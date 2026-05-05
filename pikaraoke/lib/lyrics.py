@@ -57,6 +57,12 @@ from pikaraoke.lib.lyrics_language_classifier import (
     classify_and_persist as _classify_language,
 )
 from pikaraoke.lib.lyrics_language_classifier import read_info_json as _read_info_json
+from pikaraoke.lib.lyrics_pipeline_failure_cache import (
+    clear_failure as _clear_pipeline_failure,
+)
+from pikaraoke.lib.lyrics_pipeline_failure_cache import (
+    record_failure as _record_pipeline_failure,
+)
 from pikaraoke.lib.metadata_parser import remove_accents
 from pikaraoke.lib.music_metadata import (
     _itunes_row_to_dict,
@@ -490,6 +496,10 @@ class LyricsService:
                 lyrics_provenance=provenance,
                 also_register_variant=write_variant,
             )
+            # Canonical write succeeded — drop any stale failure marker so
+            # the integrity scan doesn't keep this song in backoff after
+            # we've actually produced a .ass for it.
+            self._clear_pipeline_failure_marker(song_path)
             logger.info(
                 "tier gate: %s wrote %s (tier=%s -> %s, variant=%s)",
                 os.path.basename(song_path),
@@ -499,6 +509,20 @@ class LyricsService:
                 "yes" if write_variant else "no",
             )
             return True
+
+    def _clear_pipeline_failure_marker(self, song_path: str) -> None:
+        """Remove the canonical-pipeline failure record for ``song_path``.
+
+        Called from inside ``_try_write_ass_tiered`` on successful canonical
+        writes. Best-effort: lookup or write failures are logged and
+        swallowed so a transient DB hiccup can't poison the success path.
+        """
+        if self._db is None:
+            return
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return
+        _clear_pipeline_failure(self._db.set_metadata, audio_sha)
 
     def _register_ass(
         self,
@@ -1188,6 +1212,17 @@ class LyricsService:
                     )
                 except Exception:
                     logger.exception("failed to emit song_warning for missing lyrics")
+                # Also persist a failure marker so the integrity scan doesn't
+                # re-run the LRCLib/Genius/VTT round on every restart for songs
+                # that never had any chance of succeeding.
+                audio_sha = self._audio_sha_for_song(song_path)
+                if audio_sha and self._db is not None:
+                    _record_pipeline_failure(
+                        self._db.get_metadata,
+                        self._db.set_metadata,
+                        audio_sha,
+                        error_code="whisper_disabled_no_lyrics",
+                    )
             return
 
         # VTT cleanup is conditional: only drop YouTube's raw captions once
@@ -2472,7 +2507,9 @@ class LyricsService:
                 segments = list(segments_iter)
                 if not segments:
                     logger.info("Whisper fallback: empty transcription for %s", song_path)
-                    self._emit_whisper_failure(song_path, "empty transcription")
+                    self._emit_whisper_failure(
+                        song_path, "empty transcription", error_code="whisper_empty"
+                    )
                     return
                 lrc = _lrc_from_whisper_segments(segments)
                 lang = getattr(info, "language", None)
@@ -2488,7 +2525,9 @@ class LyricsService:
                         words.append(Word(text=text, start=start, end=end, parts=parts))
                 if not words or not lrc:
                     logger.info("Whisper fallback: no usable words for %s", song_path)
-                    self._emit_whisper_failure(song_path, "no usable word timings")
+                    self._emit_whisper_failure(
+                        song_path, "no usable word timings", error_code="whisper_no_words"
+                    )
                     return
                 if audio_sha and self._db is not None:
                     _write_cached_whisper_transcript(
@@ -2507,7 +2546,9 @@ class LyricsService:
             )
             if not ass:
                 logger.info("Whisper fallback: ASS conversion failed for %s", song_path)
-                self._emit_whisper_failure(song_path, "ASS conversion failed")
+                self._emit_whisper_failure(
+                    song_path, "ASS conversion failed", error_code="whisper_ass_failed"
+                )
                 return
             wrote = self._try_write_ass_tiered(
                 song_path,
@@ -2548,9 +2589,21 @@ class LyricsService:
                 logger.exception("failed to emit whisper success notification")
         except Exception as e:
             logger.exception("Whisper fallback crashed for %s", song_path)
-            self._emit_whisper_failure(song_path, f"{type(e).__name__}: {e}")
+            self._emit_whisper_failure(
+                song_path, f"{type(e).__name__}: {e}", error_code="whisper_crashed"
+            )
 
-    def _emit_whisper_failure(self, song_path: str, detail: str) -> None:
+    def _emit_whisper_failure(
+        self, song_path: str, detail: str, *, error_code: str | None = None
+    ) -> None:
+        """Emit ``song_warning`` and persist a pipeline-failure marker.
+
+        ``error_code`` is the stable token recorded in the failure cache
+        so the integrity scan can read back why the pipeline last failed
+        (``whisper_empty``, ``whisper_no_words``, ``whisper_ass_failed``,
+        ``whisper_crashed``). The free-form ``detail`` string still rides
+        the toast for human readers.
+        """
         try:
             self._events.emit(
                 "song_warning",
@@ -2563,6 +2616,16 @@ class LyricsService:
             )
         except Exception:
             logger.exception("failed to emit whisper-failure song_warning")
+        if error_code is None:
+            return
+        audio_sha = self._audio_sha_for_song(song_path)
+        if audio_sha and self._db is not None:
+            _record_pipeline_failure(
+                self._db.get_metadata,
+                self._db.set_metadata,
+                audio_sha,
+                error_code=error_code,
+            )
 
     def _run_whisper_for_consensus(self, song_path: str) -> tuple[list["Word"], str | None]:
         """Transcribe vocals with Whisper, return ``(words, language)``.

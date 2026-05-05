@@ -498,6 +498,60 @@ class TestIntegrityCheck:
         assert str(mp3) not in result.reprocess_paths
 
 
+class TestPipelineFailureBackoffGate:
+    """The integrity scan respects ``lyrics_pipeline_failed`` markers so a
+    song whose canonical pipeline already failed (and whose backoff hasn't
+    elapsed) isn't re-queued on every restart."""
+
+    def _seed_failed(self, db, sid, *, audio_sha, next_retry_at):
+        import json
+
+        db.update_audio_fingerprint(sid, 0.0, 0, audio_sha)
+        db.set_metadata(
+            f"lyrics_pipeline_failed:{audio_sha}",
+            json.dumps(
+                {
+                    "failed_at": "2026-05-01T00:00:00+00:00",
+                    "next_retry_at": next_retry_at,
+                    "attempts": 2,
+                    "code": "whisper_no_words",
+                }
+            ),
+        )
+
+    def test_future_failure_backoff_blocks_reprocess(self, scanner, db, tmp_path):
+        mp4 = _make_song(tmp_path, "Hopeless---bbbbbbbbbbb.mp4")
+        # First scan registers the song so we have a song_id to seed.
+        scanner.scan(str(tmp_path))
+        sid = db.get_song_id_by_path(str(mp4))
+        self._seed_failed(db, sid, audio_sha="cafef00d", next_retry_at="2099-01-01T00:00:00+00:00")
+        result = scanner.scan(str(tmp_path))
+        assert str(mp4) not in result.reprocess_paths
+
+    def test_past_failure_backoff_allows_reprocess(self, scanner, db, tmp_path):
+        mp4 = _make_song(tmp_path, "Hopeful---ccccccccccc.mp4")
+        scanner.scan(str(tmp_path))
+        sid = db.get_song_id_by_path(str(mp4))
+        self._seed_failed(db, sid, audio_sha="d00d", next_retry_at="2000-01-01T00:00:00+00:00")
+        result = scanner.scan(str(tmp_path))
+        assert str(mp4) in result.reprocess_paths
+
+    def test_force_lyrics_retry_bypasses_backoff(self, scanner, db, tmp_path):
+        mp4 = _make_song(tmp_path, "Forced---fffffffffff.mp4")
+        scanner.scan(str(tmp_path))
+        sid = db.get_song_id_by_path(str(mp4))
+        self._seed_failed(db, sid, audio_sha="f00d", next_retry_at="2099-01-01T00:00:00+00:00")
+        result = scanner.scan(str(tmp_path), force_lyrics_retry=True)
+        assert str(mp4) in result.reprocess_paths
+
+    def test_song_without_audio_sha_still_queues(self, scanner, db, tmp_path):
+        # Legacy songs that haven't been fingerprinted yet must run at
+        # least once so the fingerprint gets populated.
+        mp4 = _make_song(tmp_path, "Legacy---lllllllllll.mp4")
+        result = scanner.scan(str(tmp_path))
+        assert str(mp4) in result.reprocess_paths
+
+
 _ASS_AUTO_WORD = (
     "[Script Info]\n"
     "Title: PiKaraoke Auto-Lyrics\n"
