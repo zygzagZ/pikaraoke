@@ -1556,33 +1556,67 @@ class LyricsService:
         return _spotify_lines_to_lrc(lyrics_block.get("lines") or [])
 
     def _render_whisper_word_ass(self, song_path: str) -> str | None:
-        """Whisper ASR → word-level ASS. Returns ASS string or None."""
+        """Whisper ASR → word-level ASS. Returns ASS string or None.
+
+        Variant-fetch entry point (``fetch_variant_sync(song_path, "AI")``).
+        Distinct from the canonical ``_try_whisper_fallback`` — this one
+        renders ``<stem>.AI.ass`` (the operator-pinnable variant), the
+        other writes ``<stem>.ass`` (the canonical auto file). Both share
+        the ``(audio_sha256, model)`` transcript cache so when one path
+        already paid the transcribe cost, the other reads it back.
+        """
         try:
             _prewarm_stems(song_path)
             audio_path = _wait_for_alignment_audio(song_path)
-            model = _get_whisper_model()
-            if model is None:
-                return None
-            segments_iter, info = model.transcribe(
-                audio_path, word_timestamps=True, vad_filter=True
-            )
-            segments = list(segments_iter)
-            if not segments:
-                return None
-            lrc = _lrc_from_whisper_segments(segments)
-            lang = getattr(info, "language", None)
-            words: list[Word] = []
-            for seg in segments:
-                for w in seg.words or []:
-                    text = (getattr(w, "word", "") or "").strip()
-                    if not text or w.start is None or w.end is None:
-                        continue
-                    start = float(w.start)
-                    end = float(w.end)
-                    parts = _syllable_parts(text, lang, start, end)
-                    words.append(Word(text=text, start=start, end=end, parts=parts))
-            if not words or not lrc:
-                return None
+            model_name = _resolve_whisper_model()
+            audio_sha = self._audio_sha_for_song(song_path)
+
+            cached = None
+            if audio_sha and self._db is not None:
+                cached = _read_cached_whisper_transcript(
+                    self._db.get_metadata, audio_sha, model_name
+                )
+            if cached is not None:
+                logger.info(
+                    "whisper_transcript: cache hit (variant) sha=%s model=%s",
+                    audio_sha[:12],
+                    model_name,
+                )
+                words = list(cached.words)
+                lrc = cached.lrc
+            else:
+                model = _get_whisper_model()
+                if model is None:
+                    return None
+                segments_iter, info = model.transcribe(
+                    audio_path, word_timestamps=True, vad_filter=True
+                )
+                segments = list(segments_iter)
+                if not segments:
+                    return None
+                lrc = _lrc_from_whisper_segments(segments)
+                lang = getattr(info, "language", None)
+                words = []
+                for seg in segments:
+                    for w in seg.words or []:
+                        text = (getattr(w, "word", "") or "").strip()
+                        if not text or w.start is None or w.end is None:
+                            continue
+                        start = float(w.start)
+                        end = float(w.end)
+                        parts = _syllable_parts(text, lang, start, end)
+                        words.append(Word(text=text, start=start, end=end, parts=parts))
+                if not words or not lrc:
+                    return None
+                if audio_sha and self._db is not None:
+                    _write_cached_whisper_transcript(
+                        self._db.set_metadata,
+                        audio_sha,
+                        model_name,
+                        language=lang,
+                        lrc=lrc,
+                        words=words,
+                    )
             bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
