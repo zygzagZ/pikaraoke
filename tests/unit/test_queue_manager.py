@@ -109,6 +109,56 @@ class TestQueueManagerEnqueue:
 
         assert queue_manager.queue[0]["semitones"] == 3
 
+    def test_enqueue_records_song_id_when_callback_provided(self, preferences, events):
+        """Enqueue should call get_song_id_by_path and store the result."""
+        lookup_calls: list[str] = []
+
+        def lookup(path: str) -> int | None:
+            lookup_calls.append(path)
+            return 42 if "known" in path else None
+
+        qm = QueueManager(
+            preferences=preferences,
+            events=events,
+            get_now_playing_user=lambda: None,
+            filename_from_path=extract_title,
+            get_available_songs=lambda: [],
+            get_song_id_by_path=lookup,
+        )
+
+        qm.enqueue("/songs/known---abc.mp4", "User1")
+        qm.enqueue("/songs/missing---def.mp4", "User2")
+
+        assert lookup_calls == ["/songs/known---abc.mp4", "/songs/missing---def.mp4"]
+        assert qm.queue[0]["song_id"] == 42
+        assert qm.queue[1]["song_id"] is None
+
+    def test_enqueue_song_id_is_none_without_callback(self, queue_manager):
+        """Without a lookup callback the queue item still carries song_id=None."""
+        queue_manager.enqueue("/songs/test---abc.mp4", "User1")
+
+        assert queue_manager.queue[0]["song_id"] is None
+
+    def test_enqueue_song_id_lookup_failure_is_swallowed(self, preferences, events):
+        """A raising lookup callback shouldn't break enqueue."""
+
+        def lookup(_: str) -> int | None:
+            raise RuntimeError("DB exploded")
+
+        qm = QueueManager(
+            preferences=preferences,
+            events=events,
+            get_now_playing_user=lambda: None,
+            filename_from_path=extract_title,
+            get_available_songs=lambda: [],
+            get_song_id_by_path=lookup,
+        )
+
+        result = qm.enqueue("/songs/test---abc.mp4", "User1")
+
+        assert result[0] is True
+        assert qm.queue[0]["song_id"] is None
+
     def test_enqueue_emits_queue_update(self, queue_manager):
         """Enqueuing should emit queue_update event."""
         captured = []

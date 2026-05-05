@@ -218,6 +218,9 @@ def edit_file(query):
     events = [
         _decorate_event(e) for e in k.get_song_events_for(song=basename, youtube_id=youtube_id)
     ]
+    # Used by the live subtitle-status chip row; falls back to ``None`` for
+    # files not yet ingested into ``songs`` (the chip row hides itself).
+    song_id = k.db.get_song_id_by_path(song_path) if k.db else None
 
     return render_template(
         "edit.html",
@@ -230,6 +233,7 @@ def edit_file(query):
         song_events=events,
         song_basename=basename,
         song_youtube_id=youtube_id,
+        song_id=song_id,
     )
 
 

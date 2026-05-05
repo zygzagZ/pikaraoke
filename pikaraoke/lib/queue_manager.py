@@ -26,6 +26,7 @@ class QueueManager:
         get_now_playing_user: Callable[[], str | None] | None = None,
         filename_from_path: Callable[[str, bool], str] | None = None,
         get_available_songs: Callable[[], Any] | None = None,
+        get_song_id_by_path: Callable[[str], int | None] | None = None,
     ) -> None:
         self.queue: list[dict[str, Any]] = []
         self._preferences = preferences
@@ -33,6 +34,7 @@ class QueueManager:
         self._get_now_playing_user = get_now_playing_user
         self._filename_from_path = filename_from_path
         self._get_available_songs = get_available_songs
+        self._get_song_id_by_path = get_song_id_by_path
 
     def is_song_in_queue(self, song_path: str) -> bool:
         """Check if a song is already in the queue."""
@@ -55,6 +57,21 @@ class QueueManager:
         if self._filename_from_path:
             return self._filename_from_path(song_path, True)
         return song_path
+
+    def _resolve_song_id(self, song_path: str) -> int | None:
+        """Look up the DB ``songs.id`` for the path; ``None`` if unknown.
+
+        The bulk subtitle-state endpoint keys off ``song_id``, so the queue
+        rosette needs each item to carry it. Pre-DB tests and pre-Phase-1
+        legacy paths skip this by leaving the callback unset.
+        """
+        if not self._get_song_id_by_path:
+            return None
+        try:
+            return self._get_song_id_by_path(song_path)
+        except Exception:
+            logging.exception("queue: get_song_id_by_path failed for %s", song_path)
+            return None
 
     def _find_song_index(self, song_path: str) -> int:
         """Find a song's index in the queue by exact path match. Returns -1 if not found."""
@@ -124,6 +141,7 @@ class QueueManager:
             "file": song_path,
             "title": title,
             "semitones": semitones,
+            "song_id": self._resolve_song_id(song_path),
         }
         if add_to_front:
             # MSG: Message shown after the song is added to the top of the queue

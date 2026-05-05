@@ -128,6 +128,23 @@
     font-weight: 600;
   }
 
+  /* Subtitle source state — read-only chip row above the timeline. */
+  .pk-edit-sources {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px dotted var(--pk-ink-4);
+  }
+  .pk-edit-sources-head {
+    margin-bottom: 12px;
+  }
+  .pk-edit-sources-title {
+    font-family: var(--pk-font-mono);
+    font-size: 11px;
+    color: var(--pk-ink-3);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+  }
+
   /* Per-song processing timeline */
   .pk-events {
     margin-top: 28px;
@@ -365,6 +382,31 @@
       });
     }
 
+    // ----- Live subtitle-source chip row -----
+    const $sources = document.querySelector('.pk-edit-sources');
+    const $sourcesMount = document.getElementById('pk-edit-sources-mount');
+    if ($sources && $sourcesMount) {
+      const songId = parseInt($sources.dataset.songId, 10);
+      const factory = window.PK && window.PK.SubtitleSourcePicker
+        && window.PK.SubtitleSourcePicker.mountChipRow;
+      if (Number.isFinite(songId) && factory) {
+        if (typeof window.socket === 'undefined') connectSocket();
+        const inst = factory($sourcesMount, () => songId, { socket: window.socket });
+        fetch('/api/songs/subtitles/bulk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ song_ids: [songId] }),
+        })
+          .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+          .then((payload) => {
+            const data = payload[String(songId)];
+            if (data) inst.update(data);
+          })
+          .catch(() => { /* chip row is non-critical */ });
+      }
+    }
+
     function renderEvents(events) {
       if (!events.length) {
         $list.innerHTML = '<li class="pk-events-empty">Brak zdarzeń dla tego utworu.</li>';
@@ -439,6 +481,15 @@
     <a class="pk-btn" href="{{ referrer }}">Anuluj</a>
   </div>
 </form>
+
+{% if song_id is not none %}
+<section class="pk-edit-sources" data-song-id="{{ song_id }}">
+  <div class="pk-edit-sources-head">
+    <span class="pk-edit-sources-title">Źródła napisów</span>
+  </div>
+  <div id="pk-edit-sources-mount"></div>
+</section>
+{% endif %}
 
 <section class="pk-events"
          data-song="{{ song_basename }}"

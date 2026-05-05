@@ -176,6 +176,53 @@ export function deriveCornerBadgeState(activeSource, sources) {
 }
 
 /**
+ * Queue rosette view-model. Extends ``computeReadySummary`` with a
+ * ``spinning`` flag set when any orchestrated source is in flight, so the
+ * pill can show a discreet spinner glyph next to the count.
+ */
+export function deriveQueueRosetteState(sources) {
+  const summary = computeReadySummary(sources);
+  let spinning = false;
+  for (const s of sources || []) {
+    if (!s) continue;
+    if (
+      s.state === 'running' ||
+      s.state === 'queued' ||
+      s.status === 'downloading' ||
+      s.status === 'queued'
+    ) {
+      spinning = true;
+      break;
+    }
+  }
+  return { ...summary, spinning };
+}
+
+/**
+ * Map a single source row to a chip view-model. Used by the queue rosette
+ * expand panel and the edit-view chip row — neither surface is
+ * interactive, so this is just a glyph + css-class projection.
+ */
+export function deriveChipState(source) {
+  if (!source) return { cssClass: 'na', glyph: '·' };
+  const state = source.state;
+  const status = source.status;
+  if (state === 'running' || state === 'queued' || status === 'downloading') {
+    return { cssClass: 'downloading', glyph: '⟳' };
+  }
+  if (state === 'failed' || state === 'rate_limited' || status === 'error') {
+    return { cssClass: 'error', glyph: '✕' };
+  }
+  if (state === 'success' || status === 'ready') {
+    return { cssClass: 'ready', glyph: '●' };
+  }
+  if (status === 'download') {
+    return { cssClass: 'pending', glyph: '○' };
+  }
+  return { cssClass: 'na', glyph: '·' };
+}
+
+/**
  * Stable signature for the re-render guard (D#28). Composes
  * ``${active_source}|${ready_count}|${sources.map(s => s.source+':'+s.state).sort().join(',')}``
  * so a background source finishing flips the summary pill even when the
@@ -466,7 +513,9 @@ export function mountSmartPicker(container, getSongId, opts) {
     const viewportH = window.innerHeight || document.documentElement.clientHeight;
     const spaceBelow = viewportH - triggerRect.bottom - 16;
     const spaceAbove = triggerRect.top - 16;
-    const desired = 320;
+    // 9 source rows × 44px tap-target + 8px popover padding = 404px.
+    // Bumped from 320 so all sources fit without scrolling on a phone.
+    const desired = 420;
     let flipUp = false;
     let maxH = desired;
     if (spaceBelow >= desired) {
@@ -677,6 +726,216 @@ export function mountSmartPicker(container, getSongId, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Queue rosette + edit-view chip row factories (Phase 2.5)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CANONICAL_ORDER = [
+  'off', 'user', 'lrclib', 'lrclib-sync', 'genius-sync',
+  'spotify-sync', 'tekstowo-sync', 'AI', 'youtube-vtt',
+];
+
+// Mutates ``sources`` in place to reflect a single ``subtitle_job_update``
+// payload. Returns true when the row was found, false otherwise — the
+// caller decides whether to re-render unconditionally or skip when nothing
+// changed.
+function patchSourceState(sources, payload) {
+  const idx = sources.findIndex((s) => s && s.source === payload.source);
+  if (idx < 0) return false;
+  sources[idx] = {
+    ...sources[idx],
+    state: payload.state,
+    status: payload.status || sources[idx].status,
+    tier: payload.tier ?? sources[idx].tier,
+    error_code: payload.error_code,
+    error_message: payload.error_message,
+    next_retry_at: payload.next_retry_at ?? sources[idx].next_retry_at,
+  };
+  return true;
+}
+
+/**
+ * Mount a single chip into the parent. Read-only; tooltip carries any
+ * ``error_message``. Always rendered via ``setText`` / ``setAttr`` so a
+ * malicious label can't break out of textContent.
+ */
+function appendChip(parent, source) {
+  const view = deriveChipState(source);
+  const chip = el('div', {
+    className: 'pk-chip',
+    attrs: { 'data-state': view.cssClass, 'data-source': source.source },
+  });
+  if (source.error_message) {
+    setAttr(chip, 'title', source.error_message);
+  }
+  const glyphEl = el('span', {
+    className: 'pk-chip-glyph',
+    attrs: { 'aria-hidden': 'true' },
+    text: view.glyph,
+  });
+  const labelEl = el('span', {
+    className: 'pk-chip-label',
+    text: source.label || source.source,
+  });
+  chip.append(glyphEl, labelEl);
+  parent.appendChild(chip);
+}
+
+/**
+ * Mount the queue rosette: a small ``N/T`` pill that expands to a chip
+ * row inline. Bulk-fed (no per-row fetch); the home page hits
+ * ``POST /api/songs/subtitles/bulk`` once per queue render and fans the
+ * payload out to each rosette via ``update({ sources })``.
+ *
+ * @param {HTMLElement} container — the per-row mount slot.
+ * @param {() => (number|null)} getSongId
+ * @param {{ socket?: any, canonicalOrder?: Iterable<string> }} [opts]
+ */
+export function mountQueueRosette(container, getSongId, opts) {
+  const options = opts || {};
+  const canonicalOrder = options.canonicalOrder || DEFAULT_CANONICAL_ORDER;
+  const socket = options.socket || (typeof window !== 'undefined' ? window.socket : null);
+
+  const root = el('div', {
+    className: 'pk-rosette',
+    attrs: { 'data-expanded': 'false' },
+  });
+  const trigger = el('button', {
+    className: 'pk-rosette-pill',
+    attrs: {
+      type: 'button',
+      'aria-expanded': 'false',
+      'aria-label': 'Pokaż źródła napisów',
+    },
+  });
+  const triggerSpinner = el('span', {
+    className: 'pk-rosette-spinner',
+    attrs: { 'aria-hidden': 'true', hidden: '' },
+    text: '⟳',
+  });
+  const triggerLabel = el('span', { className: 'pk-rosette-label', text: '—' });
+  trigger.append(triggerSpinner, triggerLabel);
+  const chips = el('div', {
+    className: 'pk-rosette-chips',
+    attrs: { hidden: '' },
+  });
+  root.append(trigger, chips);
+  container.appendChild(root);
+
+  let lastSources = [];
+  let isOpen = false;
+
+  function renderTrigger() {
+    const view = deriveQueueRosetteState(lastSources);
+    setText(triggerLabel, view.total === 0 ? '—' : view.label);
+    trigger.dataset.severity = view.severity;
+    trigger.dataset.spinning = view.spinning ? 'true' : 'false';
+    triggerSpinner.hidden = !view.spinning;
+  }
+
+  function renderChips() {
+    while (chips.firstChild) chips.removeChild(chips.firstChild);
+    const sorted = sortSourcesCanonically(lastSources, canonicalOrder);
+    for (const s of sorted) appendChip(chips, s);
+  }
+
+  function setOpen(open) {
+    if (open === isOpen) return;
+    isOpen = open;
+    chips.hidden = !open;
+    setAttr(trigger, 'aria-expanded', open ? 'true' : 'false');
+    root.dataset.expanded = open ? 'true' : 'false';
+    if (open) renderChips();
+  }
+
+  trigger.addEventListener('click', (e) => {
+    // Stop the row click handler from running — the rosette controls its
+    // own expand state independent of the row's options menu.
+    e.stopPropagation();
+    setOpen(!isOpen);
+  });
+
+  function update(data) {
+    if (!data) return;
+    lastSources = Array.isArray(data.sources) ? data.sources.slice() : [];
+    renderTrigger();
+    if (isOpen) renderChips();
+  }
+
+  function onJobUpdate(payload) {
+    if (!payload) return;
+    const sid = getSongId && getSongId();
+    if (sid != null && payload.song_id != null && payload.song_id !== sid) return;
+    if (!patchSourceState(lastSources, payload)) return;
+    renderTrigger();
+    if (isOpen) renderChips();
+  }
+
+  if (socket) socket.on('subtitle_job_update', onJobUpdate);
+
+  return {
+    el: root,
+    update,
+    destroy() {
+      if (socket) socket.off('subtitle_job_update', onJobUpdate);
+      if (root.parentNode) root.parentNode.removeChild(root);
+    },
+  };
+}
+
+/**
+ * Mount the read-only chip row used on the edit page above the per-song
+ * processing timeline. Always-expanded — no toggle UI, no source switch.
+ *
+ * @param {HTMLElement} container
+ * @param {() => (number|null)} getSongId
+ * @param {{ socket?: any, canonicalOrder?: Iterable<string> }} [opts]
+ */
+export function mountChipRow(container, getSongId, opts) {
+  const options = opts || {};
+  const canonicalOrder = options.canonicalOrder || DEFAULT_CANONICAL_ORDER;
+  const socket = options.socket || (typeof window !== 'undefined' ? window.socket : null);
+
+  const root = el('div', {
+    className: 'pk-chip-row',
+    attrs: { role: 'group', 'aria-label': 'Stan źródeł napisów' },
+  });
+  container.appendChild(root);
+
+  let lastSources = [];
+
+  function render() {
+    while (root.firstChild) root.removeChild(root.firstChild);
+    const sorted = sortSourcesCanonically(lastSources, canonicalOrder);
+    for (const s of sorted) appendChip(root, s);
+  }
+
+  function update(data) {
+    if (!data) return;
+    lastSources = Array.isArray(data.sources) ? data.sources.slice() : [];
+    render();
+  }
+
+  function onJobUpdate(payload) {
+    if (!payload) return;
+    const sid = getSongId && getSongId();
+    if (sid != null && payload.song_id != null && payload.song_id !== sid) return;
+    if (!patchSourceState(lastSources, payload)) return;
+    render();
+  }
+
+  if (socket) socket.on('subtitle_job_update', onJobUpdate);
+
+  return {
+    el: root,
+    update,
+    destroy() {
+      if (socket) socket.off('subtitle_job_update', onJobUpdate);
+      if (root.parentNode) root.parentNode.removeChild(root);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Global namespace bridge (classic-script consumers)
 // ---------------------------------------------------------------------------
 
@@ -685,11 +944,15 @@ if (typeof window !== 'undefined') {
   window.PK.SubtitleSourcePicker = {
     mountCornerBadge,
     mountSmartPicker,
+    mountQueueRosette,
+    mountChipRow,
     computeReadySummary,
     deriveOptionState,
     computeCountdown,
     sortSourcesCanonically,
     deriveCornerBadgeState,
+    deriveQueueRosetteState,
+    deriveChipState,
     computePickerSig,
   };
 }
