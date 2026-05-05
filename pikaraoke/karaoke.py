@@ -31,9 +31,12 @@ from pikaraoke.lib.karaoke_database import (
     LYRICS_PROVENANCE_USER,
     SUBTITLE_SOURCE_AI,
     SUBTITLE_SOURCE_GENIUS_SYNC,
+    SUBTITLE_SOURCE_LABELS,
     SUBTITLE_SOURCE_LRCLIB,
     SUBTITLE_SOURCE_LRCLIB_SYNC,
     SUBTITLE_SOURCE_OFF,
+    SUBTITLE_SOURCE_SPOTIFY_SYNC,
+    SUBTITLE_SOURCE_TEKSTOWO_SYNC,
     SUBTITLE_SOURCE_USER,
     SUBTITLE_SOURCE_YOUTUBE_VTT,
     KaraokeDatabase,
@@ -54,6 +57,28 @@ from pikaraoke.lib.youtube_dl import (
 from pikaraoke.version import __version__ as VERSION
 
 _WHISPERX_OPT_OUT = {"off", "none", "false", "0"}
+
+
+def _infer_phase_from_warning(message: str) -> str:
+    """Best-effort phase tag for a song_warning mirrored into song_events.
+
+    The classifier is keyword-based — warning emitters use stable English
+    prefixes (``"Download failed"``, ``"Demucs ..."``, ``"MP3 encode ..."``).
+    Misses default to ``"other"`` which still renders in the timeline.
+    """
+    m = (message or "").lower()
+    if "download" in m:
+        return "download"
+    if "demucs" in m or "stems" in m or "vocal separat" in m:
+        return "demucs"
+    if "lyrics" in m or "alignment" in m or "lrclib" in m or "genius" in m:
+        return "lyrics"
+    if "encode" in m or "mp3" in m:
+        return "encode"
+    if "metadata" in m or "enrichment" in m or "itunes" in m or "musicbrainz" in m:
+        return "enrichment"
+    return "other"
+
 
 # The aligner no longer runs whisper ASR - it feeds LRC text directly to
 # wav2vec2 CTC forced alignment. There's no transcription-model size knob
@@ -437,6 +462,15 @@ class Karaoke:
         self._song_warnings: list[dict[str, Any]] = self._load_song_warnings()
         self._song_warnings_lock = threading.Lock()
 
+        # Per-song processing timeline (download/enrichment/lyrics/demucs
+        # milestones + mirrored warnings). The edit view reads this buffer
+        # filtered by basename or youtube_id.
+        self._song_events: list[dict[str, Any]] = self._load_song_events()
+        self._song_events_lock = threading.Lock()
+        # Tracks first-progress-per-song for Demucs so we emit a single
+        # "started" milestone instead of one per progress tick.
+        self._demucs_started_for: set[str] = set()
+
         self.generate_qr_code()
 
         # Clean up half-written Demucs stems from any previous run.
@@ -463,7 +497,24 @@ class Karaoke:
             events=self.events,
             aligner=self._aligner_instance,
             db=self.db,
+            preferences=self.preferences,
         )
+
+        # Phase 1: subtitle-source fan-out + per-(song, source) state machine.
+        # Listens to song_downloaded in addition to LyricsService.fetch_and_convert
+        # — the canonical-tier writer keeps producing <stem>.ass; the
+        # orchestrator queues every VARIANT_FILE_SOURCES entry independently
+        # and persists lifecycle state into ``subtitle_jobs``. The chip UI
+        # (Phase 2) reads that table; Phase 1 just makes the live state
+        # observable via REST + the new ``subtitle_job_update`` socket event.
+        from pikaraoke.lib.subtitle_orchestrator import SubtitleOrchestrator
+
+        self.subtitle_orchestrator = SubtitleOrchestrator(
+            lyrics_service=self.lyrics_service,
+            events=self.events,
+            db=self.db,
+        )
+        self.subtitle_orchestrator.attach()
 
         # Prewarm silero VAD once per process so the first song's per-line
         # LRC->audio anchor probe doesn't pay the model-load latency. The
@@ -532,6 +583,22 @@ class Karaoke:
             ),
         )
         self.events.on("song_warning", self._handle_song_warning)
+        self.events.on("song_event", self._handle_song_event)
+        self.events.on("subtitle_job_update", self._handle_subtitle_job_update)
+
+        # Wire song_enricher module-level event hook so the enrichment
+        # lifecycle (start/finish) lands in the per-song timeline. Mirrors
+        # the demucs_processor.set_warning_hook pattern: enricher is a
+        # module of free functions with no events handle of its own.
+        from pikaraoke.lib import song_enricher
+
+        def _forward_enricher_event(payload: dict[str, Any]) -> None:
+            try:
+                self.events.emit("song_event", payload)
+            except Exception:
+                logging.exception("failed to forward enricher song_event")
+
+        song_enricher.set_event_hook(_forward_enricher_event)
 
         # Wire the demucs_processor module-level warning hook so that
         # background prewarm paths (download_manager, lyrics) — which
@@ -566,12 +633,28 @@ class Karaoke:
                     "song_basename": song or "",
                 },
             )
+            # First progress tick for this song = "separation started".
+            # Subsequent ticks are noise — the splash already shows the bar.
+            if song and song not in self._demucs_started_for:
+                self._demucs_started_for.add(song)
+                self._emit_song_event(
+                    phase="demucs",
+                    message="Vocal separation started",
+                    song=song,
+                )
 
         def _forward_ready(song: str | None, cache_key: str) -> None:
             self.events.emit(
                 "stems_ready",
                 {"song_basename": song or "", "cache_key": cache_key},
             )
+            self._demucs_started_for.discard(song or "")
+            if song:
+                self._emit_song_event(
+                    phase="demucs",
+                    message="Vocal separation completed",
+                    song=song,
+                )
 
         demucs_processor.set_progress_hook(_forward_progress)
         demucs_processor.set_ready_hook(_forward_ready)
@@ -1120,7 +1203,11 @@ class Karaoke:
             logging.exception("failed to persist song_warnings")
 
     def _handle_song_warning(self, data: dict[str, Any]) -> None:
-        """Forward a song_warning socket event and append it to the persisted log."""
+        """Forward a song_warning socket event and append it to the persisted log.
+
+        Also mirrors the warning into the unified per-song event timeline so
+        the edit view can render warnings + milestones from a single buffer.
+        """
         if self.socketio:
             try:
                 self.socketio.emit("song_warning", data, namespace="/")
@@ -1136,6 +1223,23 @@ class Karaoke:
                 self._persist_song_warnings()
         except Exception:
             logging.exception("failed to buffer song_warning")
+        # Mirror into the per-song timeline. Phase is inferred from the
+        # message prefix when possible; default "other" so the entry still
+        # surfaces. Severity carries over (defaults to "warning").
+        try:
+            self._append_song_event(
+                {
+                    "timestamp": entry.get("timestamp", time.time()),
+                    "phase": _infer_phase_from_warning(entry.get("message", "")),
+                    "severity": entry.get("severity", "warning"),
+                    "message": entry.get("message", ""),
+                    "detail": entry.get("detail", ""),
+                    "song": entry.get("song", ""),
+                    "youtube_id": entry.get("youtube_id", ""),
+                }
+            )
+        except Exception:
+            logging.exception("failed to mirror song_warning into song_events")
 
     def get_song_warnings(self) -> list[dict[str, Any]]:
         """Return a copy of the persisted song_warning buffer (oldest first)."""
@@ -1169,6 +1273,124 @@ class Karaoke:
             except Exception:
                 logging.exception("failed to emit song_warnings_dismissed")
         return removed
+
+    # ------------------------------------------------------------------
+    # song_events: per-song processing timeline
+    # ------------------------------------------------------------------
+
+    _SONG_EVENTS_DB_KEY = "song_events"
+    _SONG_EVENTS_MAX = 1000
+
+    def _load_song_events(self) -> list[dict[str, Any]]:
+        try:
+            raw = self.db.get_metadata(self._SONG_EVENTS_DB_KEY)
+        except Exception:
+            logging.exception("failed to load persisted song_events")
+            return []
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logging.warning("persisted song_events not valid JSON; discarding")
+            return []
+        return data if isinstance(data, list) else []
+
+    def _persist_song_events(self) -> None:
+        try:
+            self.db.set_metadata(self._SONG_EVENTS_DB_KEY, json.dumps(self._song_events))
+        except Exception:
+            logging.exception("failed to persist song_events")
+
+    def _append_song_event(self, entry: dict[str, Any]) -> None:
+        with self._song_events_lock:
+            self._song_events.append(entry)
+            if len(self._song_events) > self._SONG_EVENTS_MAX:
+                del self._song_events[: -self._SONG_EVENTS_MAX]
+            self._persist_song_events()
+
+    def _emit_song_event(
+        self,
+        *,
+        phase: str,
+        message: str,
+        detail: str = "",
+        severity: str = "info",
+        song: str = "",
+        youtube_id: str = "",
+    ) -> None:
+        """Convenience wrapper used by karaoke.py's own forwarders."""
+        try:
+            self.events.emit(
+                "song_event",
+                {
+                    "phase": phase,
+                    "message": message,
+                    "detail": detail,
+                    "severity": severity,
+                    "song": song,
+                    "youtube_id": youtube_id,
+                },
+            )
+        except Exception:
+            logging.exception("failed to emit song_event %s/%s", phase, message)
+
+    def _handle_song_event(self, data: dict[str, Any]) -> None:
+        """Persist a song_event milestone and rebroadcast via SocketIO."""
+        try:
+            entry = {
+                "timestamp": data.get("timestamp", time.time()),
+                "phase": data.get("phase", "other"),
+                "severity": data.get("severity", "info"),
+                "message": data.get("message", ""),
+                "detail": data.get("detail", ""),
+                "song": data.get("song", "") or "",
+                "youtube_id": data.get("youtube_id", "") or "",
+            }
+        except Exception:
+            logging.exception("failed to coerce song_event payload")
+            return
+        try:
+            self._append_song_event(entry)
+        except Exception:
+            logging.exception("failed to buffer song_event")
+        if self.socketio:
+            try:
+                self.socketio.emit("song_event", entry, namespace="/")
+            except Exception:
+                logging.exception("failed to emit song_event via socketio")
+
+    def _handle_subtitle_job_update(self, data: dict[str, Any]) -> None:
+        """Rebroadcast a ``subtitle_job_update`` event over SocketIO.
+
+        The orchestrator already persisted the row before emitting; this
+        handler exists purely to fan the payload out to splash + remote
+        clients so chips (Phase 2) update without re-fetching.
+        """
+        if not self.socketio:
+            return
+        try:
+            self.socketio.emit("subtitle_job_update", data, namespace="/")
+        except Exception:
+            logging.exception("failed to emit subtitle_job_update via socketio")
+
+    def get_song_events_for(self, song: str = "", youtube_id: str = "") -> list[dict[str, Any]]:
+        """Return the persisted timeline for one song.
+
+        Matches by basename OR youtube_id so events emitted before the
+        final filename was known (e.g. "Download starting" keyed by URL +
+        video id) still attach to the song after it lands on disk.
+        Oldest first.
+        """
+        if not song and not youtube_id:
+            return []
+        with self._song_events_lock:
+            return [
+                dict(e)
+                for e in self._song_events
+                if (song and e.get("song") == song)
+                or (youtube_id and e.get("youtube_id") == youtube_id)
+            ]
 
     def reset_now_playing(self) -> None:
         """Reset all now playing state to defaults."""
@@ -1246,20 +1468,11 @@ class Karaoke:
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
         SUBTITLE_SOURCE_GENIUS_SYNC,
+        SUBTITLE_SOURCE_SPOTIFY_SYNC,
+        SUBTITLE_SOURCE_TEKSTOWO_SYNC,
         SUBTITLE_SOURCE_AI,
         SUBTITLE_SOURCE_YOUTUBE_VTT,
     )
-
-    # Polish UI labels (matches TD2 ratification).
-    _SUBTITLE_SOURCE_LABELS = {
-        SUBTITLE_SOURCE_OFF: "wyłącz",
-        SUBTITLE_SOURCE_USER: "Twoje napisy",
-        SUBTITLE_SOURCE_LRCLIB: "LRCLib",
-        SUBTITLE_SOURCE_LRCLIB_SYNC: "LRCLib + sync",
-        SUBTITLE_SOURCE_GENIUS_SYNC: "Genius + sync",
-        SUBTITLE_SOURCE_AI: "AI",
-        SUBTITLE_SOURCE_YOUTUBE_VTT: "YouTube CC",
-    }
 
     def _get_subtitle_sources_for_now_playing(
         self,
@@ -1309,6 +1522,7 @@ class Karaoke:
         # Capability gates (which sources can ever be fetched on this host).
         has_genius_token = bool(GENIUS_ACCESS_TOKEN)
         has_aligner = self.lyrics_service.has_aligner
+        has_spotify_cookie = bool(self.preferences.get_or_default("spotify_sp_dc"))
         global _HAS_FASTER_WHISPER
         if _HAS_FASTER_WHISPER is None:
             try:
@@ -1326,9 +1540,29 @@ class Karaoke:
         except Exception:
             pass
 
+        # Per-source orchestrator job state (Phase 2 picker overlay). Picker
+        # renders capability-derived ``status`` for the coarse bucket and the
+        # job ``state`` for the row suffix (running/failed/rate_limited/...).
+        # Pre-Phase-1 songs and songs the orchestrator hasn't run on simply
+        # produce an empty map — the picker treats missing entries as ``na``
+        # placeholders.
+        jobs_by_source: dict[str, dict] = {}
+        if song_id is not None and self.db is not None:
+            try:
+                for row in self.db.get_subtitle_jobs(song_id):
+                    jobs_by_source[row["source"]] = {
+                        "state": row["state"],
+                        "tier": row["tier"],
+                        "error_code": row["error_code"],
+                        "error_message": row["error_message"],
+                        "next_retry_at": row["next_retry_at"],
+                    }
+            except Exception:
+                logging.exception("subtitle_sources: get_subtitle_jobs failed for %s", song_id)
+
         sources: list[dict] = []
         for source in self._SUBTITLE_SOURCE_ORDER:
-            label = self._SUBTITLE_SOURCE_LABELS[source]
+            label = SUBTITLE_SOURCE_LABELS[source]
 
             if source == SUBTITLE_SOURCE_OFF:
                 # ``off`` is always available — it's a UI toggle, not a fetch.
@@ -1355,6 +1589,12 @@ class Karaoke:
                     na_reason = "no GENIUS_ACCESS_TOKEN"
                 elif source == SUBTITLE_SOURCE_LRCLIB_SYNC and not has_aligner:
                     na_reason = "no aligner configured"
+                elif source == SUBTITLE_SOURCE_TEKSTOWO_SYNC and not has_aligner:
+                    na_reason = "no aligner configured"
+                elif source == SUBTITLE_SOURCE_SPOTIFY_SYNC and not (
+                    has_spotify_cookie and has_aligner
+                ):
+                    na_reason = "no spotify_sp_dc preference or aligner"
                 elif source == SUBTITLE_SOURCE_AI and not (has_whisper and has_aligner):
                     na_reason = "faster_whisper / aligner unavailable"
                 elif source == SUBTITLE_SOURCE_YOUTUBE_VTT and not (
@@ -1373,12 +1613,18 @@ class Karaoke:
                     status = self._SUBTITLE_STATUS_DOWNLOAD
                 downloadable = status == self._SUBTITLE_STATUS_DOWNLOAD
 
+            job = jobs_by_source.get(source, {})
             sources.append(
                 {
                     "source": source,
                     "label": label,
                     "status": status,
                     "downloadable": downloadable,
+                    "state": job.get("state"),
+                    "tier": job.get("tier"),
+                    "error_code": job.get("error_code"),
+                    "error_message": job.get("error_message"),
+                    "next_retry_at": job.get("next_retry_at"),
                 }
             )
 

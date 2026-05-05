@@ -206,6 +206,36 @@ _MIGRATION_V8 = """
 ALTER TABLE songs ADD COLUMN lyrics_confidence REAL;
 """
 
+# v8 -> v9: per-(song, source) subtitle job state machine driving the
+# orchestrator + chip UI (Phase 1). Replaces the implicit "artifact
+# exists -> success, otherwise unknown" view with explicit lifecycle:
+# queued -> running -> success | failed | rate_limited | skipped. The
+# auto-fan-out after song_downloaded inserts a row per source; UI reads
+# this table for live state. Backfill: every existing ``ass_<source>``
+# artifact becomes a ``state='success'`` row so already-cached variants
+# show as ready immediately.
+_MIGRATION_V9 = """
+CREATE TABLE IF NOT EXISTS subtitle_jobs (
+    song_id        INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+    source         TEXT    NOT NULL,
+    state          TEXT    NOT NULL,
+    tier           TEXT,
+    started_at     TEXT,
+    finished_at    TEXT,
+    error_code     TEXT,
+    error_message  TEXT,
+    attempt_count  INTEGER NOT NULL DEFAULT 0,
+    next_retry_at  TEXT,
+    PRIMARY KEY (song_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_subtitle_jobs_state ON subtitle_jobs(state);
+INSERT OR IGNORE INTO subtitle_jobs (song_id, source, state)
+SELECT song_id, substr(role, 5), 'success'
+FROM song_artifacts
+WHERE role LIKE 'ass_%'
+  AND role NOT IN ('ass_auto', 'ass_user');
+"""
+
 LYRICS_PROVENANCE_AUTO_WORD = "auto_word"
 LYRICS_PROVENANCE_AUTO_LINE = "auto_line"
 LYRICS_PROVENANCE_USER = "user"
@@ -223,6 +253,8 @@ SUBTITLE_SOURCE_USER = "user"
 SUBTITLE_SOURCE_LRCLIB = "lrclib"
 SUBTITLE_SOURCE_LRCLIB_SYNC = "lrclib-sync"
 SUBTITLE_SOURCE_GENIUS_SYNC = "genius-sync"
+SUBTITLE_SOURCE_SPOTIFY_SYNC = "spotify-sync"
+SUBTITLE_SOURCE_TEKSTOWO_SYNC = "tekstowo-sync"
 SUBTITLE_SOURCE_AI = "AI"
 SUBTITLE_SOURCE_YOUTUBE_VTT = "youtube-vtt"
 
@@ -233,6 +265,8 @@ VALID_SUBTITLE_SOURCES = frozenset(
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
         SUBTITLE_SOURCE_GENIUS_SYNC,
+        SUBTITLE_SOURCE_SPOTIFY_SYNC,
+        SUBTITLE_SOURCE_TEKSTOWO_SYNC,
         SUBTITLE_SOURCE_AI,
         SUBTITLE_SOURCE_YOUTUBE_VTT,
     }
@@ -246,12 +280,62 @@ VARIANT_FILE_SOURCES = frozenset(
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
         SUBTITLE_SOURCE_GENIUS_SYNC,
+        SUBTITLE_SOURCE_SPOTIFY_SYNC,
+        SUBTITLE_SOURCE_TEKSTOWO_SYNC,
         SUBTITLE_SOURCE_AI,
         SUBTITLE_SOURCE_YOUTUBE_VTT,
     }
 )
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
+
+# Lifecycle states a subtitle_jobs row can hold (Phase 1).
+SUBTITLE_JOB_QUEUED = "queued"
+SUBTITLE_JOB_RUNNING = "running"
+SUBTITLE_JOB_SUCCESS = "success"
+SUBTITLE_JOB_FAILED = "failed"
+SUBTITLE_JOB_RATE_LIMITED = "rate_limited"
+SUBTITLE_JOB_SKIPPED = "skipped"
+
+# Polish UI labels for each canonical source. Lifted to module level so the
+# subtitle orchestrator can embed labels in ``subtitle_job_update`` events
+# without importing ``karaoke.py`` (which would create a cycle — karaoke.py
+# already imports this module).
+SUBTITLE_SOURCE_LABELS: dict[str, str] = {
+    SUBTITLE_SOURCE_OFF: "wyłącz",
+    SUBTITLE_SOURCE_USER: "Twoje napisy",
+    SUBTITLE_SOURCE_LRCLIB: "LRCLib",
+    SUBTITLE_SOURCE_LRCLIB_SYNC: "LRCLib + sync",
+    SUBTITLE_SOURCE_GENIUS_SYNC: "Genius + sync",
+    SUBTITLE_SOURCE_SPOTIFY_SYNC: "Spotify + sync",
+    SUBTITLE_SOURCE_TEKSTOWO_SYNC: "Tekstowo + sync",
+    SUBTITLE_SOURCE_AI: "AI",
+    SUBTITLE_SOURCE_YOUTUBE_VTT: "YouTube CC",
+}
+
+# Translate raw DB ``subtitle_jobs.state`` values to the UI status vocabulary
+# the subtitle source picker renders. The picker keeps both ``state`` (for
+# fine-grained branching like rate-limit countdowns) and ``status`` (for the
+# coarse ready/downloading/error/queued/na bucket).
+JOB_STATE_TO_UI_STATUS: dict[str, str] = {
+    SUBTITLE_JOB_QUEUED: "queued",
+    SUBTITLE_JOB_RUNNING: "downloading",
+    SUBTITLE_JOB_SUCCESS: "ready",
+    SUBTITLE_JOB_FAILED: "error",
+    SUBTITLE_JOB_RATE_LIMITED: "error",
+    SUBTITLE_JOB_SKIPPED: "na",
+}
+
+VALID_SUBTITLE_JOB_STATES = frozenset(
+    {
+        SUBTITLE_JOB_QUEUED,
+        SUBTITLE_JOB_RUNNING,
+        SUBTITLE_JOB_SUCCESS,
+        SUBTITLE_JOB_FAILED,
+        SUBTITLE_JOB_RATE_LIMITED,
+        SUBTITLE_JOB_SKIPPED,
+    }
+)
 
 _TRACK_METADATA_FIELDS = (
     "duration_seconds",
@@ -332,6 +416,14 @@ class KaraokeDatabase:
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(songs)").fetchall()}
             if "lyrics_confidence" not in columns:
                 self._conn.executescript(_MIGRATION_V8)
+            tables = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "subtitle_jobs" not in tables:
+                self._conn.executescript(_MIGRATION_V9)
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------
@@ -889,6 +981,141 @@ class KaraokeDatabase:
                 params,
             )
         return {f: source for f in applied}
+
+    # ------------------------------------------------------------------
+    # Subtitle jobs (per-(song, source) state machine — Phase 1)
+    # ------------------------------------------------------------------
+
+    def get_subtitle_jobs(self, song_id: int) -> list[sqlite3.Row]:
+        """Return every subtitle_jobs row for a song, ordered by source."""
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT song_id, source, state, tier, started_at, finished_at,
+                       error_code, error_message, attempt_count, next_retry_at
+                FROM subtitle_jobs
+                WHERE song_id = ?
+                ORDER BY source
+                """,
+                (song_id,),
+            ).fetchall()
+
+    def get_subtitle_jobs_bulk(self, song_ids: list[int]) -> dict[int, list[sqlite3.Row]]:
+        """Return jobs for many songs in a single ``IN (...)`` query.
+
+        Used by ``POST /api/songs/subtitles/bulk`` to avoid N+1 SQLite
+        queries on Pi 3 SD cards. Songs without any rows are simply absent
+        from the returned dict — callers synthesize placeholder sources.
+        """
+        if not song_ids:
+            return {}
+        # De-dup before binding; sqlite3 has no fixed parameter cap but
+        # binding the same value twice just bloats the plan for no gain.
+        unique_ids = list(set(song_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT song_id, source, state, tier, started_at, finished_at,
+                       error_code, error_message, attempt_count, next_retry_at
+                FROM subtitle_jobs
+                WHERE song_id IN ({placeholders})
+                ORDER BY song_id, source
+                """,
+                unique_ids,
+            ).fetchall()
+        out: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            out.setdefault(row["song_id"], []).append(row)
+        return out
+
+    def get_subtitle_job(self, song_id: int, source: str) -> sqlite3.Row | None:
+        """Return one subtitle_jobs row, or None when nothing recorded yet."""
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT song_id, source, state, tier, started_at, finished_at,
+                       error_code, error_message, attempt_count, next_retry_at
+                FROM subtitle_jobs
+                WHERE song_id = ? AND source = ?
+                """,
+                (song_id, source),
+            ).fetchone()
+
+    def upsert_subtitle_job(
+        self,
+        song_id: int,
+        source: str,
+        state: str,
+        *,
+        tier: str | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        attempt_count: int | None = None,
+        next_retry_at: str | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        """Insert or replace a subtitle_jobs row.
+
+        Whitelist on ``state`` — callers go through the orchestrator which
+        only writes constants from ``VALID_SUBTITLE_JOB_STATES``; defending
+        the table here too so a typo in a future caller crashes loud
+        instead of silently rotting the lifecycle.
+
+        ``increment_attempt`` bumps ``attempt_count`` from the current row
+        value (or 0 if no row); explicit ``attempt_count`` wins when both
+        are supplied.
+        """
+        if state not in VALID_SUBTITLE_JOB_STATES:
+            raise ValueError(f"upsert_subtitle_job: invalid state {state!r}")
+        with self._lock, self._conn:
+            current_attempt: int = 0
+            if increment_attempt and attempt_count is None:
+                row = self._conn.execute(
+                    "SELECT attempt_count FROM subtitle_jobs WHERE song_id = ? AND source = ?",
+                    (song_id, source),
+                ).fetchone()
+                if row is not None:
+                    current_attempt = row[0] or 0
+                attempt_count = current_attempt + 1
+            params = {
+                "song_id": song_id,
+                "source": source,
+                "state": state,
+                "tier": tier,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "error_code": error_code,
+                "error_message": error_message,
+                "attempt_count": attempt_count if attempt_count is not None else 0,
+                "next_retry_at": next_retry_at,
+            }
+            self._conn.execute(
+                """
+                INSERT INTO subtitle_jobs (
+                    song_id, source, state, tier, started_at, finished_at,
+                    error_code, error_message, attempt_count, next_retry_at
+                ) VALUES (
+                    :song_id, :source, :state, :tier, :started_at, :finished_at,
+                    :error_code, :error_message, :attempt_count, :next_retry_at
+                )
+                ON CONFLICT(song_id, source) DO UPDATE SET
+                    state         = excluded.state,
+                    tier          = COALESCE(excluded.tier, subtitle_jobs.tier),
+                    started_at    = COALESCE(excluded.started_at, subtitle_jobs.started_at),
+                    finished_at   = excluded.finished_at,
+                    error_code    = excluded.error_code,
+                    error_message = excluded.error_message,
+                    attempt_count = CASE
+                        WHEN :attempt_count > 0 THEN excluded.attempt_count
+                        ELSE subtitle_jobs.attempt_count
+                    END,
+                    next_retry_at = excluded.next_retry_at
+                """,
+                params,
+            )
 
     # ------------------------------------------------------------------
     # Metadata (app-level key-value store)

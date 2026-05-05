@@ -143,7 +143,6 @@ class MockKaraoke:
     _SUBTITLE_STATUS_DOWNLOADING = Karaoke._SUBTITLE_STATUS_DOWNLOADING
     _SUBTITLE_STATUS_NA = Karaoke._SUBTITLE_STATUS_NA
     _SUBTITLE_SOURCE_ORDER = Karaoke._SUBTITLE_SOURCE_ORDER
-    _SUBTITLE_SOURCE_LABELS = Karaoke._SUBTITLE_SOURCE_LABELS
     reset_now_playing = Karaoke.reset_now_playing
     send_notification = Karaoke.send_notification
     log_and_send = Karaoke.log_and_send
@@ -162,6 +161,14 @@ class MockKaraoke:
     dismiss_song_warnings = Karaoke.dismiss_song_warnings
     _SONG_WARNINGS_DB_KEY = Karaoke._SONG_WARNINGS_DB_KEY
     _SONG_WARNINGS_MAX = Karaoke._SONG_WARNINGS_MAX
+    _handle_song_event = Karaoke._handle_song_event
+    _load_song_events = Karaoke._load_song_events
+    _persist_song_events = Karaoke._persist_song_events
+    _append_song_event = Karaoke._append_song_event
+    _emit_song_event = Karaoke._emit_song_event
+    get_song_events_for = Karaoke.get_song_events_for
+    _SONG_EVENTS_DB_KEY = Karaoke._SONG_EVENTS_DB_KEY
+    _SONG_EVENTS_MAX = Karaoke._SONG_EVENTS_MAX
     _maybe_initial_reprocess_with_whisperx = Karaoke._maybe_initial_reprocess_with_whisperx
     _WHISPERX_REPROCESS_SENTINEL = Karaoke._WHISPERX_REPROCESS_SENTINEL
 
