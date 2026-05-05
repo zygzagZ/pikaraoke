@@ -1285,6 +1285,7 @@ class LyricsService:
                 _lrc_plain_text(lrc),
                 lrc_lines=lrc_line_windows(lrc),
                 language=language,
+                vad_cache=self._vad_cache_for_song(song_path),
             )
             if not words:
                 return None
@@ -1293,7 +1294,7 @@ class LyricsService:
                 render_lrc = _shift_lrc_per_line(lrc, line_starts)
             else:
                 render_lrc = lrc
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, render_lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
             logger.warning(
@@ -1358,7 +1359,7 @@ class LyricsService:
             synthetic_lrc = _lrc_from_aligned_lines(words, lines)
             if not synthetic_lrc:
                 return None
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, synthetic_lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
             logger.warning(
@@ -1582,7 +1583,7 @@ class LyricsService:
                     words.append(Word(text=text, start=start, end=end, parts=parts))
             if not words or not lrc:
                 return None
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
             logger.exception("_render_whisper_word_ass: failed for %s", song_path)
@@ -2222,7 +2223,11 @@ class LyricsService:
                 )
                 return
             words = self._aligner.align(
-                audio_path, plain, lrc_lines=lrc_line_windows(lrc), language=language
+                audio_path,
+                plain,
+                lrc_lines=lrc_line_windows(lrc),
+                language=language,
+                vad_cache=self._vad_cache_for_song(song_path),
             )
             if self._db is not None and song_id is not None and not db_lang:
                 # Persist the text-detected language so future runs and UI
@@ -2235,7 +2240,7 @@ class LyricsService:
                 )
             if not words:
                 return
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             anim_params = _anim_params_for_bpm(bpm)
             # The aligner returns words in audio-true time space. When it
             # also detected per-line LRC->audio shifts, the LRC string
@@ -2401,7 +2406,7 @@ class LyricsService:
         if not synthetic_lrc:
             return False
 
-        bpm = _estimate_bpm(audio_path)
+        bpm = self._cached_estimate_bpm(song_path, audio_path)
         aligner_id = self._aligner.model_id if self._aligner else None
         ass = _words_to_ass_with_k_tags(
             words,
@@ -2453,6 +2458,50 @@ class LyricsService:
         except Exception:
             logger.exception("audio_sha lookup failed for %s", song_path)
             return None
+
+    def _vad_cache_for_song(self, song_path: str):
+        """Build a ``VadCacheRef`` for ``song_path`` or None when DB unwired.
+
+        Used by every site that calls the aligner with ``lrc_lines`` (and
+        thus triggers the per-line shift detector's VAD probe). One
+        helper keeps the lookup symmetric across call sites.
+        """
+        if self._db is None:
+            return None
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return None
+        from pikaraoke.lib.lyrics_align import VadCacheRef
+
+        return VadCacheRef(
+            audio_sha256=audio_sha,
+            cache_get=self._db.get_metadata,
+            cache_set=self._db.set_metadata,
+        )
+
+    def _cached_estimate_bpm(self, song_path: str, audio_path: str) -> float | None:
+        """BPM estimation with disk-persistent caching by ``audio_sha256``.
+
+        ``_estimate_bpm`` already keeps a process-local memo, but that
+        doesn't survive restarts and is keyed by file path (not content).
+        This wrapper persists the verdict in ``metadata`` so a re-run on
+        the same audio bytes is free across restarts. ``None`` (BPM
+        couldn't be detected) is also cached — same audio would just
+        fail again.
+        """
+        from pikaraoke.lib.audio_feature_cache import CACHE_MISS, read_bpm, write_bpm
+
+        if self._db is None:
+            return _estimate_bpm(audio_path)
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return _estimate_bpm(audio_path)
+        cached = read_bpm(self._db.get_metadata, audio_sha)
+        if cached is not CACHE_MISS:
+            return cached  # type: ignore[return-value]
+        bpm = _estimate_bpm(audio_path)
+        write_bpm(self._db.set_metadata, audio_sha, bpm)
+        return bpm
 
     def _try_whisper_fallback(self, song_path: str) -> None:
         """Last-resort ASR: transcribe the vocals stem with faster-whisper.
@@ -2538,7 +2587,7 @@ class LyricsService:
                         lrc=lrc,
                         words=words,
                     )
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             ass = _words_to_ass_with_k_tags(
                 words,
                 lrc,
@@ -2872,6 +2921,7 @@ class LyricsService:
         # an improved upstream LRC has a chance to flip the routing.
         from pikaraoke.lib.lyrics_align import (
             _RELIABILITY_GATE,
+            VadCacheRef,
             grade_lrc_priors_against_audio,
         )
 
@@ -2888,12 +2938,25 @@ class LyricsService:
                     basename,
                 )
 
+        # Disk-persistent VAD cache shared by the grader pass below and
+        # the aligner's per-line shift detector — both probe the same
+        # audio, so the second call hits cache instead of re-running
+        # silero + silencedetect.
+        vad_cache: VadCacheRef | None = None
+        audio_sha = self._audio_sha_for_song(song_path)
+        if audio_sha and self._db is not None:
+            vad_cache = VadCacheRef(
+                audio_sha256=audio_sha,
+                cache_get=self._db.get_metadata,
+                cache_set=self._db.set_metadata,
+            )
+
         if replay_score is not None:
             score = replay_score
         else:
             try:
                 score, _residuals = grade_lrc_priors_against_audio(
-                    audio_path, consensus_lrc_windows
+                    audio_path, consensus_lrc_windows, vad_cache=vad_cache
                 )
             except Exception:
                 logger.exception(
@@ -2919,9 +2982,12 @@ class LyricsService:
                     consensus.text,
                     lrc_lines=consensus_lrc_windows,
                     language=language,
+                    vad_cache=vad_cache,
                 )
             else:
-                aligned = self._aligner.align(audio_path, consensus.text, language=language)
+                aligned = self._aligner.align(
+                    audio_path, consensus.text, language=language, vad_cache=vad_cache
+                )
         except Exception:
             logger.exception("consensus: aligner crashed for %s", basename)
             try:
@@ -2942,7 +3008,7 @@ class LyricsService:
             logger.info("consensus: empty aligner output for %s", basename)
             return
 
-        bpm = _estimate_bpm(audio_path)
+        bpm = self._cached_estimate_bpm(song_path, audio_path)
 
         line_template = consensus.lrc
         if not align_with_lrc_lines:

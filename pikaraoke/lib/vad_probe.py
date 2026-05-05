@@ -29,6 +29,7 @@ import logging
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from threading import Lock
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,13 @@ def _ensure_model() -> object | None:
     return _model
 
 
-def list_vocal_onsets(audio_path: str) -> list[tuple[float, float]]:
+def list_vocal_onsets(
+    audio_path: str,
+    *,
+    audio_sha256: str | None = None,
+    cache_get: "Callable[[str], str | None] | None" = None,
+    cache_set: "Callable[[str, str], None] | None" = None,
+) -> list[tuple[float, float]]:
     """Return ``[(onset_s, next_onset_s), ...]`` for vocal phrases in audio.
 
     Each entry's second element is the start time of the next phrase
@@ -114,7 +121,21 @@ def list_vocal_onsets(audio_path: str) -> list[tuple[float, float]]:
 
     Combines silero VAD (primary) with silencedetect (gap filler) on
     the same audio path. See module docstring.
+
+    When ``audio_sha256`` is provided alongside ``cache_get``/``cache_set``
+    callables, results are persisted in the metadata KV table — both the
+    silero pass and the silencedetect pass are pure functions of audio
+    bytes, so a cache hit returns immediately without re-decoding.
+    Callers without DB access (CLI / tests) omit the cache args and pay
+    the compute every call.
     """
+    if audio_sha256 and cache_get is not None:
+        from pikaraoke.lib.audio_feature_cache import CACHE_MISS, read_vad_onsets
+
+        cached = read_vad_onsets(cache_get, audio_sha256)
+        if cached is not CACHE_MISS:
+            return cached  # type: ignore[return-value]
+
     silero_starts, audio_duration = _silero_onset_starts(audio_path)
     silence_pairs = _silencedetect_onset_pairs(audio_path)
 
@@ -123,13 +144,19 @@ def list_vocal_onsets(audio_path: str) -> list[tuple[float, float]]:
         # silencedetect onset's audio end.
         audio_duration = max(end for _, end in silence_pairs)
     if audio_duration is None:
-        return []
+        result: list[tuple[float, float]] = []
+    else:
+        silencedetect_starts = [
+            onset for onset, end in silence_pairs if (end - onset) >= _MIN_AUDIO_S
+        ]
+        merged = _merge_starts(silero_starts + silencedetect_starts)
+        result = _to_onset_pairs(merged, audio_duration) if merged else []
 
-    silencedetect_starts = [onset for onset, end in silence_pairs if (end - onset) >= _MIN_AUDIO_S]
-    merged = _merge_starts(silero_starts + silencedetect_starts)
-    if not merged:
-        return []
-    return _to_onset_pairs(merged, audio_duration)
+    if audio_sha256 and cache_set is not None:
+        from pikaraoke.lib.audio_feature_cache import write_vad_onsets
+
+        write_vad_onsets(cache_set, audio_sha256, result)
+    return result
 
 
 def _silero_onset_starts(audio_path: str) -> tuple[list[float], float | None]:
