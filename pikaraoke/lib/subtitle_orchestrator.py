@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pikaraoke.lib.events import EventSystem
 from pikaraoke.lib.karaoke_database import (
     JOB_STATE_TO_UI_STATUS,
+    SUBTITLE_JOB_FAILED,
     SUBTITLE_JOB_QUEUED,
     SUBTITLE_JOB_RUNNING,
     SUBTITLE_JOB_SKIPPED,
@@ -36,6 +37,7 @@ from pikaraoke.lib.karaoke_database import (
     KaraokeDatabase,
 )
 from pikaraoke.lib.lyrics import LyricsService, variant_ass_path
+from pikaraoke.lib.lyrics_retry_backoff import compute_next_retry_at, is_in_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +112,19 @@ class SubtitleOrchestrator:
     # Kickoff
     # ------------------------------------------------------------------
 
-    def kickoff(self, song_path: str) -> None:
+    def kickoff(self, song_path: str, *, force: bool = False) -> None:
         """Queue every configured source for ``song_path``.
 
         Pre-existing variant files (cache hit on a re-downloaded song)
         are recorded as ``success`` immediately without dispatching a
         worker. Sources that are not pre-existing get a ``queued`` row +
-        a worker submission.
+        a worker submission, unless an existing ``failed`` row's
+        ``next_retry_at`` is still in the future — those skip silently
+        until the backoff elapses.
+
+        ``force=True`` bypasses the backoff gate so an explicit user
+        action (retry-this-source button, manual sync) can re-attempt
+        immediately.
 
         No-op when the DB is not wired (test/CLI shim) — the orchestrator
         is still useful as a dispatch fan-out, but state tracking is
@@ -138,7 +146,7 @@ class SubtitleOrchestrator:
             return
         for source in self._sources:
             try:
-                self._kickoff_one(song_id, song_path, source)
+                self._kickoff_one(song_id, song_path, source, force=force)
             except Exception:
                 logger.exception(
                     "SubtitleOrchestrator: kickoff failed for %s/%s",
@@ -146,11 +154,16 @@ class SubtitleOrchestrator:
                     source,
                 )
 
-    def _kickoff_one(self, song_id: int, song_path: str, source: str) -> None:
+    def _kickoff_one(
+        self, song_id: int, song_path: str, source: str, *, force: bool = False
+    ) -> None:
         """Decide whether to queue ``source`` for this song or short-circuit.
 
         Cache hit (variant file already on disk) -> mark ``success``.
-        Otherwise -> mark ``queued`` and submit the fetch.
+        Otherwise, when a prior ``failed`` row carries a future
+        ``next_retry_at``, skip silently (the chip UI keeps showing the
+        last failure). ``force=True`` bypasses that gate. Else mark
+        ``queued`` and submit the fetch.
         """
         if os.path.exists(variant_ass_path(song_path, source)):
             self._record(
@@ -162,11 +175,39 @@ class SubtitleOrchestrator:
                 finished_at=_now_iso(),
             )
             return
+        if not force and self._db is not None:
+            try:
+                existing = self._db.get_subtitle_job(song_id, source)
+            except Exception:
+                logger.exception(
+                    "SubtitleOrchestrator: get_subtitle_job failed for %s/%s",
+                    os.path.basename(song_path),
+                    source,
+                )
+                existing = None
+            if (
+                existing is not None
+                and existing["state"] == SUBTITLE_JOB_FAILED
+                and is_in_backoff(existing["next_retry_at"])
+            ):
+                logger.info(
+                    "SubtitleOrchestrator: %s/%s in backoff until %s, skipping",
+                    os.path.basename(song_path),
+                    source,
+                    existing["next_retry_at"],
+                )
+                return
         self._record(song_id, source, SUBTITLE_JOB_QUEUED, song_path=song_path)
         self._executor.submit(self._run_one, song_id, song_path, source)
 
     def _run_one(self, song_id: int, song_path: str, source: str) -> None:
-        """Worker body: transition queued -> running -> terminal state."""
+        """Worker body: transition queued -> running -> terminal state.
+
+        On a ``failed`` transition, schedules a future ``next_retry_at``
+        based on the post-increment attempt count (``compute_next_retry_at``).
+        ``_kickoff_one`` consults that timestamp on subsequent kickoffs
+        so a chronically-failing source isn't re-queued every restart.
+        """
         self._record(
             song_id,
             source,
@@ -186,32 +227,62 @@ class SubtitleOrchestrator:
             self._record(
                 song_id,
                 source,
-                "failed",
+                SUBTITLE_JOB_FAILED,
                 song_path=song_path,
                 finished_at=_now_iso(),
                 error_code="orchestrator_crash",
                 error_message=str(exc)[:200],
+                next_retry_at=self._next_retry_for(song_id, source),
             )
             self._maybe_emit_no_lyrics_warning(song_id, song_path)
             return
-        state = result.get("state", "failed")
+        state = result.get("state", SUBTITLE_JOB_FAILED)
         # ``in_flight_dedup`` is not really a failure — the canonical path
         # is doing the work. Surface as 'skipped' so the chip stays neutral
         # rather than amber. The variant file showing up later via
         # ``lyrics_upgraded`` will not flip this row to success on its
         # own; Phase 2 will add a periodic reconciler that scans
         # song_artifacts for new variants and stamps the rows.
+        final_state = state if state != "skipped" else SUBTITLE_JOB_SKIPPED
         self._record(
             song_id,
             source,
-            state if state != "skipped" else SUBTITLE_JOB_SKIPPED,
+            final_state,
             song_path=song_path,
             tier=result.get("tier"),
             finished_at=_now_iso(),
             error_code=result.get("error_code"),
             error_message=result.get("error_message"),
+            next_retry_at=(
+                self._next_retry_for(song_id, source)
+                if final_state == SUBTITLE_JOB_FAILED
+                else None
+            ),
         )
         self._maybe_emit_no_lyrics_warning(song_id, song_path)
+
+    def _next_retry_for(self, song_id: int, source: str) -> str | None:
+        """Compute ``next_retry_at`` for a freshly-failed (song, source).
+
+        Reads the row that the ``running`` transition just bumped — its
+        ``attempt_count`` is already the post-increment value and feeds
+        directly into the backoff schedule. Returns None when the DB is
+        unwired or the lookup fails (cache write is best-effort; the
+        gate degrades open).
+        """
+        if self._db is None:
+            return None
+        try:
+            row = self._db.get_subtitle_job(song_id, source)
+        except Exception:
+            logger.exception(
+                "SubtitleOrchestrator: next-retry lookup failed for song_id=%s source=%s",
+                song_id,
+                source,
+            )
+            return None
+        attempt = row["attempt_count"] if row is not None else 1
+        return compute_next_retry_at(attempt or 1)
 
     def _maybe_emit_no_lyrics_warning(self, song_id: int, song_path: str) -> None:
         """Surface a single ``song_warning`` once every auto source has finished
@@ -281,6 +352,7 @@ class SubtitleOrchestrator:
         error_code: str | None = None,
         error_message: str | None = None,
         increment_attempt: bool = False,
+        next_retry_at: str | None = None,
     ) -> None:
         """Persist the state transition and broadcast ``subtitle_job_update``."""
         if self._db is None:
@@ -296,6 +368,7 @@ class SubtitleOrchestrator:
                 error_code=error_code,
                 error_message=error_message,
                 increment_attempt=increment_attempt,
+                next_retry_at=next_retry_at,
             )
         except Exception:
             logger.exception(
