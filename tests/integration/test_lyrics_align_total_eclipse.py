@@ -70,19 +70,45 @@ def test_first_post_solo_line_snaps_to_real_onset(total_eclipse_inputs):
     )
 
 
-def test_lateness_recovers_by_417(total_eclipse_inputs):
-    """Lines whose shifted start is in 207.84..257.56 must spread out, not
-    pile up against the earlier anchor (the "compressed at one anchor"
-    cascade we're fixing)."""
+def test_post_solo_lines_spread_across_multiple_anchors(total_eclipse_inputs):
+    """The post-solo window 207.84..257.56 must contain lines distributed
+    across multiple distinct anchor regions, not collapsed onto one anchor.
+
+    The original bug compressed every post-solo line onto a single wrong
+    anchor (the spurious silencedetect marker inside the solo). The
+    smoking gun was N consecutive lines with identical or near-identical
+    shifted timestamps. This pins three checks against that cascade:
+
+    * minimum gap between consecutive shifted lines >= 0.04s (the DP's
+      ``_interpolate_unanchored`` instrumental-gap branch deliberately
+      spreads cluster lines by ~0.05s; anything tighter is collision)
+    * at least 5 distinct anchor clusters (gaps > 0.5s between adjacent
+      shifted times) inside the window — multiple vocal entries got
+      their own anchor, didn't all land on one
+    * lines never compressed below ~80% of the line count being unique
+      timestamps — duplicates are the symptom shape
+    """
     out = _starts(lyrics_align._detect_per_line_starts("/dev/null", total_eclipse_inputs))
     assert out is not None
     in_window = sorted(t for t in out if 207.84 <= t <= 257.56)
-    if len(in_window) < 2:
-        pytest.skip("not enough lines in the post-solo window for this assertion")
+    assert len(in_window) >= 10, (
+        f"expected ≥10 lines in the post-solo window for a meaningful "
+        f"cascade check; got {len(in_window)}. Fixture may have changed."
+    )
     consecutive_gaps = [b - a for a, b in zip(in_window, in_window[1:])]
-    assert (
-        min(consecutive_gaps) >= 0.05
-    ), f"post-solo lines are compressed: min gap = {min(consecutive_gaps):.3f}s"
+    assert min(consecutive_gaps) >= 0.04, (
+        f"post-solo lines collide at one anchor: " f"min gap = {min(consecutive_gaps):.3f}s"
+    )
+    cluster_breaks = sum(1 for g in consecutive_gaps if g > 0.5)
+    assert cluster_breaks >= 5, (
+        f"post-solo lines spread across only {cluster_breaks + 1} anchor "
+        f"clusters (need ≥6); compression cascade has returned"
+    )
+    unique_ratio = len(set(round(t, 3) for t in in_window)) / len(in_window)
+    assert unique_ratio >= 0.8, (
+        f"only {unique_ratio:.0%} of post-solo timestamps are unique; "
+        f"duplicates are the original wrong-anchor symptom"
+    )
 
 
 def test_full_pipeline_smoke(total_eclipse_inputs):
