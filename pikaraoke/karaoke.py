@@ -558,6 +558,9 @@ class Karaoke:
         # lands on disk. Fires before lyrics_upgraded so the splash hot-swap
         # reads the freshly-pinned override.
         self.events.on("subtitle_variant_landed", self._on_subtitle_variant_landed)
+        # Soft-miss counterpart: clear the deferred pin and toast so the
+        # picker doesn't hang on `downloading` when the source has no match.
+        self.events.on("subtitle_variant_miss", self._on_subtitle_variant_miss)
         self.events.on(
             "sync_started",
             lambda: self.socketio.emit("sync_started", namespace="/") if self.socketio else None,
@@ -1841,6 +1844,40 @@ class Karaoke:
             source,
             os.path.basename(song_path),
         )
+
+    def _on_subtitle_variant_miss(self, payload: dict[str, Any]) -> None:
+        """Clear a stuck deferred pick when its variant fetch soft-missed.
+
+        Without this, a not_found Genius/LRCLib/etc. fetch leaves the picker
+        pinned on `downloading` forever (no `subtitle_variant_landed` to
+        trigger ``_on_subtitle_variant_landed``).
+        """
+        try:
+            song_path = payload["song_path"]
+            source = payload["source"]
+        except (KeyError, TypeError):
+            logging.warning("subtitle_variant_miss: malformed payload %r", payload)
+            return
+        pending = self.get_pending_subtitle_pick(song_path)
+        if pending != source:
+            return
+        self.clear_pending_subtitle_pick(song_path)
+        logging.info(
+            "subtitle_variant_miss: cleared pending pick %s for %s",
+            source,
+            os.path.basename(song_path),
+        )
+        try:
+            self.events.emit(
+                "notification",
+                f"No {source} lyrics found for this song",
+            )
+        except Exception:
+            logging.exception("subtitle_variant_miss: notification emit failed")
+        try:
+            self.update_now_playing_socket()
+        except Exception:
+            logging.exception("subtitle_variant_miss: now_playing emit failed")
 
     def _on_lyrics_upgraded(self, song_path: str) -> None:
         """Force the splash to reload subtitles when word-level ASS lands mid-song.

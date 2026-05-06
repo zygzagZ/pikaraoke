@@ -672,9 +672,7 @@ class LyricsService:
                 {"song_path": song_path, "source": source},
             )
         except Exception:
-            logger.exception(
-                "failed to emit subtitle_variant_landed for %s/%s", source, song_path
-            )
+            logger.exception("failed to emit subtitle_variant_landed for %s/%s", source, song_path)
         try:
             self._events.emit("lyrics_upgraded", song_path)
         except Exception:
@@ -884,6 +882,24 @@ class LyricsService:
                 logger.exception("failed to emit song_warning for fetch_variant")
             return False
         if not ass:
+            # Soft miss: render returned None (e.g., Genius search empty,
+            # LRCLib has no row). Without an event the deferred picker pin
+            # set by /subtitle_source stays in `downloading` forever — no
+            # subtitle_variant_landed fires to clear it.
+            logger.info(
+                "fetch_variant: soft miss for %s/%s",
+                os.path.basename(song_path),
+                source,
+            )
+            try:
+                self._events.emit(
+                    "subtitle_variant_miss",
+                    {"song_path": song_path, "source": source},
+                )
+            except Exception:
+                logger.exception(
+                    "failed to emit subtitle_variant_miss for %s/%s", source, song_path
+                )
             return False
         try:
             self._write_and_register_variant(song_path, source, ass)
@@ -1663,9 +1679,7 @@ class LyricsService:
                 # more, the second 429 below punts to orchestrator backoff.
                 cooldown = min(_retry_after(r), SPOTIFY_RATE_LIMIT_SLEEP_CAP)
                 self._spotify_rate_limited_until = time.time() + cooldown
-                logger.warning(
-                    "Spotify search rate-limited; sleeping %.0fs and retrying", cooldown
-                )
+                logger.warning("Spotify search rate-limited; sleeping %.0fs and retrying", cooldown)
                 time.sleep(cooldown)
                 r = _do_search()
                 if r.status_code == 429:
@@ -3636,6 +3650,10 @@ def _fetch_genius(track: str, artist: str) -> str | None:
             url = result.get("url")
             break
     if not url:
+        candidates = [
+            ((h.get("result") or {}).get("primary_artist") or {}).get("name", "") for h in hits[:3]
+        ]
+        logger.info("Genius: no artist match for %r (saw primaries: %r)", artist, candidates)
         return None
     try:
         page = requests.get(url, timeout=GENIUS_TIMEOUT)

@@ -661,6 +661,30 @@ class TestFetchGenius:
         ):
             assert _fetch_genius("Track", "Artist") is None
 
+    def test_logs_seen_primaries_on_artist_mismatch(self, caplog):
+        # Diagnostic: when search returns hits but no primary_artist matches,
+        # log the queried artist + a sample of seen primaries so the operator
+        # can spot featured-artist mismatches like "Macklemore & Ryan Lewis"
+        # vs Genius's "Macklemore".
+        search_resp = MagicMock(status_code=200)
+        search_resp.json.return_value = {
+            "response": {
+                "hits": [
+                    {"result": {"primary_artist": {"name": "Macklemore"}, "url": "u"}},
+                    {"result": {"primary_artist": {"name": "Ryan Lewis"}, "url": "u"}},
+                ]
+            }
+        }
+        with patch("pikaraoke.lib.lyrics.GENIUS_ACCESS_TOKEN", "token"), patch(
+            "pikaraoke.lib.lyrics.requests.get", return_value=search_resp
+        ), caplog.at_level("INFO", logger="pikaraoke.lib.lyrics"):
+            assert _fetch_genius("Track", "Macklemore & Ryan Lewis") is None
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "no artist match" in m and "Macklemore & Ryan Lewis" in m and "Macklemore" in m
+            for m in msgs
+        ), msgs
+
     def test_returns_none_on_network_error(self):
         with patch("pikaraoke.lib.lyrics.GENIUS_ACCESS_TOKEN", "token"), patch(
             "pikaraoke.lib.lyrics.requests.get", side_effect=requests.ConnectionError()
@@ -1930,6 +1954,18 @@ class TestFetchVariantDispatchAndDedup:
         with patch.object(service, "_render_vtt_ass", return_value=None):
             assert service.fetch_variant(song, "youtube-vtt") is False
         assert not (tmp_path / "Foo---abc.youtube-vtt.ass").exists()
+        db.close()
+
+    def test_render_returning_none_emits_variant_miss(self, tmp_path):
+        # Soft miss must emit subtitle_variant_miss so a deferred picker pin
+        # set by /subtitle_source can be cleared. Without this the picker
+        # hangs on `downloading` forever (no landed event ever fires).
+        song, db, service = self._service(tmp_path)
+        misses: list = []
+        service._events.on("subtitle_variant_miss", lambda p: misses.append(p))
+        with patch.object(service, "_render_vtt_ass", return_value=None):
+            assert service.fetch_variant(song, "youtube-vtt") is False
+        assert misses == [{"song_path": song, "source": "youtube-vtt"}]
         db.close()
 
     def test_in_flight_dedup_across_threads(self, tmp_path):
@@ -3885,9 +3921,7 @@ class TestSpotifySearchRateLimit:
         ok = MagicMock(status_code=200)
         ok.json.return_value = {"tracks": {"items": [{"id": "TID", "artists": [{"name": "b"}]}]}}
         with (
-            patch(
-                "pikaraoke.lib.lyrics.requests.get", side_effect=[rate_limited, ok]
-            ) as mock_get,
+            patch("pikaraoke.lib.lyrics.requests.get", side_effect=[rate_limited, ok]) as mock_get,
             patch("pikaraoke.lib.lyrics.time.sleep") as mock_sleep,
         ):
             assert svc._resolve_spotify_track_id("a", "b", None) == "TID"
@@ -3901,9 +3935,7 @@ class TestSpotifySearchRateLimit:
         rate_limited = MagicMock(status_code=429)
         rate_limited.headers = {"Retry-After": "30"}
         with (
-            patch(
-                "pikaraoke.lib.lyrics.requests.get", return_value=rate_limited
-            ) as mock_get,
+            patch("pikaraoke.lib.lyrics.requests.get", return_value=rate_limited) as mock_get,
             patch("pikaraoke.lib.lyrics.time.sleep"),
         ):
             assert svc._resolve_spotify_track_id("a", "b", None) is None

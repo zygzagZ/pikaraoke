@@ -269,3 +269,52 @@ class TestBackfillScheduler:
         scheduler.stop()
         thread.join(timeout=1.0)
         assert not thread.is_alive(), "stop() did not unblock the pause loop"
+
+
+class TestOnSubtitleVariantMiss:
+    """Soft-miss handler clears stuck deferred picks + toasts the operator."""
+
+    def _stub(self, pending: dict[str, str]):
+        events_emitted: list = []
+        socket_calls: list = []
+
+        stub = SimpleNamespace(
+            _picks=dict(pending),
+            get_pending_subtitle_pick=lambda p: stub._picks.get(p),
+            clear_pending_subtitle_pick=lambda p: stub._picks.pop(p, None),
+            events=SimpleNamespace(
+                emit=lambda *args, **kwargs: events_emitted.append((args, kwargs))
+            ),
+            update_now_playing_socket=lambda: socket_calls.append(1),
+        )
+        return stub, events_emitted, socket_calls
+
+    def test_clears_pick_and_toasts_when_source_matches(self):
+        stub, emitted, sockets = self._stub({"/songs/foo.mp4": "genius-sync"})
+        Karaoke._on_subtitle_variant_miss(
+            stub, {"song_path": "/songs/foo.mp4", "source": "genius-sync"}
+        )
+        assert stub._picks == {}
+        assert sockets == [1]
+        # First emit is the notification toast.
+        assert emitted and emitted[0][0][0] == "notification"
+        assert "genius-sync" in emitted[0][0][1]
+
+    def test_no_op_when_pick_is_for_different_source(self):
+        # Picker intent moved on (user picked LRCLib while Genius worker was
+        # still racing); a stale Genius miss must NOT clear the new pick.
+        stub, emitted, sockets = self._stub({"/songs/foo.mp4": "lrclib-sync"})
+        Karaoke._on_subtitle_variant_miss(
+            stub, {"song_path": "/songs/foo.mp4", "source": "genius-sync"}
+        )
+        assert stub._picks == {"/songs/foo.mp4": "lrclib-sync"}
+        assert emitted == []
+        assert sockets == []
+
+    def test_malformed_payload_is_ignored(self):
+        stub, emitted, sockets = self._stub({"/songs/foo.mp4": "genius-sync"})
+        Karaoke._on_subtitle_variant_miss(stub, {"song_path": "/songs/foo.mp4"})
+        # Pending pick untouched, no toast, no socket bump.
+        assert stub._picks == {"/songs/foo.mp4": "genius-sync"}
+        assert emitted == []
+        assert sockets == []
