@@ -838,14 +838,62 @@ class Karaoke:
         racing for the aligner / Demucs / network. The lyrics pipeline is
         idempotent (cache hits short-circuit) so duplicate dispatches across
         back-to-back scans are harmless.
+
+        Idle-gated: each song waits until the queue is empty AND nothing is
+        playing so background lyrics fetches don't compete with active
+        karaoke (network, CPU, aligner). Pause/resume transitions are
+        logged so the operator can see why the pipeline isn't progressing.
         """
+        total = len(song_paths)
+
+        def _is_idle() -> bool:
+            try:
+                queue_len = len(self.queue_manager.queue)
+            except AttributeError:
+                queue_len = 0
+            try:
+                playing = self.playback_controller.now_playing_filename is not None
+            except AttributeError:
+                playing = False
+            return queue_len == 0 and not playing
+
+        def _wait_until_idle() -> None:
+            paused_logged = False
+            while not _is_idle():
+                if not paused_logged:
+                    try:
+                        queue_len = len(self.queue_manager.queue)
+                    except AttributeError:
+                        queue_len = 0
+                    logging.info(
+                        "library reprocess: paused (queue=%d, playing=%s); "
+                        "will resume when idle",
+                        queue_len,
+                        self.playback_controller.now_playing_filename is not None,
+                    )
+                    paused_logged = True
+                time.sleep(5)
+            if paused_logged:
+                logging.info("library reprocess: resumed (idle)")
 
         def _run() -> None:
-            for path in song_paths:
+            logging.info(
+                "library reprocess: starting %d song(s) (idle-gated — pauses while queue/now-playing busy)",
+                total,
+            )
+            for index, path in enumerate(song_paths, start=1):
+                _wait_until_idle()
+                logging.info(
+                    "library reprocess: %d/%d %s",
+                    index,
+                    total,
+                    os.path.basename(path),
+                )
                 try:
                     self.lyrics_service.fetch_and_convert(path)
                 except Exception:
                     logging.exception("integrity reprocess failed for %s", path)
+            logging.info("library reprocess: done (%d song(s))", total)
 
         threading.Thread(
             target=_run,
