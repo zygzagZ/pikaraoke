@@ -99,6 +99,10 @@ class _Harness:
         self.queue_manager = QueueManager(preferences=self.preferences, events=self.events)
         self.volume = 0.85
         self.state_persistence = StatePersistence(path=str(tmp_path / "state.json"))
+        # ``_restore_state`` consults ``self.db`` to backfill ``song_id`` for
+        # queue items persisted before that field existed; harness tests run
+        # without a DB.
+        self.db = None
 
     _restore_state = Karaoke._restore_state
     _persist_state = Karaoke._persist_state

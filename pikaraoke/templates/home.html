@@ -195,6 +195,7 @@
   .pk-queue-row:nth-child(4n+3) { border-left-color: var(--pk-sun); transform: rotate(-0.2deg); }
   .pk-queue-row:nth-child(4n)   { border-left-color: var(--pk-lime); transform: rotate(0.2deg); }
   .pk-queue-row.is-drag-handle { grid-template-columns: 24px 32px 1fr auto; }
+  .pk-queue-row.is-drag-handle.has-rosette { grid-template-columns: 24px 32px 1fr auto auto; }
   .pk-queue-row.is-chosen {
     background: color-mix(in srgb, var(--pk-amber) 20%, var(--pk-surface));
     box-shadow: var(--pk-shadow-elev);
@@ -478,7 +479,17 @@
         const cog = isAdmin
           ? `<button type="button" class="pk-queue-cog pk-queue-opts" data-idx="${i}" data-file="${encodeURIComponent(item.file)}" data-title="${encodeURIComponent(item.title)}" aria-label="Opcje"><i class="icon icon-cog"></i></button>`
           : '';
-        const cls = 'pk-queue-row' + (isAdmin ? ' is-drag-handle' : '');
+        // Rosette only renders for admin (the bulk endpoint is admin-only)
+        // and when the queue item carries a song_id (DB resolved). The
+        // ``has-rosette`` modifier flips the row grid to add the extra
+        // column.
+        const hasRosette = isAdmin && Number.isFinite(item.song_id);
+        const rosetteMount = hasRosette
+          ? `<div class="pk-queue-rosette-mount" data-song-id="${item.song_id}" data-idx="${i}"></div>`
+          : '';
+        const cls = 'pk-queue-row'
+          + (isAdmin ? ' is-drag-handle' : '')
+          + (hasRosette ? ' has-rosette' : '');
         return `
           <div class="${cls}" data-index="${i}" data-file="${encodeURIComponent(item.file)}">
             ${dragHandle}
@@ -487,12 +498,14 @@
               <div class="pk-queue-title-r">${escHtml(stripQuotes(item.title))}</div>
               <div class="pk-queue-singer-r">śpiewa <span class="singer">${escHtml(item.user || '')}</span></div>
             </div>
+            ${rosetteMount}
             ${cog}
           </div>`;
       })
       .join('');
 
     initSortable();
+    refreshRosettes();
 
     if (highlightFile) {
       const rows = $list.querySelectorAll('.pk-queue-row');
@@ -501,6 +514,64 @@
       });
       highlightFile = null;
     }
+  }
+
+  // Queue rosette management — bulk-fetched per render so the row pill
+  // (and its expand chips) always reflects current per-source state. Each
+  // mounted instance owns its own ``subtitle_job_update`` socket listener
+  // filtered by song_id, so live transitions update the pill without a
+  // re-render.
+  const rosetteInstances = new Map();
+
+  function teardownRosettes() {
+    rosetteInstances.forEach((inst) => {
+      try { inst.destroy(); } catch (_) { /* defensive */ }
+    });
+    rosetteInstances.clear();
+  }
+
+  function refreshRosettes() {
+    teardownRosettes();
+    if (!isAdmin) return;
+    const factory = window.PK && window.PK.SubtitleSourcePicker
+      && window.PK.SubtitleSourcePicker.mountQueueRosette;
+    if (!factory) return;
+    const $list = document.getElementById('pk-queue-list');
+    if (!$list) return;
+
+    const slots = $list.querySelectorAll('.pk-queue-rosette-mount[data-song-id]');
+    if (!slots.length) return;
+
+    const slotsBySong = new Map();
+    slots.forEach((slot) => {
+      const sid = parseInt(slot.dataset.songId, 10);
+      if (!Number.isFinite(sid)) return;
+      if (!slotsBySong.has(sid)) slotsBySong.set(sid, []);
+      slotsBySong.get(sid).push(slot);
+    });
+    if (!slotsBySong.size) return;
+
+    fetch('/api/songs/subtitles/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ song_ids: Array.from(slotsBySong.keys()) }),
+    })
+      .then((resp) => (resp.ok ? resp.json() : Promise.reject(resp.status)))
+      .then((payload) => {
+        slotsBySong.forEach((slotList, sid) => {
+          const data = payload[String(sid)];
+          if (!data) return;
+          slotList.forEach((slot) => {
+            // The slot is the actual mount container; the factory appends
+            // its own ``.pk-rosette`` child into it.
+            const inst = factory(slot, () => sid, { socket: window.socket });
+            inst.update(data);
+            rosetteInstances.set(slot, inst);
+          });
+        });
+      })
+      .catch(() => { /* rosette is non-critical; swallow */ });
   }
 
   function initSortable() {

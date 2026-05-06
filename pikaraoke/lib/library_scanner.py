@@ -8,6 +8,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
+from pikaraoke.lib.lyrics_pipeline_failure_cache import (
+    is_failure_in_backoff,
+    read_failure,
+)
 from pikaraoke.lib.metadata_parser import youtube_id_suffix
 from pikaraoke.lib.song_list import SongList
 
@@ -127,7 +131,7 @@ class LibraryScanner:
         # before _verify_integrity runs.
         self._on_provenance_classified = on_provenance_classified
 
-    def scan(self, songs_dir: str) -> ScanResult:
+    def scan(self, songs_dir: str, *, force_lyrics_retry: bool = False) -> ScanResult:
         """Synchronise the database with the filesystem.
 
         Algorithm:
@@ -139,6 +143,12 @@ class LibraryScanner:
            accounting for moves), skip deletes — unless the scan directory
            changed, in which case the breaker is bypassed.
         5. Apply path updates (moves), inserts, and deletes to the DB.
+
+        ``force_lyrics_retry`` bypasses the canonical-pipeline failure
+        cache so the integrity check re-queues every song without an
+        ass_auto/ass_user file regardless of prior failures. Wired to
+        the operator-facing "Sync Now" button — explicit user action
+        means "I want to retry now."
         """
         last_dir = self._db.get_metadata(self._METADATA_KEY)
 
@@ -230,7 +240,7 @@ class LibraryScanner:
         # Walk artifacts to spot files that vanished or changed sha out-of-band
         # (user edited an .ass, mounted volume regenerated stems, etc.) and
         # surface songs that need a fresh lyrics pipeline run.
-        reprocess_paths = self._verify_integrity()
+        reprocess_paths = self._verify_integrity(force_lyrics_retry=force_lyrics_retry)
         if reprocess_paths:
             logging.info(f"Scan: {len(reprocess_paths)} song(s) flagged for reprocess")
 
@@ -242,7 +252,7 @@ class LibraryScanner:
             reprocess_paths=reprocess_paths,
         )
 
-    def _verify_integrity(self) -> list[str]:
+    def _verify_integrity(self, *, force_lyrics_retry: bool = False) -> list[str]:
         """Validate every registered artifact and queue songs for reprocess.
 
         For each artifact row:
@@ -259,7 +269,11 @@ class LibraryScanner:
 
         Songs that survive integrity but have no ass_auto/ass_user companion
         (typical of fresh scanner-imported collections) are also queued so
-        the lyrics pipeline runs once for each.
+        the lyrics pipeline runs once for each — UNLESS the canonical
+        failure cache has a future ``next_retry_at`` for the song's
+        ``audio_sha256``. That gate stops the per-startup re-run loop on
+        songs that no source can produce lyrics for. ``force_lyrics_retry``
+        bypasses the gate entirely (operator clicked "Sync Now").
 
         Imports are deferred to keep audio_fingerprint / demucs_processor
         (torch) out of the scanner's import graph.
@@ -331,7 +345,10 @@ class LibraryScanner:
                     # only — verify_artifact_fingerprint already did that.
 
             # Imported songs that never went through the lyrics pipeline
-            # (no auto + no user-authored .ass) get one shot at it now.
+            # (no auto + no user-authored .ass) get one shot at it now —
+            # unless a prior pipeline run failed and the failure cache's
+            # next_retry_at is still in the future. ``force_lyrics_retry``
+            # bypasses that gate (admin "Sync Now").
             if (
                 not needs_reprocess
                 and "ass_auto" not in roles_present
@@ -339,12 +356,37 @@ class LibraryScanner:
             ):
                 row = self._db.get_song_by_path(song_path)
                 if row is not None and row["format"] not in _LYRICS_SKIP_FORMATS:
-                    needs_reprocess = True
+                    if force_lyrics_retry or not self._is_in_pipeline_failure_backoff(row):
+                        needs_reprocess = True
 
             if needs_reprocess:
                 queue.append(song_path)
 
         return queue
+
+    def _is_in_pipeline_failure_backoff(self, song_row) -> bool:
+        """True when the song's audio_sha256 has a future ``next_retry_at``.
+
+        Returns False when ``audio_sha256`` is missing (legacy songs not
+        yet fingerprinted) — those need to run at least once to get a
+        fingerprint, so we let them through. Returns False on any cache
+        read error so the gate degrades open.
+        """
+        try:
+            audio_sha = song_row["audio_sha256"]
+        except (KeyError, IndexError):
+            return False
+        if not audio_sha:
+            return False
+        try:
+            failure = read_failure(self._db.get_metadata, audio_sha)
+        except Exception:
+            logging.exception(
+                "Scan: pipeline-failure cache read failed for sha=%s",
+                audio_sha[:12] if audio_sha else "?",
+            )
+            return False
+        return is_failure_in_backoff(failure)
 
     def _backfill_artifacts(self) -> None:
         """Register artifacts + info.json metadata for songs that lack them.

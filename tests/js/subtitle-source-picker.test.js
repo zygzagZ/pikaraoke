@@ -5,6 +5,8 @@ import {
   computeCountdown,
   sortSourcesCanonically,
   deriveCornerBadgeState,
+  deriveQueueRosetteState,
+  deriveChipState,
   computePickerSig,
 } from '../../pikaraoke/static/js/subtitle-source-picker.js';
 
@@ -257,6 +259,78 @@ describe('computePickerSig', () => {
     const before = [row('AI', 'na', { state: 'queued' })];
     const after = [row('AI', 'downloading', { state: 'running' })];
     expect(computePickerSig(null, before)).not.toBe(computePickerSig(null, after));
+  });
+});
+
+describe('deriveQueueRosetteState', () => {
+  it('inherits ready/total/severity from computeReadySummary', () => {
+    const sources = [
+      row('lrclib', 'ready', { state: 'success' }),
+      row('AI', 'na'),
+    ];
+    const view = deriveQueueRosetteState(sources);
+    expect(view.ready).toBe(1);
+    expect(view.total).toBe(2);
+    expect(view.label).toBe('1/2');
+    expect(view.severity).toBe('amber');
+    expect(view.spinning).toBe(false);
+  });
+
+  it('flags spinning when any orchestrated source is running', () => {
+    const sources = [
+      row('lrclib', 'ready', { state: 'success' }),
+      row('AI', 'downloading', { state: 'running' }),
+    ];
+    expect(deriveQueueRosetteState(sources).spinning).toBe(true);
+  });
+
+  it('flags spinning on capability-only downloading status', () => {
+    const sources = [row('AI', 'downloading')];
+    expect(deriveQueueRosetteState(sources).spinning).toBe(true);
+  });
+
+  it('flags spinning when a source is queued', () => {
+    const sources = [row('lrclib', 'queued', { state: 'queued' })];
+    expect(deriveQueueRosetteState(sources).spinning).toBe(true);
+  });
+
+  it('reports red + not spinning for an empty list', () => {
+    expect(deriveQueueRosetteState([])).toEqual({
+      ready: 0, total: 0, label: '0/0', severity: 'red', spinning: false,
+    });
+  });
+});
+
+describe('deriveChipState', () => {
+  it('downloading wins over a stale ready status', () => {
+    const out = deriveChipState(row('AI', 'ready', { state: 'running' }));
+    expect(out.cssClass).toBe('downloading');
+    expect(out.glyph).toBe('⟳');
+  });
+
+  it('rate_limited collapses to error css', () => {
+    expect(deriveChipState(row('genius-sync', 'na', { state: 'rate_limited' })).cssClass)
+      .toBe('error');
+  });
+
+  it('error status without state still maps to error', () => {
+    expect(deriveChipState(row('lrclib', 'error')).cssClass).toBe('error');
+  });
+
+  it('success state maps to ready', () => {
+    expect(deriveChipState(row('lrclib', 'na', { state: 'success' })).cssClass).toBe('ready');
+  });
+
+  it('download status without state maps to pending', () => {
+    expect(deriveChipState(row('AI', 'download')).cssClass).toBe('pending');
+  });
+
+  it('na status with no state maps to na', () => {
+    expect(deriveChipState(row('youtube-vtt', 'na')).cssClass).toBe('na');
+  });
+
+  it('null source returns na', () => {
+    expect(deriveChipState(null).cssClass).toBe('na');
   });
 });
 

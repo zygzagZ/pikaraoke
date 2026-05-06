@@ -50,23 +50,39 @@ def test_first_line_snaps_to_first_onset(mam_te_moc_inputs):
     assert abs(out[first_text_idx] - (first_onset - LEAD_IN_S)) < 2.0
 
 
-def test_per_verse_shifts_grow_monotonically(mam_te_moc_inputs):
-    """Cumulative shift (shifted - original) grows from verse to verse,
-    not flatly applied as a single global offset."""
+def test_per_verse_shifts_are_not_a_global_offset(mam_te_moc_inputs):
+    """Cumulative shift varies meaningfully across verses, ruling out a
+    flat global offset.
+
+    A single global shift would produce identical per-line drift across
+    the entire song. Mam Tę Moc's YouTube version drifts non-uniformly
+    relative to LRClib's canonical timestamps, so the DP's job is to
+    anchor multiple verses independently. The exact per-verse trend is
+    not strictly monotonic (this fixture's drift goes +1 → +12 → -5 →
+    +30 across verses depending on which onsets the DP picks up), but
+    a global-offset implementation would collapse to span ≈ 0.
+    """
     out = _starts(lyrics_align._detect_per_line_starts("/dev/null", mam_te_moc_inputs))
     assert out is not None
     shifts = [
-        (i, out[i] - mam_te_moc_inputs[i][0])
+        out[i] - mam_te_moc_inputs[i][0]
         for i, (_, _, t) in enumerate(mam_te_moc_inputs)
         if t.strip()
     ]
-    # Drift should not be perfectly flat - a global shift would have
-    # zero variance across the song.
-    shift_values = [s for _, s in shifts]
-    span = max(shift_values) - min(shift_values)
-    assert span >= 0.5, (
-        f"per-verse drift collapsed to a global shift (span={span:.3f}s); "
-        "DP must anchor multiple verses, not just the first line"
+    span = max(shifts) - min(shifts)
+    assert span >= 5.0, (
+        f"per-verse drift collapsed (span={span:.3f}s); a flat global "
+        f"shift would produce span ≈ 0, but real per-verse anchoring on "
+        f"this fixture spans tens of seconds"
+    )
+    # Catch the "all lines clustered tight around one shift value"
+    # failure mode: at least 30% of lines must differ from the median
+    # shift by more than 1.0s.
+    median = sorted(shifts)[len(shifts) // 2]
+    far_from_median = sum(1 for s in shifts if abs(s - median) > 1.0)
+    assert far_from_median >= 0.3 * len(shifts), (
+        f"only {far_from_median}/{len(shifts)} lines drift > 1s from "
+        f"the median shift {median:.2f}s; per-verse anchoring lost"
     )
 
 

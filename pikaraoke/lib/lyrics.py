@@ -57,13 +57,25 @@ from pikaraoke.lib.lyrics_language_classifier import (
     classify_and_persist as _classify_language,
 )
 from pikaraoke.lib.lyrics_language_classifier import read_info_json as _read_info_json
+from pikaraoke.lib.lyrics_pipeline_failure_cache import (
+    clear_failure as _clear_pipeline_failure,
+)
+from pikaraoke.lib.lyrics_pipeline_failure_cache import (
+    record_failure as _record_pipeline_failure,
+)
 from pikaraoke.lib.metadata_parser import remove_accents
 from pikaraoke.lib.music_metadata import (
     _itunes_row_to_dict,
-    _normalize_title,
     _search_itunes_cached,
     fetch_musicbrainz_language_signals,
+    normalize_title,
     resolve_metadata,
+)
+from pikaraoke.lib.whisper_transcript_cache import (
+    read_cached_transcript as _read_cached_whisper_transcript,
+)
+from pikaraoke.lib.whisper_transcript_cache import (
+    write_cached_transcript as _write_cached_whisper_transcript,
 )
 
 logger = logging.getLogger(__name__)
@@ -300,6 +312,33 @@ def _tier_for_variant_source(source: str) -> str | None:
     return _VARIANT_SOURCE_TIERS.get(source)
 
 
+def _dispatch_reenrich(db, song_id: int, song_path: str) -> None:
+    """Fire ``enrich_song`` in a daemon thread after a language-write site.
+
+    The enricher is idempotent: when ``songs.language_at_enrich ==
+    songs.language`` and ``metadata_status == 'enriched'`` it short-circuits.
+    So calling this hook is safe even if the language didn't actually change
+    — every classifier / whisper-probe write site invokes it, and the
+    enricher decides whether work is needed. Imports are deferred so the
+    lyrics module stays importable in environments where the enricher's
+    requests/network chain isn't installed.
+    """
+    if db is None:
+        return
+
+    def _run() -> None:
+        try:
+            from pikaraoke.lib.song_enricher import enrich_song
+
+            enrich_song(db, song_id, song_path)
+        except Exception:
+            logger.exception("re-enrich after language write failed for %s", song_path)
+
+    threading.Thread(
+        target=_run, name=f"reenrich-{os.path.basename(song_path)}", daemon=True
+    ).start()
+
+
 @dataclass(frozen=True)
 class WordPart:
     """Sub-word chunk with its audio-aligned start/end in seconds.
@@ -484,6 +523,10 @@ class LyricsService:
                 lyrics_provenance=provenance,
                 also_register_variant=write_variant,
             )
+            # Canonical write succeeded — drop any stale failure marker so
+            # the integrity scan doesn't keep this song in backoff after
+            # we've actually produced a .ass for it.
+            self._clear_pipeline_failure_marker(song_path)
             logger.info(
                 "tier gate: %s wrote %s (tier=%s -> %s, variant=%s)",
                 os.path.basename(song_path),
@@ -493,6 +536,20 @@ class LyricsService:
                 "yes" if write_variant else "no",
             )
             return True
+
+    def _clear_pipeline_failure_marker(self, song_path: str) -> None:
+        """Remove the canonical-pipeline failure record for ``song_path``.
+
+        Called from inside ``_try_write_ass_tiered`` on successful canonical
+        writes. Best-effort: lookup or write failures are logged and
+        swallowed so a transient DB hiccup can't poison the success path.
+        """
+        if self._db is None:
+            return
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return
+        _clear_pipeline_failure(self._db.set_metadata, audio_sha)
 
     def _register_ass(
         self,
@@ -1182,6 +1239,17 @@ class LyricsService:
                     )
                 except Exception:
                     logger.exception("failed to emit song_warning for missing lyrics")
+                # Also persist a failure marker so the integrity scan doesn't
+                # re-run the LRCLib/Genius/VTT round on every restart for songs
+                # that never had any chance of succeeding.
+                audio_sha = self._audio_sha_for_song(song_path)
+                if audio_sha and self._db is not None:
+                    _record_pipeline_failure(
+                        self._db.get_metadata,
+                        self._db.set_metadata,
+                        audio_sha,
+                        error_code="whisper_disabled_no_lyrics",
+                    )
             return
 
         # VTT cleanup is conditional: only drop YouTube's raw captions once
@@ -1244,6 +1312,7 @@ class LyricsService:
                 _lrc_plain_text(lrc),
                 lrc_lines=lrc_line_windows(lrc),
                 language=language,
+                vad_cache=self._vad_cache_for_song(song_path),
             )
             if not words:
                 return None
@@ -1252,7 +1321,7 @@ class LyricsService:
                 render_lrc = _shift_lrc_per_line(lrc, line_starts)
             else:
                 render_lrc = lrc
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, render_lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
             logger.warning(
@@ -1317,7 +1386,7 @@ class LyricsService:
             synthetic_lrc = _lrc_from_aligned_lines(words, lines)
             if not synthetic_lrc:
                 return None
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, synthetic_lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
             logger.warning(
@@ -1514,34 +1583,68 @@ class LyricsService:
         return _spotify_lines_to_lrc(lyrics_block.get("lines") or [])
 
     def _render_whisper_word_ass(self, song_path: str) -> str | None:
-        """Whisper ASR → word-level ASS. Returns ASS string or None."""
+        """Whisper ASR → word-level ASS. Returns ASS string or None.
+
+        Variant-fetch entry point (``fetch_variant_sync(song_path, "AI")``).
+        Distinct from the canonical ``_try_whisper_fallback`` — this one
+        renders ``<stem>.AI.ass`` (the operator-pinnable variant), the
+        other writes ``<stem>.ass`` (the canonical auto file). Both share
+        the ``(audio_sha256, model)`` transcript cache so when one path
+        already paid the transcribe cost, the other reads it back.
+        """
         try:
             _prewarm_stems(song_path)
             audio_path = _wait_for_alignment_audio(song_path)
-            model = _get_whisper_model()
-            if model is None:
-                return None
-            segments_iter, info = model.transcribe(
-                audio_path, word_timestamps=True, vad_filter=True
-            )
-            segments = list(segments_iter)
-            if not segments:
-                return None
-            lrc = _lrc_from_whisper_segments(segments)
-            lang = getattr(info, "language", None)
-            words: list[Word] = []
-            for seg in segments:
-                for w in seg.words or []:
-                    text = (getattr(w, "word", "") or "").strip()
-                    if not text or w.start is None or w.end is None:
-                        continue
-                    start = float(w.start)
-                    end = float(w.end)
-                    parts = _syllable_parts(text, lang, start, end)
-                    words.append(Word(text=text, start=start, end=end, parts=parts))
-            if not words or not lrc:
-                return None
-            bpm = _estimate_bpm(audio_path)
+            model_name = _resolve_whisper_model()
+            audio_sha = self._audio_sha_for_song(song_path)
+
+            cached = None
+            if audio_sha and self._db is not None:
+                cached = _read_cached_whisper_transcript(
+                    self._db.get_metadata, audio_sha, model_name
+                )
+            if cached is not None:
+                logger.info(
+                    "whisper_transcript: cache hit (variant) sha=%s model=%s",
+                    audio_sha[:12],
+                    model_name,
+                )
+                words = list(cached.words)
+                lrc = cached.lrc
+            else:
+                model = _get_whisper_model()
+                if model is None:
+                    return None
+                segments_iter, info = model.transcribe(
+                    audio_path, word_timestamps=True, vad_filter=True
+                )
+                segments = list(segments_iter)
+                if not segments:
+                    return None
+                lrc = _lrc_from_whisper_segments(segments)
+                lang = getattr(info, "language", None)
+                words = []
+                for seg in segments:
+                    for w in seg.words or []:
+                        text = (getattr(w, "word", "") or "").strip()
+                        if not text or w.start is None or w.end is None:
+                            continue
+                        start = float(w.start)
+                        end = float(w.end)
+                        parts = _syllable_parts(text, lang, start, end)
+                        words.append(Word(text=text, start=start, end=end, parts=parts))
+                if not words or not lrc:
+                    return None
+                if audio_sha and self._db is not None:
+                    _write_cached_whisper_transcript(
+                        self._db.set_metadata,
+                        audio_sha,
+                        model_name,
+                        language=lang,
+                        lrc=lrc,
+                        words=words,
+                    )
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, lrc, params=_anim_params_for_bpm(bpm))
         except Exception:
             logger.exception("_render_whisper_word_ass: failed for %s", song_path)
@@ -1701,9 +1804,9 @@ class LyricsService:
         mb_signals: dict | None = None
         if info and info.get("artist") and info.get("track"):
             # Match the enricher's query shape (`_query_from_song` + iTunes'
-            # internal ``_normalize_title``) so both paths share the same LRU
+            # internal ``normalize_title``) so both paths share the same LRU
             # entry and pay at most one iTunes round-trip per song.
-            query = _normalize_title(f"{info['artist']} - {info['track']}")
+            query = normalize_title(f"{info['artist']} - {info['track']}")
             try:
                 rows = _search_itunes_cached(query, 1)
                 if rows:
@@ -1729,6 +1832,13 @@ class LyricsService:
         except Exception:
             logger.exception("classifier: classify_and_persist crashed for %s", song_path)
             return
+
+        # Re-enrich whenever Tier 1 produced a verdict — the enricher
+        # short-circuits if ``language_at_enrich`` already matches, so a
+        # consensus that confirmed the existing language costs only the
+        # idempotency check.
+        if verdict is not None:
+            _dispatch_reenrich(self._db, song_id, song_path)
 
         # Tier 2a (US-43): when Tier 1 couldn't reach consensus, run a
         # Whisper language-ID probe on the raw audio. The probe writes
@@ -1806,6 +1916,8 @@ class LyricsService:
             lang,
             bool(applied),
         )
+        if applied:
+            _dispatch_reenrich(self._db, song_id, song_path)
 
     def _apply_cached_stems_probe(self, song_path: str) -> None:
         """Apply a previously cached ``whisper_probe_stems`` verdict, if any.
@@ -1864,6 +1976,7 @@ class LyricsService:
                 cached_lang,
                 current_lang,
             )
+            _dispatch_reenrich(self._db, song_id, song_path)
 
     def _run_tier2b_probe(self, song_path: str, song_id: int, stem_path: str) -> bool:
         """Tier 2b Whisper language-ID re-probe on the vocals stem (US-43).
@@ -1927,6 +2040,8 @@ class LyricsService:
         except Exception:
             logger.exception("tier2b probe: failed to persist lang=%s for %s", stem_lang, song_path)
             return False
+        if applied:
+            _dispatch_reenrich(self._db, song_id, song_path)
 
         same_lang = _lang_base(current_lang or "") == stem_lang
         if same_lang:
@@ -2181,7 +2296,11 @@ class LyricsService:
                 )
                 return
             words = self._aligner.align(
-                audio_path, plain, lrc_lines=lrc_line_windows(lrc), language=language
+                audio_path,
+                plain,
+                lrc_lines=lrc_line_windows(lrc),
+                language=language,
+                vad_cache=self._vad_cache_for_song(song_path),
             )
             if self._db is not None and song_id is not None and not db_lang:
                 # Persist the text-detected language so future runs and UI
@@ -2194,7 +2313,7 @@ class LyricsService:
                 )
             if not words:
                 return
-            bpm = _estimate_bpm(audio_path)
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             anim_params = _anim_params_for_bpm(bpm)
             # The aligner returns words in audio-true time space. When it
             # also detected per-line LRC->audio shifts, the LRC string
@@ -2360,7 +2479,7 @@ class LyricsService:
         if not synthetic_lrc:
             return False
 
-        bpm = _estimate_bpm(audio_path)
+        bpm = self._cached_estimate_bpm(song_path, audio_path)
         aligner_id = self._aligner.model_id if self._aligner else None
         ass = _words_to_ass_with_k_tags(
             words,
@@ -2390,6 +2509,73 @@ class LyricsService:
         logger.info("Genius: wrote word-level .ass for %s - %s", artist, track)
         return True
 
+    def _audio_sha_for_song(self, song_path: str) -> str | None:
+        """Resolve the source-audio sha256 for cache keys.
+
+        Used by callers that key into ``metadata`` cache prefixes
+        (whisper_transcript, audio_bpm, audio_vad_onsets, etc.). Returns
+        None when the DB is unwired, the song row is missing, or the
+        source audio path can't be resolved — caller treats that as
+        "no cache available, run uncached".
+        """
+        if self._db is None:
+            return None
+        try:
+            from pikaraoke.lib.audio_fingerprint import ensure_audio_fingerprint
+            from pikaraoke.lib.demucs_processor import resolve_audio_source
+
+            song_id = self._db.get_song_id_by_path(song_path)
+            if song_id is None:
+                return None
+            return ensure_audio_fingerprint(self._db, song_id, resolve_audio_source(song_path))
+        except Exception:
+            logger.exception("audio_sha lookup failed for %s", song_path)
+            return None
+
+    def _vad_cache_for_song(self, song_path: str):
+        """Build a ``VadCacheRef`` for ``song_path`` or None when DB unwired.
+
+        Used by every site that calls the aligner with ``lrc_lines`` (and
+        thus triggers the per-line shift detector's VAD probe). One
+        helper keeps the lookup symmetric across call sites.
+        """
+        if self._db is None:
+            return None
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return None
+        from pikaraoke.lib.lyrics_align import VadCacheRef
+
+        return VadCacheRef(
+            audio_sha256=audio_sha,
+            cache_get=self._db.get_metadata,
+            cache_set=self._db.set_metadata,
+        )
+
+    def _cached_estimate_bpm(self, song_path: str, audio_path: str) -> float | None:
+        """BPM estimation with disk-persistent caching by ``audio_sha256``.
+
+        ``_estimate_bpm`` already keeps a process-local memo, but that
+        doesn't survive restarts and is keyed by file path (not content).
+        This wrapper persists the verdict in ``metadata`` so a re-run on
+        the same audio bytes is free across restarts. ``None`` (BPM
+        couldn't be detected) is also cached — same audio would just
+        fail again.
+        """
+        from pikaraoke.lib.audio_feature_cache import CACHE_MISS, read_bpm, write_bpm
+
+        if self._db is None:
+            return _estimate_bpm(audio_path)
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return _estimate_bpm(audio_path)
+        cached = read_bpm(self._db.get_metadata, audio_sha)
+        if cached is not CACHE_MISS:
+            return cached  # type: ignore[return-value]
+        bpm = _estimate_bpm(audio_path)
+        write_bpm(self._db.set_metadata, audio_sha, bpm)
+        return bpm
+
     def _try_whisper_fallback(self, song_path: str) -> None:
         """Last-resort ASR: transcribe the vocals stem with faster-whisper.
 
@@ -2404,42 +2590,77 @@ class LyricsService:
         forced alignment but the text it emits is a phoneme-level fiction
         anyway — pushing hallucinated words back through wav2vec2 would
         only hide the errors, not fix them.
+
+        Cache: the transcript itself is keyed by ``(audio_sha256, model)``
+        and shared with ``_run_whisper_for_consensus`` — when consensus
+        already paid the transcribe cost on the same vocals stem, this
+        path reads it back instead of re-running the model.
         """
         try:
             self._emit_stage_notification(song_path, "Transcribing (Whisper)")
             _prewarm_stems(song_path)
             audio_path = _wait_for_alignment_audio(song_path)
-            model = _get_whisper_model()
-            if model is None:
-                return
-            segments_iter, info = model.transcribe(
-                audio_path,
-                word_timestamps=True,
-                vad_filter=True,
-            )
-            segments = list(segments_iter)
-            if not segments:
-                logger.info("Whisper fallback: empty transcription for %s", song_path)
-                self._emit_whisper_failure(song_path, "empty transcription")
-                return
-            lrc = _lrc_from_whisper_segments(segments)
-            lang = getattr(info, "language", None)
-            words: list[Word] = []
-            for seg in segments:
-                for w in seg.words or []:
-                    text = (getattr(w, "word", "") or "").strip()
-                    if not text or w.start is None or w.end is None:
-                        continue
-                    start = float(w.start)
-                    end = float(w.end)
-                    parts = _syllable_parts(text, lang, start, end)
-                    words.append(Word(text=text, start=start, end=end, parts=parts))
-            if not words or not lrc:
-                logger.info("Whisper fallback: no usable words for %s", song_path)
-                self._emit_whisper_failure(song_path, "no usable word timings")
-                return
-            bpm = _estimate_bpm(audio_path)
             model_name = _resolve_whisper_model()
+            audio_sha = self._audio_sha_for_song(song_path)
+
+            cached = None
+            if audio_sha and self._db is not None:
+                cached = _read_cached_whisper_transcript(
+                    self._db.get_metadata, audio_sha, model_name
+                )
+            if cached is not None:
+                logger.info(
+                    "whisper_transcript: cache hit (fallback) sha=%s model=%s",
+                    audio_sha[:12],
+                    model_name,
+                )
+                words = list(cached.words)
+                lrc = cached.lrc
+                lang = cached.language
+            else:
+                model = _get_whisper_model()
+                if model is None:
+                    return
+                segments_iter, info = model.transcribe(
+                    audio_path,
+                    word_timestamps=True,
+                    vad_filter=True,
+                )
+                segments = list(segments_iter)
+                if not segments:
+                    logger.info("Whisper fallback: empty transcription for %s", song_path)
+                    self._emit_whisper_failure(
+                        song_path, "empty transcription", error_code="whisper_empty"
+                    )
+                    return
+                lrc = _lrc_from_whisper_segments(segments)
+                lang = getattr(info, "language", None)
+                words = []
+                for seg in segments:
+                    for w in seg.words or []:
+                        text = (getattr(w, "word", "") or "").strip()
+                        if not text or w.start is None or w.end is None:
+                            continue
+                        start = float(w.start)
+                        end = float(w.end)
+                        parts = _syllable_parts(text, lang, start, end)
+                        words.append(Word(text=text, start=start, end=end, parts=parts))
+                if not words or not lrc:
+                    logger.info("Whisper fallback: no usable words for %s", song_path)
+                    self._emit_whisper_failure(
+                        song_path, "no usable word timings", error_code="whisper_no_words"
+                    )
+                    return
+                if audio_sha and self._db is not None:
+                    _write_cached_whisper_transcript(
+                        self._db.set_metadata,
+                        audio_sha,
+                        model_name,
+                        language=lang,
+                        lrc=lrc,
+                        words=words,
+                    )
+            bpm = self._cached_estimate_bpm(song_path, audio_path)
             ass = _words_to_ass_with_k_tags(
                 words,
                 lrc,
@@ -2447,7 +2668,9 @@ class LyricsService:
             )
             if not ass:
                 logger.info("Whisper fallback: ASS conversion failed for %s", song_path)
-                self._emit_whisper_failure(song_path, "ASS conversion failed")
+                self._emit_whisper_failure(
+                    song_path, "ASS conversion failed", error_code="whisper_ass_failed"
+                )
                 return
             wrote = self._try_write_ass_tiered(
                 song_path,
@@ -2488,9 +2711,21 @@ class LyricsService:
                 logger.exception("failed to emit whisper success notification")
         except Exception as e:
             logger.exception("Whisper fallback crashed for %s", song_path)
-            self._emit_whisper_failure(song_path, f"{type(e).__name__}: {e}")
+            self._emit_whisper_failure(
+                song_path, f"{type(e).__name__}: {e}", error_code="whisper_crashed"
+            )
 
-    def _emit_whisper_failure(self, song_path: str, detail: str) -> None:
+    def _emit_whisper_failure(
+        self, song_path: str, detail: str, *, error_code: str | None = None
+    ) -> None:
+        """Emit ``song_warning`` and persist a pipeline-failure marker.
+
+        ``error_code`` is the stable token recorded in the failure cache
+        so the integrity scan can read back why the pipeline last failed
+        (``whisper_empty``, ``whisper_no_words``, ``whisper_ass_failed``,
+        ``whisper_crashed``). The free-form ``detail`` string still rides
+        the toast for human readers.
+        """
         try:
             self._events.emit(
                 "song_warning",
@@ -2503,6 +2738,16 @@ class LyricsService:
             )
         except Exception:
             logger.exception("failed to emit whisper-failure song_warning")
+        if error_code is None:
+            return
+        audio_sha = self._audio_sha_for_song(song_path)
+        if audio_sha and self._db is not None:
+            _record_pipeline_failure(
+                self._db.get_metadata,
+                self._db.set_metadata,
+                audio_sha,
+                error_code=error_code,
+            )
 
     def _run_whisper_for_consensus(self, song_path: str) -> tuple[list["Word"], str | None]:
         """Transcribe vocals with Whisper, return ``(words, language)``.
@@ -2514,9 +2759,28 @@ class LyricsService:
         every synced source got rejected. Catches every internal Whisper
         exception (OOM, decode failures, model load) and returns
         ``([], None)`` so the consensus pool just runs without it.
+
+        Cache: shares the ``(audio_sha256, model)`` transcript cache
+        with ``_try_whisper_fallback``. Whichever path runs first pays
+        the transcribe cost once; the other gets the words for free.
         """
         try:
             audio_path = _wait_for_alignment_audio(song_path)
+            model_name = _resolve_whisper_model()
+            audio_sha = self._audio_sha_for_song(song_path)
+
+            if audio_sha and self._db is not None:
+                cached = _read_cached_whisper_transcript(
+                    self._db.get_metadata, audio_sha, model_name
+                )
+                if cached is not None:
+                    logger.info(
+                        "whisper_transcript: cache hit (consensus) sha=%s model=%s",
+                        audio_sha[:12],
+                        model_name,
+                    )
+                    return list(cached.words), cached.language
+
             model = _get_whisper_model()
             if model is None:
                 return [], None
@@ -2526,6 +2790,7 @@ class LyricsService:
             segments = list(segments_iter)
             if not segments:
                 return [], None
+            lrc = _lrc_from_whisper_segments(segments)
             lang = getattr(info, "language", None)
             words: list[Word] = []
             for seg in segments:
@@ -2537,6 +2802,15 @@ class LyricsService:
                     end = float(w.end)
                     parts = _syllable_parts(text, lang, start, end)
                     words.append(Word(text=text, start=start, end=end, parts=parts))
+            if audio_sha and self._db is not None and words and lrc:
+                _write_cached_whisper_transcript(
+                    self._db.set_metadata,
+                    audio_sha,
+                    model_name,
+                    language=lang,
+                    lrc=lrc,
+                    words=words,
+                )
             return words, lang
         except Exception:
             logger.exception("whisper-for-consensus crashed for %s", song_path)
@@ -2720,6 +2994,7 @@ class LyricsService:
         # an improved upstream LRC has a chance to flip the routing.
         from pikaraoke.lib.lyrics_align import (
             _RELIABILITY_GATE,
+            VadCacheRef,
             grade_lrc_priors_against_audio,
         )
 
@@ -2736,12 +3011,25 @@ class LyricsService:
                     basename,
                 )
 
+        # Disk-persistent VAD cache shared by the grader pass below and
+        # the aligner's per-line shift detector — both probe the same
+        # audio, so the second call hits cache instead of re-running
+        # silero + silencedetect.
+        vad_cache: VadCacheRef | None = None
+        audio_sha = self._audio_sha_for_song(song_path)
+        if audio_sha and self._db is not None:
+            vad_cache = VadCacheRef(
+                audio_sha256=audio_sha,
+                cache_get=self._db.get_metadata,
+                cache_set=self._db.set_metadata,
+            )
+
         if replay_score is not None:
             score = replay_score
         else:
             try:
                 score, _residuals = grade_lrc_priors_against_audio(
-                    audio_path, consensus_lrc_windows
+                    audio_path, consensus_lrc_windows, vad_cache=vad_cache
                 )
             except Exception:
                 logger.exception(
@@ -2767,9 +3055,12 @@ class LyricsService:
                     consensus.text,
                     lrc_lines=consensus_lrc_windows,
                     language=language,
+                    vad_cache=vad_cache,
                 )
             else:
-                aligned = self._aligner.align(audio_path, consensus.text, language=language)
+                aligned = self._aligner.align(
+                    audio_path, consensus.text, language=language, vad_cache=vad_cache
+                )
         except Exception:
             logger.exception("consensus: aligner crashed for %s", basename)
             try:
@@ -2790,7 +3081,7 @@ class LyricsService:
             logger.info("consensus: empty aligner output for %s", basename)
             return
 
-        bpm = _estimate_bpm(audio_path)
+        bpm = self._cached_estimate_bpm(song_path, audio_path)
 
         line_template = consensus.lrc
         if not align_with_lrc_lines:

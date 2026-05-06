@@ -318,9 +318,52 @@ class SongManager:
         meta = _track_metadata_from_info_json(song_path)
         if meta:
             self._db.update_track_metadata_with_provenance(song_id, "youtube", meta)
+        # Pre-iTunes language consensus: run the classifier with whatever
+        # signals we already have (yt-dlp info.json, langdetect on title)
+        # so the enricher dispatched right after has a real ``expected_lang``
+        # to filter iTunes top-5 against. Without this, every download
+        # would defer to ``awaiting_language`` until a whisper probe later
+        # in the lyrics pipeline fires the re-enrich hook. Both itunes_hit
+        # and mb_signals are None — those are exactly the signals the
+        # enricher will produce.
+        self._classify_pre_itunes(song_id, song_path)
         _consume_info_json(song_path, self._db, song_id)
         if self._enrich_on_download:
             self._start_enrichment(song_id, song_path)
+
+    def _classify_pre_itunes(self, song_id: int, song_path: str) -> None:
+        """Run the language classifier without iTunes/MB signals.
+
+        Read the info.json once and call ``classify_and_persist`` with
+        ``itunes_hit=None`` / ``mb_signals=None``. Failures are swallowed
+        — the classifier is best-effort and re-runs later when the
+        lyrics pipeline arrives with stronger signals.
+        """
+        try:
+            from pikaraoke.lib.lyrics_language_classifier import (
+                classify_and_persist,
+                read_info_json,
+            )
+        except Exception:
+            logging.exception("pre-iTunes classifier import failed for %s", song_path)
+            return
+        try:
+            yt_info = read_info_json(song_path)
+            row = self._db.get_song_by_id(song_id)
+            db_title = row["title"] if row is not None else None
+            db_artist = row["artist"] if row is not None else None
+            classify_and_persist(
+                self._db,
+                song_id,
+                song_path=song_path,
+                yt_info=yt_info,
+                itunes_hit=None,
+                mb_signals=None,
+                db_title=db_title,
+                db_artist=db_artist,
+            )
+        except Exception:
+            logging.exception("pre-iTunes classifier crashed for song_id=%d %s", song_id, song_path)
 
     def _start_enrichment(self, song_id: int, song_path: str) -> None:
         """Run iTunes + MusicBrainz enrichment in a daemon thread.

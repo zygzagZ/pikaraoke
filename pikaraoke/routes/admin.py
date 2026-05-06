@@ -128,11 +128,17 @@ def dismiss_song_warnings(song: str):
 
 @admin_bp.route("/sync_library")
 def sync_library():
-    """Trigger a background library scan."""
+    """Trigger a background library scan.
+
+    The admin button is an explicit "I want to retry now" signal — it
+    bypasses the canonical-pipeline failure backoff so songs whose
+    lyrics last failed are re-queued immediately. The startup warm
+    reconciliation goes through the cached path (no force flag).
+    """
     if not is_admin():
         return jsonify({"error": "Unauthorized"}), 403
     k = get_karaoke_instance()
-    started = k.sync_library()
+    started = k.sync_library(force_lyrics_retry=True)
     if started:
         return jsonify({"status": "started"})
     return jsonify({"status": "already_syncing"})

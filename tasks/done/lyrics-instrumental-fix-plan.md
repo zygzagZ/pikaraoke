@@ -1,5 +1,75 @@
 <!-- /autoplan restore point: /Users/zygzagz/.gstack/projects/zygzagZ-pikaraoke/master-autoplan-restore-20260427-204132.md -->
 
+# Status (2026-05-04)
+
+**SHIPPED.** The plan was fully implemented and then some. Plan body
+below is preserved as the design record; the summary here is the
+current truth.
+
+## Implementation
+
+Landed across the following commits on master:
+
+| Commit | What |
+|---|---|
+| `12d927a7` | `fix(lyrics): silero VAD + DP line-anchor assignment` — new `vad_probe.py` (silero + ffmpeg silencedetect merged, chunked through 60s windows with 5s overlap), `_align_lines_to_anchors_dp` global DP solver, `_interpolate_unanchored` with instrumental-gap branch, `_detect_per_line_starts` rewritten as thin orchestrator. |
+| `d0002b1a` | `refactor(lyrics_align): _align_lines_to_anchors_dp returns DpResiduals` — DP exposes diagnostic signals (total_cost, max_anchor_shift, rejected_anchors). |
+| `4c27ef13` | `feat(lyrics_align): add _grade_priors reliability scorer` — bonus work; consensus orchestrator can now route low-confidence songs to the synthetic-LRC fallback. |
+| `3c94237c` | `feat(lyrics_align): bump model_id to wav2vec2-char-vad-dpalign-hybrid` — went past the planned `wav2vec2-char-vad-dpalign` to a hybrid id covering the cathedral-grader path. |
+| `9263308d` | `feat(lyrics): default LYRICS_CONSENSUS_ENABLED to "1"` — bonus default-on flip. |
+| `9e0d6826` | `feat(lyrics): cathedral grader — pre-grade routing, replay, legacy parity` — bonus follow-up. |
+
+Expansion 2 (silero prewarm at startup) shipped as `_prewarm_vad()`
+daemon thread in `karaoke.py:239`, launched at `karaoke.py:523`.
+
+Expansion 3 (eager `.ass` cache sweep on `model_id` bump) shipped in
+a different shape than planned — instead of the ASS-header `; model_id:`
+scan in `Karaoke.__init__`, the sweep is **DB-driven via
+`KaraokeDatabase.get_song_ids_for_realignment(current_model_id)` +
+`audio_fingerprint.invalidate_auto_ass`, paced through
+`_BackfillScheduler`, and fires from
+`LibraryScanner.on_provenance_classified`** rather than at startup.
+See `Karaoke._invalidate_stale_alignments_from_db` at `karaoke.py:720`.
+The implementation is better than the plan: it runs against the DB
+canonical state instead of re-reading every ASS file from disk.
+
+## Tests
+
+All planned test inventory landed (34 → 42+ actual). Files:
+
+- `tests/unit/test_vad_probe.py` — 7 tests (added `test_silero_chunk_loop_dedups_overlap_boundary` in the 2026-05-04 follow-up)
+- `tests/unit/test_lyrics_align.py` — 78 tests including the 9 DP unit tests + 3 interpolation tests + ER2/ER3 fold-ins
+- `tests/unit/test_karaoke.py` — 3 sweep tests (`TestInvalidateStaleAlignmentsFromDb`)
+- `tests/integration/test_lyrics_align_total_eclipse.py` — 5 tests
+- `tests/integration/test_lyrics_align_mam_te_moc.py` — 3 tests
+- `tests/integration/test_lyrics_align_queen_iwtbf.py` — 5 tests
+
+## Test-quality follow-up (2026-05-04)
+
+Audit found four soft assertions (test names overpromised what they
+checked) and one silent-skip pattern. All fixed:
+
+| Test | Issue | Fix |
+|---|---|---|
+| `test_lateness_recovers_by_417` (Total Eclipse) | only checked `min_gap >= 0.05s`; actual lateness behaviour does not "recover by 4:17" | renamed `test_post_solo_lines_spread_across_multiple_anchors`; pins ≥5 anchor-cluster breaks + ≥80% unique timestamps |
+| `test_per_verse_shifts_grow_monotonically` (Mam Tę Moc) | docstring claimed monotonic growth; reality is non-monotonic per-verse drift | renamed `test_per_verse_shifts_are_not_a_global_offset`; tightened span ≥5.0s + ≥30% lines drift > 1s from median |
+| Queen IWTBF orchestrator tests (3 of 4) | silently `pytest.skip` because the fixture's 46s leading instrumental trips `_LEADING_SILENCE_MAX_S=30s` gate | replaced with `test_orchestrator_bails_on_long_leading_instrumental` (asserts the bail IS the contract) + 3 DP-direct tests pinning the third musical pattern |
+| `test_dp_distributes_cluster_between_flanking_anchors` | cluster-collapse case `[1,2]` slipped through `any(i<2) and any(i>=2)` | added `max-min >= 2` to kill `[1,2]` |
+| coverage gap | silero chunk-loop + per-chunk `reset_states` + overlap-boundary dedup were untested (the bug Pivot 2 commit message specifically calls out) | new `test_silero_chunk_loop_dedups_overlap_boundary` drives 90s synthetic audio through the real chunk loop with stubbed `silero_vad`/`librosa`/`torch` |
+
+Net: 107 passed / 0 skipped across the affected files (was 105 + 3 silent skips).
+
+## Known deviations from plan
+
+- **`model_id`** is `wav2vec2-char-vad-dpalign-hybrid`, not the
+  planned `wav2vec2-char-vad-dpalign` — the cathedral-grader work
+  bumped it once more.
+- **Stale-`.ass` sweep** is DB-driven not ASS-header-scanned (see above).
+- **Plan said "next step: start implementation"**; actually shipped
+  2026-04-28 (commit `12d927a7`), six days before this status update.
+
+---
+
 # Replace greedy line→anchor matching with global DP assignment
 
 > **Plan revision (after premise-gate diagnostic).** The original

@@ -7,7 +7,6 @@ from pikaraoke.lib.lyrics_language_classifier import (
     ConsensusVerdict,
     LanguageSignal,
     _signal_itunes_country,
-    _signal_itunes_text,
     _signal_mb_release_country,
     _signal_mb_release_titles,
     _signal_title_heuristic,
@@ -17,6 +16,8 @@ from pikaraoke.lib.lyrics_language_classifier import (
     classify_and_persist,
     collect_signals,
     consensus,
+    pre_itunes_signals,
+    signal_itunes_text,
 )
 
 # --- per-signal extractor tests ----------------------------------------
@@ -29,15 +30,15 @@ class TestItunesTextSignal:
             "trackName": "Kolorowy wiatr",
             "artistName": "Edyta Górniak",
         }
-        sig = _signal_itunes_text(hit)
+        sig = signal_itunes_text(hit)
         assert sig is not None
         assert sig.language == "pl"
         assert sig.source == "itunes_text"
 
     def test_none_on_empty_text(self):
-        assert _signal_itunes_text({}) is None
-        assert _signal_itunes_text(None) is None
-        assert _signal_itunes_text({"artistName": "x"}) is None  # too short
+        assert signal_itunes_text({}) is None
+        assert signal_itunes_text(None) is None
+        assert signal_itunes_text({"artistName": "x"}) is None  # too short
 
     def test_english(self):
         hit = {
@@ -45,7 +46,7 @@ class TestItunesTextSignal:
             "trackName": "Colors of the Wind",
             "artistName": "Judy Kuhn",
         }
-        sig = _signal_itunes_text(hit)
+        sig = signal_itunes_text(hit)
         assert sig is not None
         assert sig.language == "en"
 
@@ -62,7 +63,7 @@ class TestItunesTextSignal:
             "trackName": "Kolorowy Wiatr",
             "artistName": "Edyta Gorniak",
         }
-        sig = _signal_itunes_text(hit)
+        sig = signal_itunes_text(hit)
         assert sig is not None
         assert sig.language == "pl"
         assert "dub_marker" in sig.detail
@@ -73,7 +74,7 @@ class TestItunesTextSignal:
             "trackName": "Kolorowy Wiatr",
             "artistName": "Edyta Górniak",
         }
-        sig = _signal_itunes_text(hit)
+        sig = signal_itunes_text(hit)
         assert sig is not None and sig.language == "pl"
 
     def test_dub_marker_german_version(self):
@@ -82,7 +83,7 @@ class TestItunesTextSignal:
             "trackName": "Lass jetzt los",
             "artistName": "Willemijn Verkaik",
         }
-        sig = _signal_itunes_text(hit)
+        sig = signal_itunes_text(hit)
         assert sig is not None and sig.language == "de"
 
 

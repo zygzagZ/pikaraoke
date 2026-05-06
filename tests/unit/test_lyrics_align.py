@@ -870,9 +870,11 @@ class TestDPAlignment:
         # Two anchored lines flank a cluster of unanchored ones (no
         # plausible anchor for the middle two). DP places anchors near
         # the start and end of the LRC span; interpolation handles the
-        # cluster. The exact anchored row may shift between two
-        # equivalent assignments (cost-tied), but the cluster shape
-        # must not collapse to "all skip" or "all anchor".
+        # cluster. The cluster-collapse failure mode (anchor1 and
+        # anchor2 both unanchored, fillers stealing both onsets) would
+        # produce anchored_indices=[1, 2]; the spread check below
+        # rejects that while still tolerating cost-tied alternatives
+        # like [0, 2] or [1, 3].
         lrc = [
             (10.0, 12.0, "anchor1"),
             (12.0, 14.0, "filler1"),
@@ -887,11 +889,16 @@ class TestDPAlignment:
         # Both onsets get used somewhere - DP doesn't waste them.
         anchored = [t for t in out if t is not None]
         assert sorted(anchored) == [12.0, 18.0]
-        # The anchors land in the *first half* and *second half* of
-        # the LRC line list (i.e. the cluster is correctly split).
+        # Anchored indices must straddle the cluster middle: at least
+        # one before index 2 AND one at or after index 2 AND the spread
+        # between them is ≥ 2 (so [1, 2] cluster collapse fails).
         anchor_indices = [i for i, t in enumerate(out) if t is not None]
-        assert any(i < 2 for i in anchor_indices), "first anchor must land on an early LRC line"
-        assert any(i >= 2 for i in anchor_indices), "second anchor must land on a late LRC line"
+        assert min(anchor_indices) <= 1, "first anchor must land on an early LRC line"
+        assert max(anchor_indices) >= 2, "second anchor must land on a late LRC line"
+        assert max(anchor_indices) - min(anchor_indices) >= 2, (
+            f"anchored indices {anchor_indices} are too close together; "
+            f"cluster collapsed onto fillers instead of straddling them"
+        )
 
     def test_dp_prefers_higher_sustain_for_long_lines(self):
         # A long line with two candidate anchors: one with 0.5s sustain

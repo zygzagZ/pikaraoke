@@ -395,6 +395,61 @@ class TestDBCoordination:
         assert row["source_url"] == "https://www.youtube.com/watch?v=abc12345678"
         assert row["language"] == "en"
 
+    def test_register_download_runs_pre_itunes_classifier(self, tmp_path, real_db):
+        """When info.json carries a manual subtitle in pl, register_download
+        must run the pre-iTunes classifier and lift ``songs.language`` from
+        the seeded ``youtube`` rung up to a stronger language signal — so
+        the enricher dispatched right after has a real ``expected_lang``
+        to filter iTunes top-5 against. (Matches >=2 signals: yt_info_lang
+        from the ``language`` field + yt_subtitle_lang from the manual
+        Polish track.)
+        """
+        import json
+
+        song = tmp_path / "Polish - Pieśń---abc12345678.mp4"
+        song.write_text("fake")
+        info = tmp_path / "Polish - Pieśń---abc12345678.info.json"
+        info.write_text(
+            json.dumps(
+                {
+                    "track": "Pieśń",
+                    "artist": "Polish",
+                    "language": "pl",
+                    "subtitles": {"pl": [{"url": "https://example/pl.vtt"}]},
+                }
+            )
+        )
+        sm = SongManager(str(tmp_path), db=real_db, enrich_on_download=False)
+        sm.register_download(_native(song))
+
+        sid = real_db.get_song_id_by_path(_native(song))
+        row = real_db.get_song_by_id(sid)
+        assert row["language"] == "pl"
+        # Provenance moved off ``youtube`` to a Tier 1 language rung —
+        # which one is fine, as long as it's stronger than ``youtube``.
+        sources = real_db.get_metadata_sources(sid)
+        assert sources["language"] in {"yt_info_lang", "yt_subtitle_lang"}
+
+    def test_register_download_no_consensus_leaves_language_alone(self, tmp_path, real_db):
+        """A bare info.json with no language field, no manual subs, and a
+        too-short title for langdetect produces no consensus — the row
+        keeps whatever the ``youtube`` seed wrote (which here is nothing).
+        The enricher dispatched right after will then defer with
+        ``awaiting_language`` until a whisper probe arrives.
+        """
+        import json
+
+        song = tmp_path / "Foo---abc12345678.mp4"
+        song.write_text("fake")
+        info = tmp_path / "Foo---abc12345678.info.json"
+        info.write_text(json.dumps({"track": "X", "artist": "Y"}))
+        sm = SongManager(str(tmp_path), db=real_db, enrich_on_download=False)
+        sm.register_download(_native(song))
+
+        sid = real_db.get_song_id_by_path(_native(song))
+        row = real_db.get_song_by_id(sid)
+        assert row["language"] is None
+
     def test_register_download_with_no_info_json_still_works(self, tmp_path, real_db):
         """Downloads without a sibling info.json (cdg/mp3 imports, tests)
         must still register the song — nothing to seed or delete."""

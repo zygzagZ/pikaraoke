@@ -198,3 +198,194 @@ class TestConfig:
         from pikaraoke.lib.karaoke_database import VARIANT_FILE_SOURCES
 
         assert set(DEFAULT_AUTO_SOURCES).issubset(VARIANT_FILE_SOURCES)
+
+
+class TestBackoff:
+    """A failed (song, source) row with a future ``next_retry_at`` is not
+    re-queued. Bypassed by ``force=True``."""
+
+    def _setup(self, db, events, tmp_path, *, results=None):
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        svc = _make_lyrics_service(results=results or {})
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        return song_path, sid, svc, orch
+
+    def test_first_failure_writes_next_retry_at(self, db, events, tmp_path):
+        song_path, sid, _svc, orch = self._setup(
+            db, events, tmp_path, results={"lrclib": {"state": "failed", "error_code": "not_found"}}
+        )
+        try:
+            orch.kickoff(song_path)
+        finally:
+            orch.shutdown(wait=True)
+
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "failed"
+        assert row["next_retry_at"] is not None
+        assert row["attempt_count"] == 1
+
+    def test_future_next_retry_at_skips_dispatch(self, db, events, tmp_path):
+        # Pre-seed a failed row whose backoff hasn't elapsed.
+        import datetime
+
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        future = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        ).isoformat(timespec="seconds")
+        db.upsert_subtitle_job(
+            sid,
+            "lrclib",
+            "failed",
+            error_code="not_found",
+            attempt_count=1,
+            next_retry_at=future,
+        )
+        svc = _make_lyrics_service(results={})
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        try:
+            orch.kickoff(song_path)
+        finally:
+            orch.shutdown(wait=True)
+
+        # Worker not invoked at all.
+        svc.fetch_variant_sync.assert_not_called()
+        # Row state preserved (not bumped to running/queued).
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "failed"
+        assert row["attempt_count"] == 1
+
+    def test_past_next_retry_at_re_queues(self, db, events, tmp_path):
+        import datetime
+
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        past = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+        ).isoformat(timespec="seconds")
+        db.upsert_subtitle_job(
+            sid,
+            "lrclib",
+            "failed",
+            error_code="not_found",
+            attempt_count=1,
+            next_retry_at=past,
+        )
+        svc = _make_lyrics_service(
+            results={"lrclib": {"state": "failed", "error_code": "not_found"}}
+        )
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        try:
+            orch.kickoff(song_path)
+        finally:
+            orch.shutdown(wait=True)
+
+        svc.fetch_variant_sync.assert_called_once()
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "failed"
+        # Second failed attempt: backoff schedule index 1 (3 days).
+        assert row["attempt_count"] == 2
+
+    def test_force_bypasses_backoff(self, db, events, tmp_path):
+        import datetime
+
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        future = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        ).isoformat(timespec="seconds")
+        db.upsert_subtitle_job(
+            sid,
+            "lrclib",
+            "failed",
+            error_code="not_found",
+            attempt_count=1,
+            next_retry_at=future,
+        )
+        svc = _make_lyrics_service(results={"lrclib": {"state": "success", "tier": "line"}})
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        try:
+            orch.kickoff(song_path, force=True)
+        finally:
+            orch.shutdown(wait=True)
+
+        svc.fetch_variant_sync.assert_called_once()
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "success"
+
+    def test_orchestrator_crash_writes_next_retry_at(self, db, events, tmp_path):
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        svc = MagicMock()
+        svc.fetch_variant_sync.side_effect = RuntimeError("boom")
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        try:
+            orch.kickoff(song_path)
+        finally:
+            orch.shutdown(wait=True)
+
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "failed"
+        assert row["error_code"] == "orchestrator_crash"
+        # Crashes are transient (OOM, code bug) - retry on the same backoff
+        # ladder rather than locking the source out forever.
+        assert row["next_retry_at"] is not None
+
+    def test_skipped_state_does_not_write_next_retry_at(self, db, events, tmp_path):
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        svc = _make_lyrics_service(
+            results={"lrclib": {"state": "skipped", "error_code": "in_flight_dedup"}}
+        )
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        try:
+            orch.kickoff(song_path)
+        finally:
+            orch.shutdown(wait=True)
+
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "skipped"
+        # ``skipped`` is not a failure — the canonical path is still doing
+        # the work; no backoff applies.
+        assert row["next_retry_at"] is None
+
+    def test_success_clears_next_retry_at_via_overwrite(self, db, events, tmp_path):
+        song_path = str(tmp_path / "song.mp4")
+        with open(song_path, "wb"):
+            pass
+        sid = _insert_song(db, song_path)
+        # Seed a failed row with backoff.
+        db.upsert_subtitle_job(
+            sid,
+            "lrclib",
+            "failed",
+            error_code="not_found",
+            attempt_count=2,
+            next_retry_at="2099-01-01T00:00:00+00:00",
+        )
+        svc = _make_lyrics_service(results={"lrclib": {"state": "success", "tier": "line"}})
+        orch = SubtitleOrchestrator(svc, events, db, sources=("lrclib",), max_workers=2)
+        try:
+            orch.kickoff(song_path, force=True)
+        finally:
+            orch.shutdown(wait=True)
+
+        row = db.get_subtitle_job(sid, "lrclib")
+        assert row["state"] == "success"
+        # The success transition didn't carry a next_retry_at, so the
+        # COALESCE-free overwrite zeroes it. A future failed retry would
+        # compute a fresh schedule based on the bumped attempt_count.
+        assert row["next_retry_at"] is None

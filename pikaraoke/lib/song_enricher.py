@@ -1,17 +1,26 @@
 """Best-effort music metadata enrichment for downloaded songs.
 
+Reactive model: the enricher reruns every time a new language signal
+flips ``songs.language``. iTunes is consulted only when ``songs.language``
+is non-empty; the chosen hit must agree with that language (otherwise
+the row stays "language_mismatch" with no textual iTunes fields written).
+Idempotency is gated on ``songs.language_at_enrich``: when it equals
+``songs.language`` and ``metadata_status='enriched'``, the run is a no-op.
+
 Pipeline per song:
-  1. Pick a query string from the ``songs`` row (register_download and
-     the scanner both seed artist/title from yt-dlp's info.json);
-     fall back to the filename stem when the row has no artist/title.
-  2. Query iTunes for canonical artist/track + album + track_number +
-     release_date + iTunes ID + cover-art URL.
-  3. Query MusicBrainz with the iTunes-canonicalized artist/track for
-     MusicBrainz recording ID + ISRC.
-  4. Download cover art to ``<stem>.cover.jpg`` when a URL is available and
-     register it as a ``cover_art`` artifact.
-  5. Persist all populated fields via ``update_track_metadata`` and stamp
-     ``metadata_status`` / ``enrichment_attempts`` / ``last_enrichment_attempt``.
+  1. Idempotency check. If ``metadata_status='enriched'`` and
+     ``language_at_enrich == songs.language``, return early.
+  2. Read ``expected_lang = songs.language``. Empty → stamp
+     ``awaiting_language`` (no iTunes call) and return — a later
+     language-write site will dispatch us again.
+  3. Pull iTunes top-5 for the query (LRU-cached). Empty → ``not_found``.
+  4. Pick the first hit whose derived language (langdetect over
+     collection+track+artist, with country fallback) matches
+     ``expected_lang``. None → ``language_mismatch``, no textual fields
+     written.
+  5. Apply the chosen hit's fields via ``update_track_metadata_with_provenance``,
+     run the existing variant guard, fetch MusicBrainz IDs, download
+     cover art, stamp ``language_at_enrich``.
 
 All network calls are best-effort: failures are logged and swallowed so
 enrichment cannot crash playback. The caller typically spawns this in a
@@ -30,7 +39,13 @@ import requests
 
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
 from pikaraoke.lib.lyrics import _VARIANT_RE
-from pikaraoke.lib.music_metadata import fetch_itunes_track, fetch_musicbrainz_ids
+from pikaraoke.lib.lyrics_language_classifier import COUNTRY_TO_LANG, signal_itunes_text
+from pikaraoke.lib.music_metadata import (
+    fetch_musicbrainz_ids,
+    normalize_title,
+    project_full_hit,
+    search_itunes_full,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +177,40 @@ def enrich_song(db: KaraokeDatabase, song_id: int, song_path: str) -> None:
             logger.exception("stamping enrichment error failed for song_id=%d", song_id)
 
 
+def _hit_language(raw_hit: dict) -> str | None:
+    """Derive a primary subtag for one iTunes hit.
+
+    Runs ``signal_itunes_text`` (langdetect over collection+track+artist
+    + dub markers) first; falls back to ``COUNTRY_TO_LANG`` keyed on the
+    storefront when the text is too short for langdetect. Returns None
+    when neither signal fires — the caller treats that as "language
+    unknown" and won't reject on lack of evidence.
+    """
+    sig = signal_itunes_text(raw_hit)
+    if sig is not None:
+        return sig.language
+    country = (raw_hit.get("country") or "").upper()
+    return COUNTRY_TO_LANG.get(country)
+
+
+def _pick_hit_for_language(candidates: list[dict], expected_lang: str) -> tuple[dict | None, str]:
+    """Return ``(chosen_raw_hit, reason)``.
+
+    ``reason`` is one of ``"lang_match"`` (a candidate's derived language
+    matched ``expected_lang``) or ``"no_match"`` (every candidate either
+    disagreed or had no derivable language). Hits with no derivable
+    language are NOT accepted — they're indistinguishable from a
+    "wrong-language hit whose text is too short to detect", and accepting
+    them would leak the same Pedalini-style false-match the language
+    guard exists to prevent. Callers requiring a permissive accept-on-
+    unknown policy should fall back outside this function.
+    """
+    for raw_hit in candidates:
+        if _hit_language(raw_hit) == expected_lang:
+            return raw_hit, "lang_match"
+    return None, "no_match"
+
+
 def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: str) -> None:
     row = db.get_song_by_id(song_id)
     if row is None:
@@ -185,24 +234,61 @@ def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: s
             }
         )
 
+    expected_lang = (row["language"] or "").strip() or None
+
+    # Idempotency: if we already enriched against the current language,
+    # the iTunes pick can't change. Re-running would be a no-op write
+    # but still costs an HTTP roundtrip on cold cache, so short-circuit
+    # here. ``manual``-tagged fields are preserved by the provenance
+    # ladder regardless.
+    if row["metadata_status"] == "enriched" and (row["language_at_enrich"] or "") == (
+        expected_lang or ""
+    ):
+        return
+
+    if expected_lang is None:
+        db.stamp_enrichment_attempt(song_id, "awaiting_language", now)
+        _emit(
+            "Metadata enrichment deferred",
+            detail="awaiting_language: no consensus signal yet",
+        )
+        return
+
     query = _query_from_song(row, song_path)
     if not query:
-        db.stamp_enrichment_attempt(song_id, "skipped", now)
+        db.stamp_enrichment_attempt(song_id, "skipped", now, language_at_enrich=expected_lang)
         _emit("Metadata enrichment skipped", detail="no artist/title to query")
         return
 
-    _emit("Metadata enrichment starting", detail=query)
+    _emit("Metadata enrichment starting", detail=f"{query} (lang={expected_lang})")
 
-    itunes = None
+    candidates: list[dict] = []
     try:
-        itunes = fetch_itunes_track(query)
+        candidates = search_itunes_full(normalize_title(query), limit=5)
     except Exception:
         logger.exception("iTunes lookup crashed for %r", query)
 
-    if not itunes:
-        db.stamp_enrichment_attempt(song_id, "not_found", now)
+    if not candidates:
+        db.stamp_enrichment_attempt(song_id, "not_found", now, language_at_enrich=expected_lang)
         _emit("Metadata enrichment finished", detail="iTunes: no match")
         return
+
+    chosen_raw, reason = _pick_hit_for_language(candidates, expected_lang)
+    if chosen_raw is None:
+        db.stamp_enrichment_attempt(
+            song_id, "language_mismatch", now, language_at_enrich=expected_lang
+        )
+        _emit(
+            "Metadata enrichment finished",
+            severity="warning",
+            detail=(
+                f"language_mismatch: audio={expected_lang}, "
+                f"top-{len(candidates)} iTunes hits had no match"
+            ),
+        )
+        return
+
+    itunes = project_full_hit(chosen_raw)
 
     if _itunes_adds_variant(query, itunes):
         logger.info(
@@ -255,7 +341,7 @@ def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: s
             db.upsert_artifacts(song_id, [{"role": COVER_ART_ROLE, "path": cover_path}])
 
     final_status = "enriched" if applied else "no_new_fields"
-    db.stamp_enrichment_attempt(song_id, final_status, now)
+    db.stamp_enrichment_attempt(song_id, final_status, now, language_at_enrich=expected_lang)
     _emit(
         "Metadata enrichment finished",
         detail=f"{final_status}: " + ", ".join(sorted(applied)) if applied else final_status,

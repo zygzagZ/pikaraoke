@@ -674,6 +674,7 @@ class Karaoke:
             get_now_playing_user=lambda: self.playback_controller.now_playing_user,
             filename_from_path=self.song_manager.display_name_from_path,
             get_available_songs=lambda: self.song_manager.songs,
+            get_song_id_by_path=(lambda p: self.db.get_song_id_by_path(p) if self.db else None),
         )
 
         # Initialize and start download manager
@@ -851,23 +852,33 @@ class Karaoke:
             daemon=True,
         ).start()
 
-    def sync_library(self) -> bool:
+    def sync_library(self, *, force_lyrics_retry: bool = False) -> bool:
         """Trigger a background library scan.
 
         Used for both warm startup reconciliation and admin 'Sync Now'.
         Returns False if a sync is already in progress.
+
+        ``force_lyrics_retry`` bypasses the canonical-pipeline failure
+        cache so songs whose lyrics last failed are re-attempted now
+        instead of waiting for ``next_retry_at`` to elapse. The admin
+        "Sync Now" route passes this; warm startup reconciliation does
+        not (would defeat the cache entirely).
         """
         if not self._sync_lock.acquire(blocking=False):
             return False
         self.events.emit("sync_started")
-        thread = threading.Thread(target=self._background_sync, daemon=True)
+        thread = threading.Thread(
+            target=self._background_sync,
+            args=(force_lyrics_retry,),
+            daemon=True,
+        )
         thread.start()
         return True
 
-    def _background_sync(self) -> None:
+    def _background_sync(self, force_lyrics_retry: bool = False) -> None:
         try:
             logging.info(f"Background library scan starting: {self.download_path}")
-            result = self._scanner.scan(self.download_path)
+            result = self._scanner.scan(self.download_path, force_lyrics_retry=force_lyrics_retry)
             self._apply_scan_result(result)
         finally:
             self._sync_lock.release()
@@ -1111,6 +1122,14 @@ class Karaoke:
         saved_queue = state.get("queue") or []
         restored_queue = [item for item in saved_queue if os.path.isfile(item.get("file", ""))]
         dropped_queue = len(saved_queue) - len(restored_queue)
+        # Backfill ``song_id`` for items persisted before the field existed,
+        # so the queue rosette can hit the bulk endpoint without a refresh.
+        for item in restored_queue:
+            if item.get("song_id") is None and self.db is not None:
+                try:
+                    item["song_id"] = self.db.get_song_id_by_path(item["file"])
+                except Exception:
+                    item["song_id"] = None
 
         now_playing = state.get("now_playing")
         resume_title = None
@@ -1132,6 +1151,9 @@ class Karaoke:
                     "file": now_playing["filename"],
                     "title": title,
                     "semitones": int(now_playing.get("transpose") or 0),
+                    "song_id": (
+                        self.db.get_song_id_by_path(now_playing["filename"]) if self.db else None
+                    ),
                 }
                 restored_queue.insert(0, resume_item)
                 self.playback_controller.pending_resume_position = max(0.0, position)

@@ -1,5 +1,22 @@
 # Subtitle pipeline — Phase 1: orchestrator + per-source state
 
+## Status (2026-05-04)
+
+**SHIPPED** — commit `2a2b78ca feat(subtitle): orchestrate per-source
+fan-out with lifecycle state`. Phase 1 landed: `subtitle_jobs` schema,
+`SubtitleOrchestrator`, per-source executor pools, `subtitle_job_update`
+SocketIO event, `GET /api/songs/<id>/subtitles` endpoint, and the
+quick-win additions (tekstowo/spotify in `LYRICS_SOURCE_LABELS`,
+"no subtitles found" toast). Phases 2–4 still plan-only — see
+`subtitle-status-chips-phase-2.md`, `subtitle-smart-selection-phase-3.md`,
+`subtitle-self-healing-phase-4.md`.
+
+The enrichment-trigger bug listed under quick-wins was handled
+separately in `enrichment-trigger-bug.md` (mitigated 2026-05-04 with
+the `metadata_status='error'` stamp).
+
+---
+
 ## Goal
 
 After `song_downloaded`, fan out to ALL configured lyrics sources in

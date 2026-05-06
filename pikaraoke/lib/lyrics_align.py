@@ -14,6 +14,7 @@ the reference LRC and timings come from wav2vec2's phonetic alignment.
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -21,6 +22,38 @@ from pikaraoke.lib import vad_probe
 from pikaraoke.lib.lyrics import Word, WordPart
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class VadCacheRef:
+    """Bundle of disk-persistent VAD-onset cache callables.
+
+    Threaded through ``grade_lrc_priors_against_audio``,
+    ``_detect_per_line_starts``, and ``WhisperXAligner.align`` so a single
+    pipeline pass deduplicates the silero + silencedetect probe across
+    its prior-reliability grader and per-line shift detector calls (and
+    survives across alignment runs / app restarts via
+    ``audio_feature_cache``).
+
+    ``audio_sha256`` is the source-audio sha (not the vocals stem) — the
+    same key ``audio_feature_cache.write_vad_onsets`` writes under.
+    """
+
+    audio_sha256: str
+    cache_get: Callable[[str], str | None]
+    cache_set: Callable[[str, str], None]
+
+
+def _vad_onsets(audio_path: str, vad_cache: "VadCacheRef | None") -> list[tuple[float, float]]:
+    """Wrap ``vad_probe.list_vocal_onsets`` with optional cache plumbing."""
+    if vad_cache is None:
+        return vad_probe.list_vocal_onsets(audio_path)
+    return vad_probe.list_vocal_onsets(
+        audio_path,
+        audio_sha256=vad_cache.audio_sha256,
+        cache_get=vad_cache.cache_get,
+        cache_set=vad_cache.cache_set,
+    )
 
 
 @dataclass(frozen=True)
@@ -260,6 +293,8 @@ def _grade_priors(
 def grade_lrc_priors_against_audio(
     audio_path: str,
     lrc_lines: list[tuple[float, float, str]],
+    *,
+    vad_cache: "VadCacheRef | None" = None,
 ) -> tuple[float, DpResiduals | None]:
     """Score upstream LRC priors against audio without aligning words.
 
@@ -269,6 +304,11 @@ def grade_lrc_priors_against_audio(
     deciding between line-windowed and whole-song wav2vec2 alignment,
     so the routing decision has the full 3-signal score (duration +
     shift + rejection) instead of duration only.
+
+    ``vad_cache`` is the disk-persistent VAD onset cache (populated by
+    ``LyricsService``). When provided, the VAD probe writes its result
+    so the aligner's downstream ``_detect_per_line_starts`` call hits
+    the cache instead of re-probing the same audio.
 
     Returns ``(score, residuals)``. ``residuals`` is None when the DP
     couldn't produce a valid alignment (no onsets, first-line shift
@@ -285,7 +325,7 @@ def grade_lrc_priors_against_audio(
     lrc_implied_duration_s = float(lrc_lines[-1][0])
 
     residuals: DpResiduals | None = None
-    onsets = sorted(vad_probe.list_vocal_onsets(audio_path), key=lambda p: p[0])
+    onsets = sorted(_vad_onsets(audio_path, vad_cache), key=lambda p: p[0])
     if onsets and onsets[0][0] <= _LEADING_SILENCE_MAX_S:
         dp_result = _align_lines_to_anchors_dp(lrc_lines, onsets)
         if dp_result is not None:
@@ -301,7 +341,10 @@ def grade_lrc_priors_against_audio(
 
 
 def _detect_per_line_starts(
-    audio_path: str, lrc_lines: list[tuple[float, float, str]]
+    audio_path: str,
+    lrc_lines: list[tuple[float, float, str]],
+    *,
+    vad_cache: "VadCacheRef | None" = None,
 ) -> tuple[list[float], DpResiduals] | None:
     """Compute audio-aligned start times for each LRC line.
 
@@ -321,7 +364,7 @@ def _detect_per_line_starts(
     past ``_LEADING_SILENCE_MAX_S``, or the first anchored line's shift
     falls outside ``[_GLOBAL_OFFSET_MIN_S, _GLOBAL_OFFSET_MAX_S]``.
     """
-    onsets = sorted(vad_probe.list_vocal_onsets(audio_path), key=lambda p: p[0])
+    onsets = sorted(_vad_onsets(audio_path, vad_cache), key=lambda p: p[0])
     if not onsets or onsets[0][0] > _LEADING_SILENCE_MAX_S:
         return None
     first_idx = next(
@@ -852,6 +895,7 @@ class WhisperXAligner:
         *,
         lrc_lines: list[tuple[float, float, str]] | None = None,
         language: str | None = None,
+        vad_cache: "VadCacheRef | None" = None,
     ) -> list[Word]:
         """Forced-align reference lyrics to audio with wav2vec2 CTC.
 
@@ -891,7 +935,7 @@ class WhisperXAligner:
         # anchor (continuous singing inside a verse) inherit the most
         # recent locked shift.
         if lrc_lines is not None:
-            detect_result = _detect_per_line_starts(audio_path, lrc_lines)
+            detect_result = _detect_per_line_starts(audio_path, lrc_lines, vad_cache=vad_cache)
             if detect_result is not None:
                 new_starts, residuals = detect_result
                 self.last_line_starts = {
