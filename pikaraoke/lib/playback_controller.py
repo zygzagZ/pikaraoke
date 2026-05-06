@@ -317,6 +317,7 @@ class PlaybackController:
             "now_playing_audio_track_url": self.now_playing_audio_track_url,
             "now_playing_avsync_offset_ms": self.now_playing_avsync_offset_ms,
             "now_playing_position": self.now_playing_position,
+            "now_playing_filename": self.now_playing_filename,
             "now_playing_basename": (
                 os.path.basename(self.now_playing_filename) if self.now_playing_filename else None
             ),

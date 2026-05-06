@@ -120,3 +120,27 @@ class TestQueueReorderSocketUpdates:
             "song1",
         ]
         queue_with_events.update_now_playing_socket.assert_called_once()
+
+
+class TestReorderWithCurrentRoute:
+    @patch("pikaraoke.routes.queue.is_admin", return_value=True)
+    @patch("pikaraoke.routes.queue.get_karaoke_instance")
+    def test_route_delegates_to_karaoke(self, mock_get_instance, mock_is_admin, client):
+        k = MagicMock()
+        k.reorder_with_current.return_value = True
+        mock_get_instance.return_value = k
+
+        response = client.post(
+            "/queue/reorder_with_current", data={"old_index": 1, "new_index": 0}
+        )
+
+        assert response.status_code == 200
+        assert json.loads(response.data) == {"success": True}
+        k.reorder_with_current.assert_called_once_with(1, 0)
+
+    @patch("pikaraoke.routes.queue.is_admin", return_value=False)
+    def test_route_blocks_non_admin(self, mock_is_admin, client):
+        response = client.post(
+            "/queue/reorder_with_current", data={"old_index": 1, "new_index": 0}
+        )
+        assert response.status_code == 403

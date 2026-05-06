@@ -98,6 +98,15 @@
     align-items: center;
     gap: 10px;
   }
+  .pk-queue-now.is-list-item { margin-bottom: 0; }
+  .pk-queue-now.is-list-item.is-drag-handle {
+    grid-template-columns: 24px 1fr auto;
+    padding-left: 14px;
+  }
+  .pk-queue-now.is-list-item.is-drag-handle::before { left: 38px; }
+  .pk-queue-now.is-chosen {
+    box-shadow: var(--pk-shadow-elev);
+  }
   .pk-queue-now::before {
     content: '';
     position: absolute;
@@ -444,38 +453,49 @@
 
   function renderQueue() {
     const $list = document.getElementById('pk-queue-list');
-    const $now = document.getElementById('pk-queue-now');
     const $empty = document.getElementById('pk-queue-empty');
     const $toolbar = document.getElementById('pk-queue-toolbar');
     const np = queueState.nowPlaying;
     const q = queueState.queue;
-
-    // Now playing card
-    if (np && np.now_playing) {
-      $now.hidden = false;
-      $now.querySelector('[data-pk-np-title]').textContent = stripQuotes(np.now_playing);
-      $now.querySelector('[data-pk-np-singer]').textContent = np.now_playing_user || '';
-    } else {
-      $now.hidden = true;
-    }
+    const hasNow = !!(np && np.now_playing);
 
     // Wyczyść is only meaningful when there's something to clear.
     if ($toolbar) $toolbar.hidden = !q.length;
 
     // Empty state
-    if (!q.length && !(np && np.now_playing)) {
+    if (!q.length && !hasNow) {
       $empty.hidden = false;
       $list.innerHTML = '';
       return;
     }
     $empty.hidden = true;
 
-    // Queue list
-    $list.innerHTML = q
+    const dragHandle = isAdmin
+      ? `<div class="pk-queue-drag drag-handle" title="Przeciągnij aby zmienić kolejność"><i class="icon icon-braille"></i></div>`
+      : '';
+
+    let html = '';
+    if (hasNow) {
+      const npFile = np.now_playing_filename || np.now_playing;
+      const opts = isAdmin
+        ? `<button type="button" class="pk-queue-now-options" aria-label="Opcje"><i class="icon icon-cog"></i></button>`
+        : '';
+      const cls = 'pk-queue-now is-list-item' + (isAdmin ? ' is-drag-handle' : '');
+      html += `
+        <div class="${cls}" data-index="0" data-file="${encodeURIComponent(npFile)}" data-now="1">
+          ${dragHandle}
+          <div>
+            <div class="pk-queue-now-label">gra teraz</div>
+            <div class="pk-queue-now-title">${escHtml(stripQuotes(np.now_playing))}</div>
+            <div class="pk-queue-now-singer">śpiewa <span class="singer">${escHtml(np.now_playing_user || '')}</span></div>
+          </div>
+          ${opts}
+        </div>`;
+    }
+
+    html += q
       .map((item, i) => {
-        const dragHandle = isAdmin
-          ? `<div class="pk-queue-drag drag-handle" title="Przeciągnij aby zmienić kolejność"><i class="icon icon-braille"></i></div>`
-          : '';
+        const virtIdx = hasNow ? i + 1 : i;
         const cog = isAdmin
           ? `<button type="button" class="pk-queue-cog pk-queue-opts" data-idx="${i}" data-file="${encodeURIComponent(item.file)}" data-title="${encodeURIComponent(item.title)}" aria-label="Opcje"><i class="icon icon-cog"></i></button>`
           : '';
@@ -491,7 +511,7 @@
           + (isAdmin ? ' is-drag-handle' : '')
           + (hasRosette ? ' has-rosette' : '');
         return `
-          <div class="${cls}" data-index="${i}" data-file="${encodeURIComponent(item.file)}">
+          <div class="${cls}" data-index="${virtIdx}" data-file="${encodeURIComponent(item.file)}">
             ${dragHandle}
             <div class="pk-queue-n">${i + 1}</div>
             <div class="pk-queue-body">
@@ -504,11 +524,13 @@
       })
       .join('');
 
+    $list.innerHTML = html;
+
     initSortable();
     refreshRosettes();
 
     if (highlightFile) {
-      const rows = $list.querySelectorAll('.pk-queue-row');
+      const rows = $list.querySelectorAll('[data-file]');
       rows.forEach((r) => {
         if (decodeURIComponent(r.dataset.file) === highlightFile) r.classList.add('is-moved');
       });
@@ -594,14 +616,23 @@
         if (evt.oldIndex === evt.newIndex) return;
         const movedFile = decodeURIComponent(evt.item.dataset.file);
         highlightFile = movedFile;
-        // Update visual numbers immediately
+        // Update visual numbers immediately (skip the now-playing row)
         $list.querySelectorAll('.pk-queue-row .pk-queue-n').forEach((n, i) => {
           n.textContent = String(i + 1).padStart(2, '0');
         });
-        $.post('{{ url_for("queue.reorder") }}', {
-          old_index: evt.oldIndex,
-          new_index: evt.newIndex,
-        });
+        const hasNow = !!$list.querySelector('[data-now="1"]');
+        if (hasNow && (evt.oldIndex === 0 || evt.newIndex === 0)) {
+          $.post('{{ url_for("queue.reorder_with_current") }}', {
+            old_index: evt.oldIndex,
+            new_index: evt.newIndex,
+          });
+        } else {
+          const offset = hasNow ? 1 : 0;
+          $.post('{{ url_for("queue.reorder") }}', {
+            old_index: evt.oldIndex - offset,
+            new_index: evt.newIndex - offset,
+          });
+        }
       },
     });
   }
@@ -931,19 +962,6 @@
 {% endif %}
 
 <div id="pk-downloads" hidden></div>
-
-<div id="pk-queue-now" class="pk-queue-now" hidden>
-  <div>
-    <div class="pk-queue-now-label">gra teraz</div>
-    <div class="pk-queue-now-title" data-pk-np-title></div>
-    <div class="pk-queue-now-singer">śpiewa <span class="singer" data-pk-np-singer></span></div>
-  </div>
-  {% if admin %}
-  <button type="button" class="pk-queue-now-options" aria-label="Opcje">
-    <i class="icon icon-cog"></i>
-  </button>
-  {% endif %}
-</div>
 
 <div id="pk-queue-list" class="pk-queue-list"></div>
 

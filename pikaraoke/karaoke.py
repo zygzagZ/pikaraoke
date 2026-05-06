@@ -1073,6 +1073,54 @@ class Karaoke:
         self.queue_manager.enqueue(filename, user, semitones, True)
         self.playback_controller.skip(log_action=False)
 
+    def reorder_with_current(self, old_index: int, new_index: int) -> bool:
+        """Reorder treating the playing song as virtual index 0.
+
+        Indices: 0 = currently playing, 1..N = queue[0..N-1]. When the move
+        changes which item ends up at index 0, the playing song is stopped
+        (and re-queued from the start at its dropped position) and the run
+        loop picks up the new top item. When index 0 is untouched, this is
+        a plain queue reorder.
+        """
+        pc = self.playback_controller
+        qm = self.queue_manager
+
+        if pc.now_playing_filename is None:
+            if old_index < 1 or new_index < 1:
+                return False
+            return qm.reorder(old_index - 1, new_index - 1)
+
+        if old_index == new_index:
+            return True
+
+        current_item = {
+            "user": pc.now_playing_user or "Pikaraoke",
+            "file": pc.now_playing_filename,
+            "title": qm._resolve_title(pc.now_playing_filename),
+            "semitones": pc.now_playing_transpose or 0,
+            "song_id": qm._resolve_song_id(pc.now_playing_filename),
+        }
+        combined = [current_item] + list(qm.queue)
+
+        if not (0 <= old_index < len(combined) and 0 <= new_index < len(combined)):
+            return False
+
+        moved = combined.pop(old_index)
+        combined.insert(new_index, moved)
+
+        if combined[0]["file"] == pc.now_playing_filename:
+            qm.queue = combined[1:]
+            qm._events.emit("queue_update")
+            qm._events.emit("now_playing_update")
+            return True
+
+        # Mutate queue first so the run loop's next pop_next() picks the
+        # promoted song; the demoted current sits at its dropped index.
+        qm.queue = combined
+        pc.skip(log_action=False)
+        qm._events.emit("queue_update")
+        return True
+
     def volume_change(self, vol_level: float) -> bool:
         """Set the playback volume.
 
