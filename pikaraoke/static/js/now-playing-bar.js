@@ -815,16 +815,30 @@
       });
   }
 
+  // Tap-to-seek is allowed for the admin and for the pilot who added the
+  // current song (their stored pilot name matches now_playing_user). The
+  // server-side /seek socket handler is still authoritative — this only
+  // gates which clients render lines as tappable and short-circuits the
+  // emit. now_playing_user comes from state.data, populated by render().
+  function canSeekLyrics() {
+    if (state.isAdmin) return true;
+    const owner = state.data && state.data.now_playing_user;
+    if (!owner) return false;
+    const pilot = (typeof getPilotName === 'function') ? getPilotName() : '';
+    return !!pilot && pilot === owner;
+  }
+
   function buildLyricsDom(lines) {
     if (!el.lyricsScroll) return;
     el.lyricsScroll.textContent = '';
+    const tappable = canSeekLyrics();
     const frag = document.createDocumentFragment();
     for (let i = 0; i < lines.length; i++) {
       const p = document.createElement('p');
       p.className = 'pk-lyric-line';
       p.dataset.pkLyricIdx = String(i);
       p.textContent = lines[i].text;
-      if (state.isAdmin) {
+      if (tappable) {
         p.setAttribute('role', 'button');
         p.tabIndex = 0;
         p.classList.add('is-tappable');
@@ -952,10 +966,11 @@
     );
   }
 
-  // Tap-to-seek on a lyric line — admin only. Delegated on the scroll
-  // container so a single listener covers all lines without per-build wiring.
+  // Tap-to-seek on a lyric line — admin or the pilot who added the song.
+  // Delegated on the scroll container so a single listener covers all
+  // lines without per-build wiring.
   function onLyricLineActivate(e) {
-    if (!state.isAdmin) return;
+    if (!canSeekLyrics()) return;
     const node = e.target.closest('.pk-lyric-line.is-tappable');
     if (!node) return;
     const idx = parseInt(node.dataset.pkLyricIdx, 10);
@@ -966,7 +981,7 @@
   }
 
   function onLyricLineKeydown(e) {
-    if (!state.isAdmin) return;
+    if (!canSeekLyrics()) return;
     if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
     const node = e.target.closest('.pk-lyric-line.is-tappable');
     if (!node) return;
