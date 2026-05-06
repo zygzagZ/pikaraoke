@@ -118,6 +118,10 @@ SPOTIFY_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
+# Upper bound on the in-thread sleep we accept from Spotify's Retry-After
+# on a 429 to ``/v1/search``. Beyond this we punt back to the orchestrator
+# rather than parking a worker.
+SPOTIFY_RATE_LIMIT_SLEEP_CAP = 90.0
 
 # Last-resort ASR fallback. When LRCLib / Genius / YouTube VTT all miss,
 # transcribe the vocals stem with faster-whisper so the song still gets
@@ -1613,11 +1617,11 @@ class LyricsService:
 
         Memoized per ``(track, artist, isrc)`` key — repeated requests for
         the same song hit cache instead of the rate-limited search API.
-        Honors a global rate-limit cooldown: if Spotify recently returned
-        429, all callers fast-fail with None until the Retry-After window
-        expires. ``api.spotify.com/v1/search`` is aggressively throttled
-        for web-player tokens, so cache + cooldown is what makes the
-        backend actually usable in practice.
+        On 429 the caller sleeps the Retry-After window and retries once
+        in-place rather than failing — Spotify's search throttle is short-
+        lived (seconds) and bubbling the failure up turns into a multi-day
+        orchestrator backoff. Concurrent callers see the global cooldown
+        gate and fast-fail so only one thread eats the sleep.
         """
         cache_key = (track, artist, isrc or "")
         if cache_key in self._spotify_search_cache:
@@ -1633,8 +1637,9 @@ class LyricsService:
             query = f"isrc:{isrc}"
         else:
             query = f'track:"{track}" artist:"{artist}"'
-        try:
-            r = requests.get(
+
+        def _do_search() -> requests.Response:
+            return requests.get(
                 SPOTIFY_SEARCH_URL,
                 params={"q": query, "type": "track", "limit": 5},
                 headers={
@@ -1643,14 +1648,34 @@ class LyricsService:
                 },
                 timeout=SPOTIFY_TIMEOUT,
             )
+
+        def _retry_after(resp: requests.Response) -> float:
+            try:
+                return float(resp.headers.get("Retry-After", "60"))
+            except ValueError:
+                return 60.0
+
+        try:
+            r = _do_search()
             if r.status_code == 429:
-                try:
-                    cooldown = float(r.headers.get("Retry-After", "60"))
-                except ValueError:
-                    cooldown = 60.0
+                # Cap the in-thread sleep so a pathological Retry-After
+                # can't park a worker for hours; if Spotify really wants
+                # more, the second 429 below punts to orchestrator backoff.
+                cooldown = min(_retry_after(r), SPOTIFY_RATE_LIMIT_SLEEP_CAP)
                 self._spotify_rate_limited_until = time.time() + cooldown
-                logger.warning("Spotify search rate-limited; cooling down for %.0fs", cooldown)
-                return None
+                logger.warning(
+                    "Spotify search rate-limited; sleeping %.0fs and retrying", cooldown
+                )
+                time.sleep(cooldown)
+                r = _do_search()
+                if r.status_code == 429:
+                    cooldown2 = _retry_after(r)
+                    self._spotify_rate_limited_until = time.time() + cooldown2
+                    logger.warning(
+                        "Spotify search still rate-limited after retry; giving up for %.0fs",
+                        cooldown2,
+                    )
+                    return None
             if r.status_code != 200:
                 logger.warning("Spotify search HTTP %s for %r", r.status_code, query)
                 return None

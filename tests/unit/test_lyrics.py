@@ -3875,17 +3875,59 @@ class TestSpotifySearchRateLimit:
         svc._spotify_token_cache = ("TOK", time.time() + 3600)
         return svc
 
-    def test_429_sets_cooldown_and_skips_subsequent_lookups(self):
+    def test_429_sleeps_and_retries_then_recovers(self):
+        """First 429 → sleep Retry-After → retry succeeds. The worker
+        eats the sleep instead of bubbling up a transient failure that
+        would trigger the orchestrator's multi-day backoff."""
+        svc = self._make_service()
+        rate_limited = MagicMock(status_code=429)
+        rate_limited.headers = {"Retry-After": "5"}
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = {"tracks": {"items": [{"id": "TID", "artists": [{"name": "b"}]}]}}
+        with (
+            patch(
+                "pikaraoke.lib.lyrics.requests.get", side_effect=[rate_limited, ok]
+            ) as mock_get,
+            patch("pikaraoke.lib.lyrics.time.sleep") as mock_sleep,
+        ):
+            assert svc._resolve_spotify_track_id("a", "b", None) == "TID"
+            assert mock_get.call_count == 2
+            mock_sleep.assert_called_once_with(5.0)
+
+    def test_429_twice_sets_cooldown_and_skips_subsequent_lookups(self):
+        """Two 429s in a row → give up and arm the global gate so other
+        lookups fast-fail until Retry-After elapses."""
         svc = self._make_service()
         rate_limited = MagicMock(status_code=429)
         rate_limited.headers = {"Retry-After": "30"}
-        with patch("pikaraoke.lib.lyrics.requests.get", return_value=rate_limited) as mock_get:
+        with (
+            patch(
+                "pikaraoke.lib.lyrics.requests.get", return_value=rate_limited
+            ) as mock_get,
+            patch("pikaraoke.lib.lyrics.time.sleep"),
+        ):
             assert svc._resolve_spotify_track_id("a", "b", None) is None
             assert svc._spotify_rate_limited_until > time.time() + 25
+            assert mock_get.call_count == 2  # initial + one retry
             # A different (track, artist) should not hit the wire while
             # the cooldown is active.
             assert svc._resolve_spotify_track_id("c", "d", None) is None
-            assert mock_get.call_count == 1
+            assert mock_get.call_count == 2
+
+    def test_429_sleep_capped(self):
+        """Retry-After of 600s gets capped to SPOTIFY_RATE_LIMIT_SLEEP_CAP
+        so a worker can't be parked for an hour by a pathological header."""
+        from pikaraoke.lib.lyrics import SPOTIFY_RATE_LIMIT_SLEEP_CAP
+
+        svc = self._make_service()
+        rate_limited = MagicMock(status_code=429)
+        rate_limited.headers = {"Retry-After": "600"}
+        with (
+            patch("pikaraoke.lib.lyrics.requests.get", return_value=rate_limited),
+            patch("pikaraoke.lib.lyrics.time.sleep") as mock_sleep,
+        ):
+            svc._resolve_spotify_track_id("a", "b", None)
+            mock_sleep.assert_called_once_with(SPOTIFY_RATE_LIMIT_SLEEP_CAP)
 
     def test_successful_search_is_cached_per_key(self):
         svc = self._make_service()
