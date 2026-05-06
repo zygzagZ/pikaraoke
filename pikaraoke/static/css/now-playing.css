@@ -456,6 +456,51 @@
   text-align: right;
 }
 
+/* Subtitle timing offset — label + stepper buttons flanking a numeric
+   text input. Per-(song, source) value, defaulting to 0.00s. */
+.pk-tool-offset {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  grid-column: 1 / -1;
+  background: var(--pk-surface);
+  border: 1px solid var(--pk-border);
+  border-radius: var(--pk-r-md);
+}
+.pk-tool-offset[hidden] { display: none; }
+.pk-offset-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.pk-offset-input {
+  width: 70px;
+  padding: 6px 8px;
+  background: var(--pk-surface-2);
+  border: 1px solid var(--pk-border);
+  border-radius: 6px;
+  color: var(--pk-amber);
+  font-family: var(--pk-font-mono);
+  font-size: 14px;
+  text-align: center;
+  font-feature-settings: "tnum";
+  -moz-appearance: textfield;
+}
+.pk-offset-input:focus-visible {
+  outline: 2px solid var(--pk-amber);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+.pk-offset-suffix {
+  font-family: var(--pk-font-mono);
+  font-size: 11px;
+  color: var(--pk-ink-3);
+  min-width: 8px;
+}
+
 /* Bottom controls — sticky bottom row in the player flex shell.
    border-top + safe-area padding visually anchors the strip when the
    middle scroll region pushes content underneath. */

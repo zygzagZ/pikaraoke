@@ -520,11 +520,17 @@
           <span class="pk-tool-stem-val" data-pk-inst-val>100%</span>
         </div>
 
-        {# Subtitle timing offset — shown only when ASS lyrics are loaded. #}
-        <div class="pk-tool pk-tool-stem" data-pk-subtitle-offset-tool hidden>
+        {# Subtitle timing offset — shown only when ASS lyrics are loaded.
+           Per-(song, source) value in seconds; defaults to 0.00s for any
+           combination the operator hasn't tweaked yet. #}
+        <div class="pk-tool pk-tool-offset" data-pk-subtitle-offset-tool hidden>
           <span class="pk-tool-label">napisy</span>
-          <input type="range" min="-2" max="2" step="0.05" value="0" data-pk-subtitle-offset class="pk-range">
-          <span class="pk-tool-stem-val" data-pk-subtitle-offset-val>0.00s</span>
+          <div class="pk-offset-control">
+            <button type="button" class="pk-tool-step" data-pk-subtitle-offset-dec aria-label="Subtitles earlier">&minus;</button>
+            <input type="text" inputmode="decimal" data-pk-subtitle-offset class="pk-offset-input" value="0.00" aria-label="Subtitle offset (seconds)">
+            <span class="pk-offset-suffix">s</span>
+            <button type="button" class="pk-tool-step" data-pk-subtitle-offset-inc aria-label="Subtitles later">+</button>
+          </div>
         </div>
 
         {# Subtitle source picker — Phase 2 mounts a smart popover into

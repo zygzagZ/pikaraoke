@@ -298,7 +298,6 @@ def test_preference_manager_defaults_exist():
         "download_path",
         "youtubedl_proxy",
         "preferred_language",
-        "subtitle_offset",
         "spotify_sp_dc",
     }
 
