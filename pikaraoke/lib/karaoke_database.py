@@ -236,6 +236,16 @@ WHERE role LIKE 'ass_%'
   AND role NOT IN ('ass_auto', 'ass_user');
 """
 
+# v9 -> v10: snapshot of ``songs.language`` at the moment iTunes enrichment
+# last ran. The enricher uses this for idempotency: when a new language
+# signal flips ``songs.language`` (e.g. whisper probe writes ``pl`` after
+# Tier-1 had no consensus), ``language_at_enrich != songs.language`` is the
+# trigger to re-run iTunes selection. NULL means "never enriched yet" or
+# "row predates this column" — both treated as "enrich on next dispatch".
+_MIGRATION_V10 = """
+ALTER TABLE songs ADD COLUMN language_at_enrich TEXT;
+"""
+
 LYRICS_PROVENANCE_AUTO_WORD = "auto_word"
 LYRICS_PROVENANCE_AUTO_LINE = "auto_line"
 LYRICS_PROVENANCE_USER = "user"
@@ -287,7 +297,7 @@ VARIANT_FILE_SOURCES = frozenset(
     }
 )
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 # Lifecycle states a subtitle_jobs row can hold (Phase 1).
 SUBTITLE_JOB_QUEUED = "queued"
@@ -362,6 +372,14 @@ class KaraokeDatabase:
     native OS strings (str(path), never as_posix()).
     """
 
+    # Sentinel for kwargs that distinguish "caller didn't pass this field"
+    # from "caller explicitly cleared it". Plain None means clear (e.g.
+    # reverting to VTT-only), omission means keep-as-is. Declared at the top
+    # of the class body so methods anywhere below can use it as a default
+    # value (Python evaluates defaults at def-time against the surrounding
+    # namespace, so the order matters).
+    _UNSET = object()
+
     def __init__(self, db_path: str | None = None) -> None:
         if db_path is None:
             db_path = os.path.join(get_data_directory(), "pikaraoke.db")
@@ -424,6 +442,9 @@ class KaraokeDatabase:
             }
             if "subtitle_jobs" not in tables:
                 self._conn.executescript(_MIGRATION_V9)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(songs)").fetchall()}
+            if "language_at_enrich" not in columns:
+                self._conn.executescript(_MIGRATION_V10)
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------
@@ -743,24 +764,49 @@ class KaraokeDatabase:
                 (mtime, size, sha256, song_id),
             )
 
-    def stamp_enrichment_attempt(self, song_id: int, status: str, attempted_at: str) -> None:
+    def stamp_enrichment_attempt(
+        self,
+        song_id: int,
+        status: str,
+        attempted_at: str,
+        *,
+        language_at_enrich: str | None = _UNSET,  # type: ignore[assignment]
+    ) -> None:
         """Record metadata_status + attempt count for a song.
 
         Increments enrichment_attempts atomically. Used by the enricher so
-        failed lookups are visible in the DB for later retry.
+        failed lookups are visible in the DB for later retry. ``language_at_enrich``
+        is the language assumption the enricher used; pass it to keep the
+        idempotency snapshot in sync with the status write. Omit to leave
+        the column untouched (e.g. when stamping a transient ``error``
+        without a language verdict).
         """
         with self._lock, self._conn:
-            self._conn.execute(
-                """
-                UPDATE songs
-                SET metadata_status = ?,
-                    enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1,
-                    last_enrichment_attempt = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (status, attempted_at, song_id),
-            )
+            if language_at_enrich is self._UNSET:
+                self._conn.execute(
+                    """
+                    UPDATE songs
+                    SET metadata_status = ?,
+                        enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1,
+                        last_enrichment_attempt = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (status, attempted_at, song_id),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE songs
+                    SET metadata_status = ?,
+                        enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1,
+                        last_enrichment_attempt = ?,
+                        language_at_enrich = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (status, attempted_at, language_at_enrich, song_id),
+                )
 
     def clear_audio_fingerprint(self, song_id: int) -> None:
         with self._lock, self._conn:
@@ -773,11 +819,6 @@ class KaraokeDatabase:
                 """,
                 (song_id,),
             )
-
-    # Sentinel that lets update_processing_config distinguish "caller didn't
-    # pass this field" from "caller explicitly cleared it". Plain None means
-    # clear (e.g. reverting to VTT-only), omission means keep-as-is.
-    _UNSET = object()
 
     def update_processing_config(
         self,

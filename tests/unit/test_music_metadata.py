@@ -7,11 +7,11 @@ import requests
 
 from pikaraoke.lib import music_metadata
 from pikaraoke.lib.music_metadata import (
-    _normalize_title,
     _upscale_artwork,
     fetch_itunes_track,
     fetch_musicbrainz_ids,
     fetch_musicbrainz_language_signals,
+    normalize_title,
     resolve_metadata,
     search_itunes,
     search_itunes_full,
@@ -46,11 +46,11 @@ class TestNormalizeTitle:
         ],
     )
     def test_normalizes(self, raw, expected):
-        assert _normalize_title(raw) == expected
+        assert normalize_title(raw) == expected
 
     def test_preserves_feat_without_parens(self):
         # iTunes is fuzzy enough that stripping feat would lose disambiguation.
-        assert _normalize_title("Dr. Dre feat. Snoop Dogg - Nuthin") == (
+        assert normalize_title("Dr. Dre feat. Snoop Dogg - Nuthin") == (
             "Dr. Dre feat. Snoop Dogg - Nuthin"
         )
 

@@ -35,7 +35,7 @@ _TOPIC_SUFFIX_RE = re.compile(r"\s*-\s*Topic\s*$", re.IGNORECASE)
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-def _normalize_title(raw: str) -> str:
+def normalize_title(raw: str) -> str:
     """Strip YouTube boilerplate so the query reads like a clean search term.
 
     Drops parenthesized/bracketed content ("Official Video", "Long Version",
@@ -138,7 +138,7 @@ def resolve_metadata(title: str) -> dict | None:
 
     Returns None if iTunes has no match or the request failed.
     """
-    hits = search_itunes(_normalize_title(title), limit=1)
+    hits = search_itunes(normalize_title(title), limit=1)
     return hits[0] if hits else None
 
 
@@ -151,28 +151,38 @@ def _upscale_artwork(url: str, target: int = 600) -> str:
     return re.sub(r"/\d+x\d+(bb)?\.(jpg|png|jpeg)$", f"/{target}x{target}bb.jpg", url)
 
 
+def project_full_hit(raw_hit: dict) -> dict:
+    """Project an ``_ITUNES_FIELDS``-shaped row to the canonical enricher shape.
+
+    Shape: ``{itunes_id, artist, track, album, track_number, release_date,
+    cover_art_url, genre}`` — keys may be ``None`` when iTunes didn't supply
+    them. Shared between ``fetch_itunes_track`` (top-1 caller) and the song
+    enricher (top-5 reranker), so a hit picked by either path projects
+    identically.
+    """
+    artwork = raw_hit.get("artworkUrl100") or ""
+    return {
+        "itunes_id": str(raw_hit["trackId"]) if raw_hit.get("trackId") else None,
+        "artist": raw_hit.get("artistName") or None,
+        "track": raw_hit.get("trackName") or None,
+        "album": raw_hit.get("collectionName") or None,
+        "track_number": raw_hit.get("trackNumber") or None,
+        "release_date": raw_hit.get("releaseDate") or None,
+        "cover_art_url": _upscale_artwork(artwork) if artwork else None,
+        "genre": raw_hit.get("primaryGenreName") or None,
+    }
+
+
 def fetch_itunes_track(title: str) -> dict | None:
     """Top match from iTunes with the full extracted field set.
 
-    Shape: ``{itunes_id, artist, track, album, track_number, release_date,
-    cover_art_url, genre}`` — keys may be missing/empty when iTunes doesn't
-    supply them. Returns None when iTunes returns no match.
+    Returns None when iTunes returns no match. See ``project_full_hit`` for
+    the output shape.
     """
-    hits = search_itunes_full(_normalize_title(title), limit=1)
+    hits = search_itunes_full(normalize_title(title), limit=1)
     if not hits:
         return None
-    h = hits[0]
-    artwork = h.get("artworkUrl100") or ""
-    return {
-        "itunes_id": str(h["trackId"]) if h.get("trackId") else None,
-        "artist": h.get("artistName") or None,
-        "track": h.get("trackName") or None,
-        "album": h.get("collectionName") or None,
-        "track_number": h.get("trackNumber") or None,
-        "release_date": h.get("releaseDate") or None,
-        "cover_art_url": _upscale_artwork(artwork) if artwork else None,
-        "genre": h.get("primaryGenreName") or None,
-    }
+    return project_full_hit(hits[0])
 
 
 # Cached MusicBrainz recording shape. Fields beyond mbid/isrc are US-43

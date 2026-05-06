@@ -66,9 +66,9 @@ from pikaraoke.lib.lyrics_pipeline_failure_cache import (
 from pikaraoke.lib.metadata_parser import remove_accents
 from pikaraoke.lib.music_metadata import (
     _itunes_row_to_dict,
-    _normalize_title,
     _search_itunes_cached,
     fetch_musicbrainz_language_signals,
+    normalize_title,
     resolve_metadata,
 )
 from pikaraoke.lib.whisper_transcript_cache import (
@@ -310,6 +310,33 @@ _VARIANT_SOURCE_TIERS: dict[str, str] = {
 
 def _tier_for_variant_source(source: str) -> str | None:
     return _VARIANT_SOURCE_TIERS.get(source)
+
+
+def _dispatch_reenrich(db, song_id: int, song_path: str) -> None:
+    """Fire ``enrich_song`` in a daemon thread after a language-write site.
+
+    The enricher is idempotent: when ``songs.language_at_enrich ==
+    songs.language`` and ``metadata_status == 'enriched'`` it short-circuits.
+    So calling this hook is safe even if the language didn't actually change
+    — every classifier / whisper-probe write site invokes it, and the
+    enricher decides whether work is needed. Imports are deferred so the
+    lyrics module stays importable in environments where the enricher's
+    requests/network chain isn't installed.
+    """
+    if db is None:
+        return
+
+    def _run() -> None:
+        try:
+            from pikaraoke.lib.song_enricher import enrich_song
+
+            enrich_song(db, song_id, song_path)
+        except Exception:
+            logger.exception("re-enrich after language write failed for %s", song_path)
+
+    threading.Thread(
+        target=_run, name=f"reenrich-{os.path.basename(song_path)}", daemon=True
+    ).start()
 
 
 @dataclass(frozen=True)
@@ -1777,9 +1804,9 @@ class LyricsService:
         mb_signals: dict | None = None
         if info and info.get("artist") and info.get("track"):
             # Match the enricher's query shape (`_query_from_song` + iTunes'
-            # internal ``_normalize_title``) so both paths share the same LRU
+            # internal ``normalize_title``) so both paths share the same LRU
             # entry and pay at most one iTunes round-trip per song.
-            query = _normalize_title(f"{info['artist']} - {info['track']}")
+            query = normalize_title(f"{info['artist']} - {info['track']}")
             try:
                 rows = _search_itunes_cached(query, 1)
                 if rows:
@@ -1805,6 +1832,13 @@ class LyricsService:
         except Exception:
             logger.exception("classifier: classify_and_persist crashed for %s", song_path)
             return
+
+        # Re-enrich whenever Tier 1 produced a verdict — the enricher
+        # short-circuits if ``language_at_enrich`` already matches, so a
+        # consensus that confirmed the existing language costs only the
+        # idempotency check.
+        if verdict is not None:
+            _dispatch_reenrich(self._db, song_id, song_path)
 
         # Tier 2a (US-43): when Tier 1 couldn't reach consensus, run a
         # Whisper language-ID probe on the raw audio. The probe writes
@@ -1882,6 +1916,8 @@ class LyricsService:
             lang,
             bool(applied),
         )
+        if applied:
+            _dispatch_reenrich(self._db, song_id, song_path)
 
     def _apply_cached_stems_probe(self, song_path: str) -> None:
         """Apply a previously cached ``whisper_probe_stems`` verdict, if any.
@@ -1940,6 +1976,7 @@ class LyricsService:
                 cached_lang,
                 current_lang,
             )
+            _dispatch_reenrich(self._db, song_id, song_path)
 
     def _run_tier2b_probe(self, song_path: str, song_id: int, stem_path: str) -> bool:
         """Tier 2b Whisper language-ID re-probe on the vocals stem (US-43).
@@ -2003,6 +2040,8 @@ class LyricsService:
         except Exception:
             logger.exception("tier2b probe: failed to persist lang=%s for %s", stem_lang, song_path)
             return False
+        if applied:
+            _dispatch_reenrich(self._db, song_id, song_path)
 
         same_lang = _lang_base(current_lang or "") == stem_lang
         if same_lang:

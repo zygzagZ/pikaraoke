@@ -222,6 +222,19 @@ def edit_file(query):
     # files not yet ingested into ``songs`` (the chip row hides itself).
     song_id = k.db.get_song_id_by_path(song_path) if k.db else None
 
+    # Surfaces the metadata-enrichment state to the template so we can show
+    # an "awaiting language" / "language mismatch" chip. Both states are
+    # transient (a later whisper probe re-runs the enricher), but they tell
+    # the user why iTunes-derived fields look empty or odd; for an enriched
+    # row the chip stays hidden.
+    metadata_status = None
+    metadata_language = None
+    if song_id is not None and k.db is not None:
+        row = k.db.get_song_by_id(song_id)
+        if row is not None:
+            metadata_status = row["metadata_status"]
+            metadata_language = row["language"]
+
     return render_template(
         "edit.html",
         site_title=site_name,
@@ -234,6 +247,8 @@ def edit_file(query):
         song_basename=basename,
         song_youtube_id=youtube_id,
         song_id=song_id,
+        metadata_status=metadata_status,
+        metadata_language=metadata_language,
     )
 
 

@@ -20,6 +20,45 @@ def _insert_song(db, path="/songs/Artist - Song---abc12345678.mp4"):
     return db.get_song_id_by_path(path)
 
 
+def _seed_language(db, song_id, lang):
+    """Plant ``songs.language`` so the language-gated enricher will run iTunes."""
+    db.update_track_metadata_with_provenance(song_id, "whisper_probe_raw", {"language": lang})
+
+
+def _raw_hit(
+    artist="A",
+    track="B",
+    *,
+    track_id=12345,
+    collection="",
+    track_number=1,
+    release_date=None,
+    artwork="https://fake/100x100bb.jpg",
+    genre="Rock",
+    country="USA",
+    currency="USD",
+):
+    """Build a raw iTunes-API-shaped hit (the shape ``search_itunes_full`` returns).
+
+    Defaults keep the joined collection+track+artist text under
+    ``_LANGDETECT_MIN_CHARS`` (12), so ``_hit_language`` falls back to the
+    storefront-country mapping. Tests that exercise the langdetect path
+    pass longer artist/track/collection explicitly.
+    """
+    return {
+        "artistName": artist,
+        "trackName": track,
+        "trackId": track_id,
+        "collectionName": collection,
+        "trackNumber": track_number,
+        "releaseDate": release_date,
+        "artworkUrl100": artwork,
+        "primaryGenreName": genre,
+        "country": country,
+        "currency": currency,
+    }
+
+
 def _row_with(**fields):
     """Mimic a sqlite3.Row (supports __getitem__ by column name)."""
     return fields
@@ -46,26 +85,89 @@ class TestQueryFromSong:
         assert song_enricher._query_from_song(None, str(song)) == "Artist - Song"
 
 
+class TestHitLanguage:
+    def test_uses_text_signal_when_long_enough(self):
+        # Polish text — langdetect should fire on the joined fields.
+        hit = _raw_hit(
+            artist="Edyta Górniak",
+            track="Kolorowy wiatr",
+            collection="Pocahontas Złota Kolekcja",
+            country="USA",  # storefront would say en; text wins
+        )
+        assert song_enricher._hit_language(hit) == "pl"
+
+    def test_falls_back_to_country_when_text_too_short(self):
+        hit = _raw_hit(artist="X", track="Y", collection="Z", country="POL")
+        # Too short for langdetect (12-char minimum), country says PL.
+        assert song_enricher._hit_language(hit) == "pl"
+
+    def test_returns_none_when_neither_signal_fires(self):
+        hit = _raw_hit(artist="X", track="Y", collection="Z", country="XYZ")
+        assert song_enricher._hit_language(hit) is None
+
+
+class TestPickHitForLanguage:
+    def test_picks_first_matching(self):
+        hits = [
+            _raw_hit(country="POL", artist="A", track="B", collection="C"),  # pl
+            _raw_hit(country="USA", artist="A", track="B", collection="C"),  # en
+        ]
+        chosen, reason = song_enricher._pick_hit_for_language(hits, "en")
+        assert reason == "lang_match"
+        assert chosen is hits[1]
+
+    def test_skips_hits_with_unknown_language(self):
+        hits = [
+            _raw_hit(country="XYZ", artist="A", track="B", collection="C"),  # unknown
+            _raw_hit(country="POL", artist="A", track="B", collection="C"),  # pl
+        ]
+        chosen, reason = song_enricher._pick_hit_for_language(hits, "pl")
+        assert chosen is hits[1]
+
+    def test_no_match_returns_none(self):
+        hits = [_raw_hit(country="USA", artist="A", track="B", collection="C")]
+        chosen, reason = song_enricher._pick_hit_for_language(hits, "pl")
+        assert chosen is None
+        assert reason == "no_match"
+
+
 class TestEnrichSong:
-    def test_populates_nullable_fields_from_itunes(self, db, tmp_path):
+    def test_defers_when_no_language_signal_yet(self, db, tmp_path):
+        """Before any classifier/whisper has set songs.language, the
+        enricher records ``awaiting_language`` and does NOT call iTunes."""
         song_path = str(tmp_path / "Eminem - Stan---abc12345678.mp4")
         sid = _insert_song(db, song_path)
 
-        itunes_full = {
-            "itunes_id": "99999",
-            "artist": "Eminem",
-            "track": "Stan",
-            "album": "The Marshall Mathers LP",
-            "track_number": 3,
-            "release_date": "2000-05-23T07:00:00Z",
-            "cover_art_url": "https://fake/art.jpg",
-            "genre": "Hip-Hop/Rap",
-        }
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None), patch.object(
-            song_enricher, "_download_cover", return_value=False
-        ):
+        with patch.object(song_enricher, "search_itunes_full") as mock_search:
+            song_enricher.enrich_song(db, sid, song_path)
+            mock_search.assert_not_called()
+
+        row = db.get_song_by_id(sid)
+        assert row["metadata_status"] == "awaiting_language"
+        assert row["enrichment_attempts"] == 1
+        assert row["language_at_enrich"] is None
+        # No textual fields written.
+        assert row["album"] is None
+        assert row["genre"] is None
+
+    def test_populates_nullable_fields_from_itunes(self, db, tmp_path):
+        song_path = str(tmp_path / "Eminem - Stan---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
+
+        hit = _raw_hit(
+            artist="Eminem",
+            track="Stan",
+            track_id=99999,
+            collection="The Marshall Mathers LP",
+            track_number=3,
+            release_date="2000-05-23T07:00:00Z",
+            genre="Hip-Hop/Rap",
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ), patch.object(song_enricher, "_download_cover", return_value=False):
             song_enricher.enrich_song(db, sid, song_path)
 
         row = db.get_song_by_id(sid)
@@ -78,10 +180,145 @@ class TestEnrichSong:
         assert row["genre"] == "Hip-Hop/Rap"
         assert row["metadata_status"] == "enriched"
         assert row["enrichment_attempts"] == 1
+        assert row["language_at_enrich"] == "en"
+
+    def test_picks_first_language_matching_hit_from_top5(self, db, tmp_path):
+        """Top-1 is wrong-language, top-2 matches — enricher picks top-2."""
+        song_path = str(tmp_path / "Edyta - Kolorowy wiatr---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "pl")
+
+        hits = [
+            _raw_hit(  # decoy: en hit
+                artist="Judy Kuhn",
+                track="Colors of the Wind",
+                track_id=11111,
+                collection="Pocahontas Original Soundtrack",
+                country="USA",
+                genre="Soundtrack",
+            ),
+            _raw_hit(  # match: pl hit
+                artist="Edyta Górniak",
+                track="Kolorowy wiatr",
+                track_id=22222,
+                collection="Pocahontas: Polska wersja",
+                country="POL",
+                genre="Soundtrack",
+            ),
+        ]
+        with patch.object(song_enricher, "search_itunes_full", return_value=hits), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        assert row["itunes_id"] == "22222"
+        assert row["artist"] == "Edyta Górniak"
+        assert row["title"] == "Kolorowy wiatr"
+        assert row["metadata_status"] == "enriched"
+        assert row["language_at_enrich"] == "pl"
+
+    def test_language_mismatch_when_no_top5_hit_matches(self, db, tmp_path):
+        """The Pedalini regression: query "Don Pedalini", whisper says pl,
+        every iTunes hit is Portuguese. No textual fields get written; the
+        row stamps ``language_mismatch`` and snapshots the language so we
+        won't retry until language changes again.
+        """
+        song_path = str(tmp_path / "Don Pedalini---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "pl")
+
+        # All 5 hits are Brazilian/Portuguese hymns.
+        hits = [
+            _raw_hit(
+                artist=f"Padrinho Fábio Pedalino {i}",
+                track="A Arte e o Dom do Amor",
+                track_id=10000 + i,
+                collection="IV Livro - Hinário da Humanidade",
+                country="BRA",
+                genre="Worldwide",
+            )
+            for i in range(5)
+        ]
+        with patch.object(song_enricher, "search_itunes_full", return_value=hits):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        assert row["metadata_status"] == "language_mismatch"
+        assert row["language_at_enrich"] == "pl"
+        # Critically: no textual iTunes fields leaked through.
+        assert row["artist"] is None
+        assert row["title"] is None
+        assert row["album"] is None
+        assert row["genre"] is None
+        assert row["itunes_id"] is None  # match was wrong wholesale
+
+    def test_idempotent_when_language_unchanged(self, db, tmp_path):
+        """Second run with the same songs.language as the snapshot is a no-op
+        — iTunes is not called at all."""
+        song_path = str(tmp_path / "Eminem - Stan---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
+
+        hit = _raw_hit(artist="Eminem", track="Stan", country="USA")
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row_first = db.get_song_by_id(sid)
+        assert row_first["metadata_status"] == "enriched"
+        assert row_first["language_at_enrich"] == "en"
+
+        # Second call: songs.language unchanged, status='enriched'. iTunes
+        # MUST NOT be hit again.
+        with patch.object(song_enricher, "search_itunes_full") as mock_search:
+            song_enricher.enrich_song(db, sid, song_path)
+            mock_search.assert_not_called()
+
+        # Attempts counter doesn't increment because we early-returned
+        # before stamping (the only way to express "no work done").
+        row_second = db.get_song_by_id(sid)
+        assert row_second["enrichment_attempts"] == row_first["enrichment_attempts"]
+
+    def test_re_enriches_when_language_changes(self, db, tmp_path):
+        """First pass enriches against en; whisper later says pl and triggers
+        a re-run; second pass picks the pl hit instead."""
+        song_path = str(tmp_path / "Foo - Bar---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
+
+        # Both hits stay short so language is decided by storefront country
+        # (the most predictable signal in unit tests; langdetect on 2-3 word
+        # phrases is famously noisy and would make the assertions flaky).
+        en_hit = _raw_hit(artist="EN", track="X", track_id=111, country="USA")
+        pl_hit = _raw_hit(artist="PL", track="Y", track_id=222, country="POL")
+        with patch.object(
+            song_enricher, "search_itunes_full", return_value=[en_hit, pl_hit]
+        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        assert row["itunes_id"] == "111"
+        assert row["language_at_enrich"] == "en"
+
+        # Whisper raw probe writes pl — provenance ladder lets it overwrite.
+        db.update_track_metadata_with_provenance(sid, "whisper_probe_raw", {"language": "pl"})
+        with patch.object(
+            song_enricher, "search_itunes_full", return_value=[en_hit, pl_hit]
+        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        assert row["itunes_id"] == "222"
+        assert row["artist"] == "PL"
+        assert row["title"] == "Y"
+        assert row["language_at_enrich"] == "pl"
 
     def test_manual_edits_beat_itunes(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
         # Pre-existing manual artist/title/album — provenance "manual" is
         # the top of the ladder so iTunes must not clobber.
         db.update_track_metadata_with_provenance(
@@ -90,19 +327,17 @@ class TestEnrichSong:
             {"artist": "Manual", "title": "Preset", "album": "Pre-album"},
         )
 
-        itunes_full = {
-            "itunes_id": "12345",
-            "artist": "iTunes Artist",
-            "track": "iTunes Track",
-            "album": "iTunes Album",
-            "track_number": 7,
-            "release_date": None,
-            "cover_art_url": None,
-            "genre": None,
-        }
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
+        hit = _raw_hit(
+            artist="iTunes Artist",
+            track="iTunes Track",
+            track_id=12345,
+            collection="iTunes Album",
+            track_number=7,
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
             song_enricher.enrich_song(db, sid, song_path)
 
         row = db.get_song_by_id(sid)
@@ -118,23 +353,20 @@ class TestEnrichSong:
         """iTunes (conf 2) beats YouTube info.json (conf 1) for identity fields."""
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
         db.update_track_metadata_with_provenance(
             sid, "youtube", {"artist": "YouTube Artist", "title": "YouTube Track"}
         )
 
-        itunes_full = {
-            "itunes_id": "12345",
-            "artist": "iTunes Artist",
-            "track": "iTunes Track",
-            "album": None,
-            "track_number": None,
-            "release_date": None,
-            "cover_art_url": None,
-            "genre": None,
-        }
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
+        hit = _raw_hit(
+            artist="iTunes Artist",
+            track="iTunes Track",
+            track_id=12345,
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
             song_enricher.enrich_song(db, sid, song_path)
 
         row = db.get_song_by_id(sid)
@@ -147,20 +379,9 @@ class TestEnrichSong:
     def test_writes_musicbrainz_ids_when_available(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
-        with patch.object(
-            song_enricher,
-            "fetch_itunes_track",
-            return_value={
-                "itunes_id": "1",
-                "artist": "A",
-                "track": "T",
-                "album": None,
-                "track_number": None,
-                "release_date": None,
-                "cover_art_url": None,
-                "genre": None,
-            },
-        ), patch.object(
+        _seed_language(db, sid, "en")
+        hit = _raw_hit(artist="A", track="T", track_id=1, country="USA")
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
             song_enricher,
             "fetch_musicbrainz_ids",
             return_value={"musicbrainz_recording_id": "mbid-uuid", "isrc": "USRC17600001"},
@@ -174,49 +395,50 @@ class TestEnrichSong:
     def test_records_not_found_when_itunes_miss(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
-        with patch.object(song_enricher, "fetch_itunes_track", return_value=None):
+        _seed_language(db, sid, "en")
+        with patch.object(song_enricher, "search_itunes_full", return_value=[]):
             song_enricher.enrich_song(db, sid, song_path)
         row = db.get_song_by_id(sid)
         assert row["metadata_status"] == "not_found"
         assert row["enrichment_attempts"] == 1
+        assert row["language_at_enrich"] == "en"
 
-    def test_increments_attempts_on_repeated_runs(self, db, tmp_path):
+    def test_increments_attempts_on_repeated_runs_for_unresolved_language(self, db, tmp_path):
+        """Without a language signal, every dispatch stamps another attempt
+        (idempotency only kicks in once we've reached ``enriched``)."""
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
-        with patch.object(song_enricher, "fetch_itunes_track", return_value=None):
+        with patch.object(song_enricher, "search_itunes_full") as mock_search:
             song_enricher.enrich_song(db, sid, song_path)
             song_enricher.enrich_song(db, sid, song_path)
             song_enricher.enrich_song(db, sid, song_path)
+            mock_search.assert_not_called()
         row = db.get_song_by_id(sid)
         assert row["enrichment_attempts"] == 3
+        assert row["metadata_status"] == "awaiting_language"
 
     def test_downloads_cover_and_registers_artifact(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
-        itunes_full = {
-            "itunes_id": "1",
-            "artist": "A",
-            "track": "T",
-            "album": None,
-            "track_number": None,
-            "release_date": None,
-            "cover_art_url": "https://fake/big.jpg",
-            "genre": None,
-        }
+        _seed_language(db, sid, "en")
+        hit = _raw_hit(
+            artist="A",
+            track="T",
+            track_id=1,
+            artwork="https://fake/100x100bb.jpg",
+            country="USA",
+        )
         expected_cover = str(tmp_path / "Foo---abc12345678.cover.jpg")
 
         def fake_download(url, dest):
-            assert url == "https://fake/big.jpg"
             assert dest == expected_cover
             with open(dest, "wb") as f:
                 f.write(b"image-bytes")
             return True
 
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None), patch.object(
-            song_enricher, "_download_cover", side_effect=fake_download
-        ):
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ), patch.object(song_enricher, "_download_cover", side_effect=fake_download):
             song_enricher.enrich_song(db, sid, song_path)
 
         arts = {(a["role"], a["path"]) for a in db.get_artifacts(sid)}
@@ -225,25 +447,20 @@ class TestEnrichSong:
     def test_skips_cover_download_when_file_exists(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
         existing_cover = tmp_path / "Foo---abc12345678.cover.jpg"
         existing_cover.write_bytes(b"already-there")
 
-        with patch.object(
-            song_enricher,
-            "fetch_itunes_track",
-            return_value={
-                "itunes_id": "1",
-                "artist": "A",
-                "track": "T",
-                "album": None,
-                "track_number": None,
-                "release_date": None,
-                "cover_art_url": "https://fake/big.jpg",
-                "genre": None,
-            },
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None), patch.object(
-            song_enricher, "_download_cover"
-        ) as mock_dl:
+        hit = _raw_hit(
+            artist="A",
+            track="T",
+            track_id=1,
+            artwork="https://fake/100x100bb.jpg",
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ), patch.object(song_enricher, "_download_cover") as mock_dl:
             song_enricher.enrich_song(db, sid, song_path)
             mock_dl.assert_not_called()
 
@@ -251,32 +468,38 @@ class TestEnrichSong:
         assert existing_cover.read_bytes() == b"already-there"
 
     def test_itunes_variant_does_not_override_title(self, db, tmp_path):
-        """When iTunes' only hit is an Instrumental/Karaoke cut (a common
-        small-catalogue edge case), its canonical artist/track must not
-        clobber the existing row — otherwise LRCLib queries get poisoned
-        with a suffix that doesn't exist in its index. Other iTunes
-        fields (album, itunes_id, etc.) still flow through.
+        """When iTunes' chosen hit is an Instrumental/Karaoke cut, its
+        canonical artist/track must not clobber the existing row — otherwise
+        LRCLib queries get poisoned with a suffix that doesn't exist in its
+        index. Other iTunes fields (album, itunes_id, etc.) still flow
+        through.
         """
         song_path = str(tmp_path / "Artist - Antyczny Napaleniec---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "pl")
         db.update_track_metadata_with_provenance(
             sid,
             "youtube",
             {"artist": "Artist", "title": "Antyczny Napaleniec"},
         )
-        itunes_full = {
-            "itunes_id": "55555",
-            "artist": "Artist",
-            "track": "Antyczny Napaleniec (Instrumental)",
-            "album": "Album Name",
-            "track_number": 4,
-            "release_date": "2020-01-01T00:00:00Z",
-            "cover_art_url": None,
-            "genre": "Rap",
-        }
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
+        # Polish text in the album name so signal_itunes_text reads "pl"
+        # (matches the seeded language). The variant marker "(live)" in the
+        # track triggers _itunes_adds_variant; the test verifies that guard
+        # still drops the canonical title/artist while letting album +
+        # itunes_id flow through.
+        hit = _raw_hit(
+            artist="A",
+            track="X (live)",
+            track_id=55555,
+            collection="Płyta nazwa",
+            track_number=4,
+            release_date="2020-01-01T00:00:00Z",
+            genre="Rap",
+            country="POL",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
             song_enricher.enrich_song(db, sid, song_path)
 
         row = db.get_song_by_id(sid)
@@ -285,7 +508,7 @@ class TestEnrichSong:
         assert row["artist"] == "Artist"
         # Other iTunes-only fields still land.
         assert row["itunes_id"] == "55555"
-        assert row["album"] == "Album Name"
+        assert row["album"] == "Płyta nazwa"
         assert row["track_number"] == 4
         assert row["genre"] == "Rap"
 
@@ -295,22 +518,19 @@ class TestEnrichSong:
         must still flow through."""
         song_path = str(tmp_path / "Artist - Song (Instrumental)---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
         db.update_track_metadata_with_provenance(
             sid, "youtube", {"artist": "Artist", "title": "Song (Instrumental)"}
         )
-        itunes_full = {
-            "itunes_id": "1",
-            "artist": "Artist Canonical",
-            "track": "Song (Instrumental)",
-            "album": None,
-            "track_number": None,
-            "release_date": None,
-            "cover_art_url": None,
-            "genre": None,
-        }
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
+        hit = _raw_hit(
+            artist="Artist Canonical",
+            track="Song (Instrumental)",
+            track_id=1,
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
             song_enricher.enrich_song(db, sid, song_path)
 
         row = db.get_song_by_id(sid)
@@ -320,11 +540,12 @@ class TestEnrichSong:
     def test_survives_provider_crashes(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
 
-        def boom_itunes(_):
+        def boom_search(_query, limit):
             raise RuntimeError("iTunes is on fire")
 
-        with patch.object(song_enricher, "fetch_itunes_track", side_effect=boom_itunes):
+        with patch.object(song_enricher, "search_itunes_full", side_effect=boom_search):
             song_enricher.enrich_song(db, sid, song_path)  # must not raise
         row = db.get_song_by_id(sid)
         assert row["metadata_status"] == "not_found"
@@ -335,22 +556,21 @@ class TestEnrichSong:
         """The module-level event hook receives start + finish events on success."""
         song_path = str(tmp_path / "Eminem - Stan---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
 
         captured: list[dict] = []
         song_enricher.set_event_hook(captured.append)
         try:
-            itunes_full = {
-                "itunes_id": "99999",
-                "artist": "Eminem",
-                "track": "Stan",
-                "album": "MMLP",
-                "track_number": 3,
-                "release_date": "2000-05-23T07:00:00Z",
-                "cover_art_url": None,
-                "genre": "Hip-Hop/Rap",
-            }
+            hit = _raw_hit(
+                artist="Eminem",
+                track="Stan",
+                track_id=99999,
+                collection="MMLP",
+                country="USA",
+                genre="Hip-Hop/Rap",
+            )
             with patch.object(
-                song_enricher, "fetch_itunes_track", return_value=itunes_full
+                song_enricher, "search_itunes_full", return_value=[hit]
             ), patch.object(song_enricher, "fetch_musicbrainz_ids", return_value=None):
                 song_enricher.enrich_song(db, sid, song_path)
         finally:
@@ -366,11 +586,12 @@ class TestEnrichSong:
         """An iTunes miss still emits a finish milestone (with detail)."""
         song_path = str(tmp_path / "Foo - Bar---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
 
         captured: list[dict] = []
         song_enricher.set_event_hook(captured.append)
         try:
-            with patch.object(song_enricher, "fetch_itunes_track", return_value=None):
+            with patch.object(song_enricher, "search_itunes_full", return_value=[]):
                 song_enricher.enrich_song(db, sid, song_path)
         finally:
             song_enricher.set_event_hook(None)
@@ -379,17 +600,40 @@ class TestEnrichSong:
         assert messages == ["Metadata enrichment starting", "Metadata enrichment finished"]
         assert "no match" in captured[-1]["detail"]
 
+    def test_event_hook_emits_warning_on_language_mismatch(self, db, tmp_path):
+        """Mismatch is the noteworthy outcome — surface it as a warning event."""
+        song_path = str(tmp_path / "Don Pedalini---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "pl")
+
+        captured: list[dict] = []
+        song_enricher.set_event_hook(captured.append)
+        try:
+            hits = [
+                _raw_hit(country="BRA", artist="X Pedalino", track="A Arte", collection="Hinario")
+            ]
+            with patch.object(song_enricher, "search_itunes_full", return_value=hits):
+                song_enricher.enrich_song(db, sid, song_path)
+        finally:
+            song_enricher.set_event_hook(None)
+
+        finish = captured[-1]
+        assert finish["message"] == "Metadata enrichment finished"
+        assert finish["severity"] == "warning"
+        assert "language_mismatch" in finish["detail"]
+
     def test_event_hook_misbehaving_callback_does_not_break_enrichment(self, db, tmp_path):
         """A raising hook is logged and swallowed — enrichment must still complete."""
         song_path = str(tmp_path / "Foo - Bar---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
 
         def explode(_payload):
             raise RuntimeError("boom")
 
         song_enricher.set_event_hook(explode)
         try:
-            with patch.object(song_enricher, "fetch_itunes_track", return_value=None):
+            with patch.object(song_enricher, "search_itunes_full", return_value=[]):
                 song_enricher.enrich_song(db, sid, song_path)  # must not raise
         finally:
             song_enricher.set_event_hook(None)
@@ -404,20 +648,10 @@ class TestEnrichSong:
         signal we use to spot enrichment that silently dropped."""
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
 
-        itunes_full = {
-            "itunes_id": "1",
-            "artist": "A",
-            "track": "T",
-            "album": None,
-            "track_number": None,
-            "release_date": None,
-            "cover_art_url": None,
-            "genre": None,
-        }
-        with patch.object(
-            song_enricher, "fetch_itunes_track", return_value=itunes_full
-        ), patch.object(
+        hit = _raw_hit(artist="A", track="T", track_id=1, country="USA")
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
             db, "update_track_metadata_with_provenance", side_effect=RuntimeError("db boom")
         ):
             song_enricher.enrich_song(db, sid, song_path)  # must not raise

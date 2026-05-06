@@ -128,6 +128,35 @@
     font-weight: 600;
   }
 
+  /* Metadata enrichment state — single chip surfacing language-driven
+     enrichment outcomes. Hidden when the row reached ``enriched``. */
+  .pk-edit-metadata {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px dotted var(--pk-ink-4);
+  }
+  .pk-meta-chip {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    background: var(--pk-bg);
+    border: 1px solid var(--pk-border);
+    border-left: 3px solid var(--pk-ink-4);
+    border-radius: var(--pk-r-sm);
+    font-size: 13px;
+  }
+  .pk-meta-chip.is-warning { border-left-color: var(--pk-amber); }
+  .pk-meta-chip.is-error   { border-left-color: #d35454; }
+  .pk-meta-chip-title {
+    font-family: var(--pk-font-mono);
+    font-size: 11px;
+    color: var(--pk-ink-3);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+  }
+  .pk-meta-chip-body { color: var(--pk-ink-2); }
+
   /* Subtitle source state — read-only chip row above the timeline. */
   .pk-edit-sources {
     margin-top: 24px;
@@ -481,6 +510,30 @@
     <a class="pk-btn" href="{{ referrer }}">Anuluj</a>
   </div>
 </form>
+
+{% if metadata_status == 'awaiting_language' %}
+<section class="pk-edit-metadata">
+  <div class="pk-meta-chip is-warning" role="status">
+    <span class="pk-meta-chip-title">Metadane</span>
+    <span class="pk-meta-chip-body">
+      Czekamy na rozpoznanie języka audio. Po analizie pojawi się tu match
+      iTunes albo informacja o konflikcie języka.
+    </span>
+  </div>
+</section>
+{% elif metadata_status == 'language_mismatch' %}
+<section class="pk-edit-metadata">
+  <div class="pk-meta-chip is-error" role="status">
+    <span class="pk-meta-chip-title">Metadane — konflikt języka</span>
+    <span class="pk-meta-chip-body">
+      Język audio
+      ({{ metadata_language or '?' }}) nie pasuje do żadnego z 5 wyników
+      iTunes. Pola tekstowe nie zostały zaciągnięte automatycznie —
+      ustaw je ręcznie w polach powyżej.
+    </span>
+  </div>
+</section>
+{% endif %}
 
 {% if song_id is not none %}
 <section class="pk-edit-sources" data-song-id="{{ song_id }}">

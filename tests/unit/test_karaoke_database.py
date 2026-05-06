@@ -28,7 +28,7 @@ class TestInit:
 
     def test_user_version(self, db):
         ver = db._conn.execute("PRAGMA user_version").fetchone()[0]
-        assert ver == 9
+        assert ver == 10
 
     def test_songs_table_exists(self, db):
         tables = {
@@ -602,16 +602,17 @@ class TestMigrationFromV1:
         conn.commit()
         conn.close()
 
-        # Open via KaraokeDatabase: should apply v2..v9 migrations in-place.
+        # Open via KaraokeDatabase: should apply v2..v10 migrations in-place.
         db = KaraokeDatabase(db_path)
         try:
             ver = db._conn.execute("PRAGMA user_version").fetchone()[0]
-            assert ver == 9
+            assert ver == 10
 
             cols = {row[1] for row in db._conn.execute("PRAGMA table_info(songs)").fetchall()}
             assert "metadata_sources" in cols
             assert "lyrics_provenance" in cols
             assert "subtitle_source_override" in cols
+            assert "language_at_enrich" in cols
             assert "lyrics_confidence" in cols
             art_cols = {
                 row[1] for row in db._conn.execute("PRAGMA table_info(song_artifacts)").fetchall()

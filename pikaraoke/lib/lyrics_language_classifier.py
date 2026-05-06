@@ -50,7 +50,11 @@ _LANGDETECT_MIN_CHARS = 12
 # wrong map entry would be worse than no entry. Multi-language countries
 # (Canada, Belgium, Switzerland, India, ...) are deliberately absent —
 # the classifier will just not emit a signal for them.
-_COUNTRY_TO_LANG: dict[str, str] = {
+#
+# Public so the song enricher can derive a per-iTunes-hit language hint
+# (used as a fallback when langdetect on the hit's text bails on short
+# strings).
+COUNTRY_TO_LANG: dict[str, str] = {
     "POL": "pl",
     "PL": "pl",
     "USA": "en",
@@ -229,8 +233,13 @@ def _dub_hint_language(text: str) -> tuple[str, str] | None:
     return None
 
 
-def _signal_itunes_text(itunes_hit: dict | None) -> LanguageSignal | None:
-    """Rung 17. Dub-marker / langdetect over iTunes collection + track + artist."""
+def signal_itunes_text(itunes_hit: dict | None) -> LanguageSignal | None:
+    """Rung 17. Dub-marker / langdetect over iTunes collection + track + artist.
+
+    Public so the enricher can run it directly on a single iTunes hit it's
+    considering (see ``_pick_hit_for_language``), without going through the
+    full ``collect_signals`` flow.
+    """
     if not itunes_hit:
         return None
     parts = [
@@ -267,7 +276,7 @@ def _signal_itunes_country(itunes_hit: dict | None) -> LanguageSignal | None:
     country = (itunes_hit.get("country") or "").upper()
     if not country:
         return None
-    lang = _COUNTRY_TO_LANG.get(country)
+    lang = COUNTRY_TO_LANG.get(country)
     if not lang:
         return None
     return LanguageSignal(
@@ -333,7 +342,7 @@ def _signal_mb_release_country(mb_signals: dict | None) -> LanguageSignal | None
     if len(unique) != 1:
         return None
     country = next(iter(unique))
-    lang = _COUNTRY_TO_LANG.get(country)
+    lang = COUNTRY_TO_LANG.get(country)
     if not lang:
         return None
     return LanguageSignal(
@@ -442,6 +451,30 @@ def read_info_json(song_path: str) -> dict | None:
         return None
 
 
+def pre_itunes_signals(
+    *,
+    yt_info: dict | None = None,
+    db_title: str | None = None,
+    db_artist: str | None = None,
+) -> list[LanguageSignal]:
+    """The subset of ``collect_signals`` that doesn't depend on iTunes / MB.
+
+    Used at ``register_download`` time, before the enricher has run, to get
+    a first-cut language verdict from yt-dlp info.json + langdetect on the
+    title. If consensus achieved here, the enricher dispatched right after
+    has a real ``expected_lang`` and can rerank iTunes' top-5; otherwise
+    enrichment defers (status=``awaiting_language``) until a later signal
+    arrives (typically a whisper probe writing to ``songs.language``).
+    """
+    return collect_signals(
+        yt_info=yt_info,
+        itunes_hit=None,
+        mb_signals=None,
+        db_title=db_title,
+        db_artist=db_artist,
+    )
+
+
 def collect_signals(
     *,
     yt_info: dict | None = None,
@@ -462,7 +495,7 @@ def collect_signals(
         _signal_yt_info_lang(yt_info),
         _signal_yt_subtitle_lang(yt_info),
         _signal_yt_title_lang(yt_info),
-        _signal_itunes_text(itunes_hit),
+        signal_itunes_text(itunes_hit),
         _signal_itunes_country(itunes_hit),
         _signal_mb_release_titles(mb_signals),
         _signal_mb_release_country(mb_signals),
