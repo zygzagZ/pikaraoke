@@ -313,6 +313,7 @@ class Karaoke:
     qr_code_path: str | None = None
     base_path: str = os.path.dirname(__file__)
     loop_interval: int = 500  # in milliseconds
+    skip_splash_delay: bool = False
     default_logo_path: str = os.path.join(base_path, "static", "images", "logo.png")
     default_bg_music_path: str = os.path.join(base_path, "static", "music")
     default_bg_video_path: str = os.path.join(base_path, "static", "video", "night_sea.mp4")
@@ -1952,10 +1953,12 @@ class Karaoke:
                 # Start next song from queue if not currently playing
                 if len(self.queue_manager.queue) > 0 and not self.playback_controller.is_playing:
                     self.reset_now_playing()
-                    # Splash delay between songs
+                    # Splash delay between songs. The next-song owner can short-circuit
+                    # the wait via /skip_break, which flips skip_splash_delay.
                     splash_delay = self.preferences.get_or_default("splash_delay")
+                    self.skip_splash_delay = False
                     i = 0
-                    while i < (splash_delay * 1000):
+                    while i < (splash_delay * 1000) and not self.skip_splash_delay:
                         self.handle_run_loop()
                         i += self.loop_interval
 

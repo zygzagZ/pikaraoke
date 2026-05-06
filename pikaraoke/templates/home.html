@@ -179,6 +179,43 @@
   }
   .pk-queue-now-options i.icon { font-size: 15px; }
 
+  .pk-queue-break {
+    position: relative;
+    padding: 14px;
+    background: linear-gradient(90deg,
+      color-mix(in srgb, var(--pk-lime) 22%, var(--pk-surface)),
+      var(--pk-surface));
+    border: 1px solid var(--pk-border-strong);
+    border-radius: var(--pk-r-md);
+    margin-bottom: 10px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 10px;
+  }
+  .pk-queue-break-label {
+    font-family: var(--pk-font-hand);
+    font-size: 16px;
+    color: var(--pk-amber-2);
+    font-weight: 600;
+    margin-bottom: 2px;
+    line-height: 1;
+  }
+  .pk-play-now-btn {
+    font-family: var(--pk-font-hand);
+    font-size: 16px;
+    font-weight: 700;
+    background: var(--pk-amber);
+    color: var(--pk-bg);
+    border: 0;
+    border-radius: 10px;
+    padding: 10px 16px;
+    cursor: pointer;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .pk-play-now-btn:disabled { opacity: 0.5; cursor: default; }
+
   .pk-queue-list {
     display: flex;
     flex-direction: column;
@@ -491,6 +528,24 @@
           </div>
           ${opts}
         </div>`;
+    } else if (np && np.up_next) {
+      // Inter-song splash delay: server is in the wait loop. The owner of the
+      // next song (or admin) can short-circuit the wait via /skip_break.
+      const pilotName = (typeof getPilotName === 'function') ? (getPilotName() || '') : '';
+      const owner = String(np.next_user || '');
+      const canSkip = isAdmin || (pilotName !== '' && owner !== '' && pilotName === owner);
+      const btn = canSkip
+        ? `<button type="button" id="pk-play-now-btn" class="pk-play-now-btn">Graj teraz</button>`
+        : '';
+      html += `
+        <div class="pk-queue-break">
+          <div>
+            <div class="pk-queue-break-label">za chwilę</div>
+            <div class="pk-queue-now-title">${escHtml(stripQuotes(np.up_next))}</div>
+            <div class="pk-queue-now-singer">śpiewa <span class="singer">${escHtml(owner)}</span></div>
+          </div>
+          ${btn}
+        </div>`;
     }
 
     html += q
@@ -790,6 +845,16 @@
     $(document).off('click.pk-np-opts').on('click.pk-np-opts', '.pk-queue-now-options', function (e) {
       e.preventDefault();
       openNpOptions();
+    });
+
+    // Play now: skip the inter-song splash delay
+    $(document).off('click.pk-play-now').on('click.pk-play-now', '#pk-play-now-btn', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.disabled = true;
+      fetch('/skip_break', { method: 'POST', credentials: 'same-origin' })
+        .catch(() => {})
+        .finally(() => refreshQueue());
     });
 
     // Dismiss download error

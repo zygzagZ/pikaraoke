@@ -21,6 +21,15 @@ def skip():
     return redirect(url_for("home.home"))
 
 
+@controller_bp.route("/skip_break", methods=["POST"])
+def skip_break():
+    """Cut short the inter-song splash delay so the next queued song starts now."""
+    k = get_karaoke_instance()
+    k.skip_splash_delay = True
+    broadcast_event("skip_break", "user command")
+    return ("", 204)
+
+
 @controller_bp.route("/pause")
 def pause():
     """Toggle pause/resume playback."""
