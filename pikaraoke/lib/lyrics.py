@@ -106,9 +106,8 @@ TEKSTOWO_USER_AGENT = (
 )
 
 SPOTIFY_TIMEOUT = 5.0
-SPOTIFY_TOKEN_URL = (
-    "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
-)
+SPOTIFY_SERVER_TIME_URL = "https://open.spotify.com/api/server-time"
+SPOTIFY_TOKEN_URL = "https://open.spotify.com/api/token"
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 SPOTIFY_LYRICS_URL = (
     "https://spclient.wg.spotify.com/color-lyrics/v2/track/{track_id}"
@@ -1462,8 +1461,12 @@ class LyricsService:
 
         Cached on the LyricsService for the token's full lifetime minus a
         30s safety window. Returns None on missing cookie, network failure,
-        or anonymous token (cookie expired or wrong account).
+        anonymous token (cookie expired or wrong account), or unavailable
+        TOTP secret. ``open.spotify.com/api/token`` requires a TOTP code
+        derived from a rotating secret published by xyloflake/spot-secrets-go.
         """
+        from pikaraoke.lib.lyrics_spotify_totp import SpotifyTOTP, SpotifyTOTPError
+
         sp_dc = self._get_spotify_sp_dc()
         if not sp_dc:
             return None
@@ -1472,8 +1475,40 @@ class LyricsService:
             if cache is not None and cache[1] > time.time() + 30:
                 return cache[0]
             try:
+                st = requests.get(
+                    SPOTIFY_SERVER_TIME_URL,
+                    headers={
+                        "User-Agent": SPOTIFY_USER_AGENT,
+                        "Accept": "application/json",
+                    },
+                    cookies={"sp_dc": sp_dc},
+                    timeout=SPOTIFY_TIMEOUT,
+                )
+                if st.status_code != 200:
+                    logger.warning("Spotify server-time HTTP %s", st.status_code)
+                    return None
+                server_time_s = st.json()["serverTime"]
+            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                logger.warning("Spotify server-time fetch failed: %s", e)
+                return None
+            server_time_ms = int(server_time_s) * 1000
+
+            try:
+                totp_code, totp_ver = SpotifyTOTP.singleton().generate(server_time_ms)
+            except SpotifyTOTPError as e:
+                logger.warning("Spotify TOTP unavailable: %s", e)
+                return None
+
+            try:
                 r = requests.get(
                     SPOTIFY_TOKEN_URL,
+                    params={
+                        "reason": "init",
+                        "productType": "web-player",
+                        "totp": totp_code,
+                        "totpVer": str(totp_ver),
+                        "ts": str(server_time_ms),
+                    },
                     headers={
                         "User-Agent": SPOTIFY_USER_AGENT,
                         "Accept": "application/json",
