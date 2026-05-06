@@ -204,6 +204,14 @@ def main() -> None:
 
     args = parse_pikaraoke_args()
 
+    # Trace every outbound HTTP request (lyrics fetchers, iTunes,
+    # MusicBrainz, YouTube Data API). Installs a one-shot monkey-patch
+    # on requests.Session.send so the log shows URL, status, and timing
+    # for any caller — useful for diagnosing 429s and slow upstreams.
+    from pikaraoke.lib.http_logging import install as _install_http_logging
+
+    _install_http_logging()
+
     # --- LOGGING SETUP ---
     # Optional: Force the log file to go to AppData too, so you can debug installation issues
     # log_path = os.path.join(get_data_directory(), 'pikaraoke.log')
