@@ -415,7 +415,17 @@ export function mountSmartPicker(container, getSongId, opts) {
   let popoverFlipUp = false;
 
   function activeSourceFor(data) {
-    return (data && (data.subtitle_source_override || data.now_playing_lyrics_source)) || null;
+    if (!data) return null;
+    // ``subtitle_source_pending`` reflects a user click on an unready
+    // variant: the picker should show that as the active row (with a
+    // downloading glyph) so the user sees their intent confirmed even
+    // though the splash is still rendering the previous override.
+    return (
+      data.subtitle_source_pending ||
+      data.subtitle_source_override ||
+      data.now_playing_lyrics_source ||
+      null
+    );
   }
 
   function renderTrigger(active, sources) {

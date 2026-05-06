@@ -472,6 +472,15 @@ class Karaoke:
         # "started" milestone instead of one per progress tick.
         self._demucs_started_for: set[str] = set()
 
+        # Pending subtitle-source picks (song_path -> source). Set by the
+        # picker when the user taps an unready variant: the actual override
+        # write is deferred until the variant lands so the splash keeps
+        # showing the previous subs instead of falling back to canonical.
+        # Only the *latest* pick per song is honoured — re-clicking a
+        # different unready source overwrites it.
+        self._pending_subtitle_picks: dict[str, str] = {}
+        self._pending_picks_lock = threading.Lock()
+
         self.generate_qr_code()
 
         # Clean up half-written Demucs stems from any previous run.
@@ -545,6 +554,10 @@ class Karaoke:
         # thread, so a slow fetch stalls the queue for the next song.
         self.events.on("song_downloaded", self._dispatch_lyrics_fetch_async)
         self.events.on("lyrics_upgraded", self._on_lyrics_upgraded)
+        # Commit a deferred picker selection once the user-requested variant
+        # lands on disk. Fires before lyrics_upgraded so the splash hot-swap
+        # reads the freshly-pinned override.
+        self.events.on("subtitle_variant_landed", self._on_subtitle_variant_landed)
         self.events.on(
             "sync_started",
             lambda: self.socketio.emit("sync_started", namespace="/") if self.socketio else None,
@@ -1503,6 +1516,11 @@ class Karaoke:
         # cue. Computed here and piggybacked on the existing ~1s poll —
         # no separate endpoint needed.
         subtitle_sources, override, song_id = self._get_subtitle_sources_for_now_playing()
+        pending_pick = (
+            self.get_pending_subtitle_pick(self.playback_controller.now_playing_filename)
+            if self.playback_controller.now_playing_filename
+            else None
+        )
 
         return {
             **playback_state,
@@ -1517,6 +1535,11 @@ class Karaoke:
             "subtitle_offset": float(self.preferences.get_or_default("subtitle_offset")),
             "subtitle_sources": subtitle_sources,
             "subtitle_source_override": override,
+            # The user's deferred pick: source they tapped that hadn't
+            # been fetched yet. Picker shows it as the active row (with
+            # a downloading glyph) so the trigger reflects user intent
+            # while the splash keeps rendering the previous override.
+            "subtitle_source_pending": pending_pick,
             # When the operator has pinned ``off`` for this song, the splash
             # must skip SubtitlesOctopus initialisation on cold load (the
             # ``subtitle_off`` socket event only handles already-loaded
@@ -1751,6 +1774,73 @@ class Karaoke:
             ensure_audio_fingerprint(self.db, song_id, audio_source)
         except Exception:
             logging.exception("ensure_audio_fingerprint failed on download for %s", song_path)
+
+    def set_pending_subtitle_pick(self, song_path: str, source: str) -> None:
+        """Record the operator's not-yet-ready picker selection.
+
+        Pairs with ``_on_subtitle_variant_landed``: the variant write
+        commits this pick to ``subtitle_source_override`` and refreshes
+        the splash. Re-clicking another unready source overwrites the
+        pending pick — only the latest intent is honoured.
+        """
+        with self._pending_picks_lock:
+            self._pending_subtitle_picks[song_path] = source
+
+    def get_pending_subtitle_pick(self, song_path: str) -> str | None:
+        """Return the deferred picker selection for ``song_path``, or None."""
+        with self._pending_picks_lock:
+            return self._pending_subtitle_picks.get(song_path)
+
+    def clear_pending_subtitle_pick(self, song_path: str) -> None:
+        """Drop any deferred picker selection for ``song_path`` (idempotent)."""
+        with self._pending_picks_lock:
+            self._pending_subtitle_picks.pop(song_path, None)
+
+    def _on_subtitle_variant_landed(self, payload: dict[str, Any]) -> None:
+        """Commit a deferred picker selection when the matching variant lands.
+
+        Called before ``lyrics_upgraded`` is emitted by
+        ``_write_and_register_variant``, so the override is persisted
+        before the splash refetches ``/subtitle/<id>``. When the landed
+        source doesn't match the current pending pick (user changed
+        their mind mid-fetch), the override is left alone — the splash
+        keeps showing whatever it was showing.
+        """
+        try:
+            song_path = payload["song_path"]
+            source = payload["source"]
+        except (KeyError, TypeError):
+            logging.warning("subtitle_variant_landed: malformed payload %r", payload)
+            return
+        pending = self.get_pending_subtitle_pick(song_path)
+        if pending != source:
+            return
+        if self.db is None:
+            return
+        try:
+            song_id = self.db.get_song_id_by_path(song_path)
+        except Exception:
+            logging.exception(
+                "subtitle_variant_landed: get_song_id_by_path failed for %s", song_path
+            )
+            return
+        if song_id is None:
+            return
+        try:
+            self.db.set_subtitle_source_override(song_id, source)
+        except Exception:
+            logging.exception(
+                "subtitle_variant_landed: set_subtitle_source_override failed for %s/%s",
+                song_path,
+                source,
+            )
+            return
+        self.clear_pending_subtitle_pick(song_path)
+        logging.info(
+            "subtitle_variant_landed: committed pending pick %s for %s",
+            source,
+            os.path.basename(song_path),
+        )
 
     def _on_lyrics_upgraded(self, song_path: str) -> None:
         """Force the splash to reload subtitles when word-level ASS lands mid-song.

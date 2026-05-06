@@ -112,6 +112,13 @@ class TestAvailable:
 
 class TestDownload:
     def test_missing_variant_dispatches_fetch_and_returns_pending(self, client, mocks, tmp_path):
+        """Deferred-pin contract: clicking an unready variant schedules
+        the fetch, records a pending pick on the karaoke instance, and
+        leaves ``subtitle_source_override`` untouched so the splash
+        keeps rendering whatever was visible before. The override is
+        committed by ``Karaoke._on_subtitle_variant_landed`` once the
+        variant ASS file actually lands.
+        """
         song_path = tmp_path / "Foo---abc.mp4"
         song_path.write_text("fake")
         row = {"file_path": str(song_path), "lyrics_provenance": "auto_line"}
@@ -122,40 +129,21 @@ class TestDownload:
 
         assert r.status_code == 202
         assert json.loads(r.data) == {"status": "pending"}
-        mocks["k"].db.set_subtitle_source_override.assert_called_once_with(1, "AI")
-        # Dispatch is synchronous (it claims the in-flight slot) so we can
-        # assert on the call without polling. The race-fix contract: the
-        # claim must happen BEFORE lyrics_upgraded is emitted, so the
-        # splash GET cannot race past the worker thread.
+        # Override unchanged — splash keeps showing previous source.
+        mocks["k"].db.set_subtitle_source_override.assert_not_called()
+        # Pending pick recorded so the variant-landed listener commits
+        # the override later.
+        mocks["k"].set_pending_subtitle_pick.assert_called_once_with(str(song_path), "AI")
+        # Dispatch claims the in-flight slot synchronously (CG1).
         mocks["k"].lyrics_service.dispatch_variant_fetch.assert_called_once_with(
             str(song_path), "AI"
         )
-
-    def test_dispatch_happens_before_lyrics_upgraded_emit(self, client, mocks, tmp_path):
-        """Race-fix contract: in-flight slot must be claimed BEFORE the
-        cache-bust event fires, otherwise the splash's GET /subtitle/<id>
-        races past the worker's own ``add(key)`` and the stream route
-        clears the just-set pin.
-        """
-        song_path = tmp_path / "Foo---abc.mp4"
-        song_path.write_text("fake")
-        row = {"file_path": str(song_path), "lyrics_provenance": "auto_line"}
-        mocks["k"].db.get_song_by_id.return_value = row
-        mocks["k"].lyrics_service.dispatch_variant_fetch.return_value = True
-
-        call_order: list = []
-        mocks["k"].lyrics_service.dispatch_variant_fetch.side_effect = (
-            lambda *_a, **_kw: call_order.append("dispatch") or True
-        )
-        mocks["k"].events.emit.side_effect = lambda *_a, **_kw: call_order.append("emit")
-
-        r = _post_json(client, {"song_id": 1, "source": "AI"})
-
-        assert r.status_code == 202
-        assert call_order == [
-            "dispatch",
-            "emit",
-        ], f"dispatch must precede lyrics_upgraded; got {call_order}"
+        # No lyrics_upgraded emit on the deferred path: the splash must
+        # not refetch /subtitle while the previous source is still
+        # rendering. Picker refresh goes through update_now_playing_socket.
+        emitted_events = [c.args[0] for c in mocks["k"].events.emit.call_args_list]
+        assert "lyrics_upgraded" not in emitted_events
+        mocks["k"].update_now_playing_socket.assert_called_once()
 
 
 class TestOff:

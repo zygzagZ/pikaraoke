@@ -76,6 +76,9 @@ class _Host:
         self.youtube_dl_provider = MagicMock()
         self.run_loop_running = True
         self.running = True
+        # Pending picker selections (matches Karaoke.__init__).
+        self._pending_subtitle_picks: dict[str, str] = {}
+        self._pending_picks_lock = threading.Lock()
 
     @property
     def socketio(self):
@@ -103,6 +106,9 @@ _Host._SUBTITLE_STATUS_DOWNLOAD = Karaoke._SUBTITLE_STATUS_DOWNLOAD
 _Host._SUBTITLE_STATUS_DOWNLOADING = Karaoke._SUBTITLE_STATUS_DOWNLOADING
 _Host._SUBTITLE_STATUS_NA = Karaoke._SUBTITLE_STATUS_NA
 _Host._SUBTITLE_SOURCE_ORDER = Karaoke._SUBTITLE_SOURCE_ORDER
+_Host.set_pending_subtitle_pick = Karaoke.set_pending_subtitle_pick
+_Host.get_pending_subtitle_pick = Karaoke.get_pending_subtitle_pick
+_Host.clear_pending_subtitle_pick = Karaoke.clear_pending_subtitle_pick
 
 
 class _StubLyricsService:
@@ -392,17 +398,25 @@ class TestPickerFlowEndToEnd:
     def test_pin_missing_variant_dispatches_fetch_and_returns_pending(
         self, client, host, db, tmp_path
     ):
-        """The full "operator picks AI" path: real DB write, real
-        threaded dispatch into the LyricsService stub.
+        """The full "operator picks AI" path: schedule the fetch, leave
+        the DB override alone (so the splash keeps rendering whatever
+        was previously displayed), record a pending pick — that pick is
+        committed to ``subtitle_source_override`` only once the variant
+        file lands (see ``_on_subtitle_variant_landed``).
         """
         song_path = self._song_with_files(tmp_path, with_variant=False)
         sid = _insert_song(db, song_path, provenance="auto_line")
         host.playback_controller.now_playing_filename = song_path
+        prior = db.get_subtitle_source_override(sid)
 
         r = _post_pin(client, sid, "AI")
         assert r.status_code == 202
         assert json.loads(r.data) == {"status": "pending"}
-        assert db.get_subtitle_source_override(sid) == "AI"
+        # Override unchanged: splash keeps showing previous source.
+        assert db.get_subtitle_source_override(sid) == prior
+        # Pending pick recorded so the variant-landed listener can
+        # commit later.
+        assert host.get_pending_subtitle_pick(song_path) == "AI"
 
         # Wait for the dispatched daemon thread to call into the stub.
         import time

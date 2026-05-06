@@ -106,11 +106,41 @@ def set_subtitle_source():
         except OSError:
             variant_ready = False
 
+    deferred = source in VARIANT_FILE_SOURCES and not variant_ready
+
+    if deferred:
+        # User tapped a not-yet-fetched variant. Schedule the fetch but
+        # leave the override + displayed subs alone — the splash keeps
+        # showing the previous source. The pick is recorded as pending
+        # and committed by ``Karaoke._on_subtitle_variant_landed`` once
+        # the variant file lands. Re-clicking another unready source
+        # overwrites the pending pick: only the latest intent wins.
+        k.set_pending_subtitle_pick(file_path, source)
+        # Dispatch (idempotent: dedups on the (song, source) in-flight
+        # slot) so the worker actually starts. Return value is immaterial
+        # to the caller — pending pick is set either way.
+        k.lyrics_service.dispatch_variant_fetch(file_path, source)
+        # Refresh the picker so it sees ``subtitle_source_pending`` and
+        # the row's ``downloading`` status. No URL bump — splash must
+        # not refetch /subtitle while the previous source is still
+        # rendering.
+        try:
+            k.update_now_playing_socket()
+        except Exception:
+            logger.exception("set_subtitle_source: now_playing emit failed (deferred)")
+        return json.dumps({"status": "pending"}), 202
+
+    # Immediate path: ``off``, ``user``, or a variant whose file is
+    # already on disk. Write the override, broadcast on/off transitions,
+    # and bump the subtitle URL via ``lyrics_upgraded`` so the splash
+    # hot-swaps to the chosen source.
     try:
         k.db.set_subtitle_source_override(song_id, source)
     except Exception:
         logger.exception("set_subtitle_source: write failed for song_id=%s", song_id)
         return _json_error("DB error", 500)
+    # Any prior deferred pick is superseded by this immediate switch.
+    k.clear_pending_subtitle_pick(file_path)
 
     # Off → on transition needs the canvas un-hidden BEFORE the new URL
     # arrives so the still-running SubtitlesOctopus instance is visible
@@ -120,26 +150,11 @@ def set_subtitle_source():
     if is_off:
         broadcast_event("subtitle_off")
 
-    # Dispatch the on-demand fetch BEFORE the cache-bust emit. The
-    # dispatch synchronously claims the in-flight slot, so the splash's
-    # subsequent ``GET /subtitle/<id>`` is guaranteed to see in-flight=True
-    # and fall back to canonical instead of clearing the just-set pin.
-    # If we emitted ``lyrics_upgraded`` first, splash could race past
-    # the worker thread's own ``add(key)`` and undo the operator's pick.
-    pending = source in VARIANT_FILE_SOURCES and not variant_ready
-    if pending:
-        # Return value (claim acquired vs deduped to an existing fetch) is
-        # immaterial to the caller — either way the variant isn't on disk
-        # yet, so the picker should show ``downloading`` and the response
-        # status should be 202.
-        k.lyrics_service.dispatch_variant_fetch(file_path, source)
-
     # Force the splash to re-fetch /subtitle/<id> with the new pin in place.
     # ``lyrics_upgraded`` is the established cache-bust: the karaoke
     # handler bumps ``?v=`` on ``now_playing_subtitle_url`` and re-emits
     # ``now_playing``. Splash sees a new URL → tear down + reinit Octopus
-    # → /subtitle/<id> serves the variant (or falls back to canonical
-    # while the variant is still in flight).
+    # → /subtitle/<id> serves the variant.
     if not is_off:
         try:
             k.events.emit("lyrics_upgraded", file_path)
@@ -153,6 +168,4 @@ def set_subtitle_source():
         except Exception:
             logger.exception("set_subtitle_source: now_playing emit failed")
 
-    if pending:
-        return json.dumps({"status": "pending"}), 202
     return json.dumps({"status": "ok"}), 200

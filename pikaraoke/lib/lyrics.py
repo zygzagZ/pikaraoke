@@ -660,6 +660,17 @@ class LyricsService:
         if song_id is None:
             return
         self._db.upsert_artifacts(song_id, [{"role": f"ass_{source}", "path": target}])
+        # Emit landed BEFORE lyrics_upgraded so pending-pick commit (if any)
+        # writes the override before the splash hot-swap reads it.
+        try:
+            self._events.emit(
+                "subtitle_variant_landed",
+                {"song_path": song_path, "source": source},
+            )
+        except Exception:
+            logger.exception(
+                "failed to emit subtitle_variant_landed for %s/%s", source, song_path
+            )
         try:
             self._events.emit("lyrics_upgraded", song_path)
         except Exception:
