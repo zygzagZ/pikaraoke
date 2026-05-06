@@ -63,6 +63,7 @@ from pikaraoke.lib.lyrics import (
     _fetch_lrclib,
     _fetch_tekstowo,
     _format_ass_time,
+    _group_spotify_syllables,
     _k_token,
     _lrc_from_aligned_lines,
     _lrc_plain_text,
@@ -75,6 +76,7 @@ from pikaraoke.lib.lyrics import (
     _shift_lrc,
     _shift_lrc_per_line,
     _spotify_lines_to_lrc,
+    _spotify_syllable_lines_to_ass,
     _strip_variant_markers,
     _syllabify,
     _syllable_parts,
@@ -3680,3 +3682,253 @@ class TestLyricsServiceLanguageMismatch:
         # Consensus winning source is the highest-rung agreeing signal.
         assert sources["language"] in {"itunes_text", "mb_release_titles"}
         db.close()
+
+
+class TestGroupSpotifySyllables:
+    def test_groups_two_syllable_word(self):
+        syllables = [
+            {"startTimeMs": "1000", "endTimeMs": "1300", "text": "Hel"},
+            {"startTimeMs": "1300", "endTimeMs": "1700", "text": "lo"},
+            {"startTimeMs": "1900", "endTimeMs": "3000", "text": "world"},
+        ]
+        words = _group_spotify_syllables("Hello world", syllables)
+        assert words is not None
+        assert [w.text for w in words] == ["Hello", "world"]
+        assert words[0].start == pytest.approx(1.0)
+        assert words[0].end == pytest.approx(1.7)
+        assert words[0].parts is not None
+        assert [p.text for p in words[0].parts] == ["Hel", "lo"]
+        # Single-syllable word collapses parts to None (renderer emits one \kf).
+        assert words[1].parts is None
+
+    def test_returns_none_when_text_mismatch(self):
+        # Syllables don't reconstruct the line text — heuristic must bail out.
+        syllables = [
+            {"startTimeMs": "1000", "endTimeMs": "1500", "text": "X"},
+            {"startTimeMs": "1500", "endTimeMs": "2000", "text": "Y"},
+        ]
+        assert _group_spotify_syllables("Hello world", syllables) is None
+
+    def test_returns_none_for_empty_line(self):
+        assert _group_spotify_syllables("", [{"text": "x"}]) is None
+
+
+class TestSpotifySyllableRender:
+    def _line(self, line_text, *syl_specs):
+        return {
+            "startTimeMs": "1000",
+            "endTimeMs": str(syl_specs[-1][1]),
+            "words": line_text,
+            "syllables": [
+                {"startTimeMs": str(s), "endTimeMs": str(e), "text": t} for s, e, t in syl_specs
+            ],
+        }
+
+    def test_emits_per_syllable_kf_tags(self):
+        line = self._line(
+            "Hello world",
+            (1000, 1300, "Hel"),
+            (1300, 1700, "lo"),
+            (1900, 3000, "world"),
+        )
+        ass = _spotify_syllable_lines_to_ass([line])
+        assert ass is not None
+        # Per-syllable \kf with centisecond durations.
+        assert r"{\kf30}Hel" in ass
+        assert r"{\kf40}lo" in ass
+        assert r"{\kf110}world" in ass
+
+    def test_returns_none_when_any_line_unmappable(self):
+        good = self._line(
+            "Hi",
+            (1000, 1500, "Hi"),
+        )
+        bad = self._line(
+            "Mismatch line",
+            (2000, 2500, "X"),
+        )
+        # Strict: any unmappable line aborts the render so the caller falls
+        # back to LINE_SYNCED rather than emitting a half-rendered ASS.
+        assert _spotify_syllable_lines_to_ass([good, bad]) is None
+
+    def test_returns_none_when_no_syllables(self):
+        line = {"startTimeMs": "1000", "words": "Hi", "syllables": []}
+        assert _spotify_syllable_lines_to_ass([line]) is None
+
+
+class TestSpotifyNativeRenderer:
+    """``_render_spotify_native_ass`` dispatches on Spotify's syncType.
+
+    Tests at this layer are integration-flavoured — they patch
+    ``_fetch_spotify_lyrics_payload`` (already covered by lower-level
+    tests) and verify the renderer returns the right shape per syncType.
+    """
+
+    def _make_service(self):
+        from pikaraoke.lib.events import EventSystem
+
+        prefs = MagicMock()
+        prefs.get_or_default.return_value = "cookie"
+        return LyricsService(download_path="/tmp", events=EventSystem(), preferences=prefs)
+
+    def test_line_synced_returns_line_level_ass(self):
+        svc = self._make_service()
+        payload = {
+            "syncType": "LINE_SYNCED",
+            "lines": [{"startTimeMs": "1000", "words": "hello"}],
+        }
+        with patch.object(svc, "_fetch_spotify_lyrics_payload", return_value=payload), patch.object(
+            svc, "_is_lyrics_language_mismatch", return_value=False
+        ):
+            ass = svc._render_spotify_native_ass("/tmp/song.mp3", {"track": "T", "artist": "A"})
+        assert ass is not None
+        # Line-level renderer emits Dialogue events without per-token \kf.
+        assert "Dialogue:" in ass
+        assert r"\kf" not in ass
+
+    def test_syllable_synced_returns_word_level_ass(self):
+        svc = self._make_service()
+        payload = {
+            "syncType": "SYLLABLE_SYNCED",
+            "lines": [
+                {
+                    "startTimeMs": "1000",
+                    "endTimeMs": "3000",
+                    "words": "Hello world",
+                    "syllables": [
+                        {"startTimeMs": "1000", "endTimeMs": "1300", "text": "Hel"},
+                        {"startTimeMs": "1300", "endTimeMs": "1700", "text": "lo"},
+                        {"startTimeMs": "1900", "endTimeMs": "3000", "text": "world"},
+                    ],
+                }
+            ],
+        }
+        with patch.object(svc, "_fetch_spotify_lyrics_payload", return_value=payload):
+            ass = svc._render_spotify_native_ass("/tmp/song.mp3", {"track": "T", "artist": "A"})
+        assert ass is not None
+        assert r"\kf" in ass
+
+    def test_syllable_synced_falls_back_to_line_when_unmappable(self):
+        svc = self._make_service()
+        # Syllable text doesn't reconstruct the line; renderer falls back
+        # to LINE_SYNCED line-level rendering rather than failing.
+        payload = {
+            "syncType": "SYLLABLE_SYNCED",
+            "lines": [
+                {
+                    "startTimeMs": "1000",
+                    "words": "Hello world",
+                    "syllables": [{"startTimeMs": "1000", "endTimeMs": "1500", "text": "Junk"}],
+                }
+            ],
+        }
+        with patch.object(svc, "_fetch_spotify_lyrics_payload", return_value=payload), patch.object(
+            svc, "_is_lyrics_language_mismatch", return_value=False
+        ):
+            ass = svc._render_spotify_native_ass("/tmp/song.mp3", {"track": "T", "artist": "A"})
+        assert ass is not None
+        assert r"\kf" not in ass  # line-level
+
+    def test_unsynced_returns_none(self):
+        svc = self._make_service()
+        payload = {
+            "syncType": "UNSYNCED",
+            "lines": [{"startTimeMs": "0", "words": "hello"}],
+        }
+        with patch.object(svc, "_fetch_spotify_lyrics_payload", return_value=payload):
+            ass = svc._render_spotify_native_ass("/tmp/song.mp3", {"track": "T", "artist": "A"})
+        assert ass is None
+
+    def test_no_payload_returns_none(self):
+        svc = self._make_service()
+        with patch.object(svc, "_fetch_spotify_lyrics_payload", return_value=None):
+            assert (
+                svc._render_spotify_native_ass("/tmp/song.mp3", {"track": "T", "artist": "A"})
+                is None
+            )
+
+    def test_missing_metadata_short_circuits(self):
+        svc = self._make_service()
+        with patch.object(svc, "_fetch_spotify_lyrics_payload") as mock_fetch:
+            assert (
+                svc._render_spotify_native_ass("/tmp/song.mp3", {"track": None, "artist": None})
+                is None
+            )
+            mock_fetch.assert_not_called()
+
+
+class TestSpotifySearchRateLimit:
+    """Search-cache + global rate-limit cooldown make the backend usable.
+
+    api.spotify.com/v1/search is aggressively throttled for web-player
+    tokens; without these guards a single 429 would block subsequent
+    unrelated lookups for ~40s.
+    """
+
+    def _make_service(self):
+        from pikaraoke.lib.events import EventSystem
+
+        prefs = MagicMock()
+        prefs.get_or_default.return_value = "cookie"
+        svc = LyricsService(download_path="/tmp", events=EventSystem(), preferences=prefs)
+        # Pre-mint a token so resolve doesn't need server-time + token mocks.
+        svc._spotify_token_cache = ("TOK", time.time() + 3600)
+        return svc
+
+    def test_429_sets_cooldown_and_skips_subsequent_lookups(self):
+        svc = self._make_service()
+        rate_limited = MagicMock(status_code=429)
+        rate_limited.headers = {"Retry-After": "30"}
+        with patch("pikaraoke.lib.lyrics.requests.get", return_value=rate_limited) as mock_get:
+            assert svc._resolve_spotify_track_id("a", "b", None) is None
+            assert svc._spotify_rate_limited_until > time.time() + 25
+            # A different (track, artist) should not hit the wire while
+            # the cooldown is active.
+            assert svc._resolve_spotify_track_id("c", "d", None) is None
+            assert mock_get.call_count == 1
+
+    def test_successful_search_is_cached_per_key(self):
+        svc = self._make_service()
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = {"tracks": {"items": [{"id": "TID", "artists": [{"name": "Art"}]}]}}
+        with patch("pikaraoke.lib.lyrics.requests.get", return_value=ok) as mock_get:
+            assert svc._resolve_spotify_track_id("Song", "Art", None) == "TID"
+            assert svc._resolve_spotify_track_id("Song", "Art", None) == "TID"
+            assert mock_get.call_count == 1  # second call hit cache
+
+    def test_miss_is_cached_too(self):
+        svc = self._make_service()
+        empty = MagicMock(status_code=200)
+        empty.json.return_value = {"tracks": {"items": []}}
+        with patch("pikaraoke.lib.lyrics.requests.get", return_value=empty) as mock_get:
+            assert svc._resolve_spotify_track_id("Song", "Art", None) is None
+            assert svc._resolve_spotify_track_id("Song", "Art", None) is None
+            assert mock_get.call_count == 1
+
+
+class TestSpotifyVariantConstants:
+    """Source-list / picker-order regression: the new ``spotify`` source
+    must be registered everywhere downstream code expects."""
+
+    def test_spotify_in_canonical_constants(self):
+        from pikaraoke.lib.karaoke_database import (
+            SUBTITLE_SOURCE_LABELS,
+            SUBTITLE_SOURCE_SPOTIFY,
+            VALID_SUBTITLE_SOURCES,
+            VARIANT_FILE_SOURCES,
+        )
+
+        assert SUBTITLE_SOURCE_SPOTIFY == "spotify"
+        assert SUBTITLE_SOURCE_SPOTIFY in VALID_SUBTITLE_SOURCES
+        assert SUBTITLE_SOURCE_SPOTIFY in VARIANT_FILE_SOURCES
+        assert SUBTITLE_SOURCE_LABELS[SUBTITLE_SOURCE_SPOTIFY] == "Spotify"
+
+    def test_spotify_tier_is_line(self):
+        from pikaraoke.lib.lyrics import (
+            SUBTITLE_SOURCE_SPOTIFY,
+            _tier_for_variant_source,
+        )
+
+        # ``spotify`` (native) is line-level — same tier as lrclib raw.
+        # ``spotify-sync`` (wav2vec2) is word-level.
+        assert _tier_for_variant_source(SUBTITLE_SOURCE_SPOTIFY) == "line"

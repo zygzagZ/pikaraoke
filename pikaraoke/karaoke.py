@@ -35,6 +35,7 @@ from pikaraoke.lib.karaoke_database import (
     SUBTITLE_SOURCE_LRCLIB,
     SUBTITLE_SOURCE_LRCLIB_SYNC,
     SUBTITLE_SOURCE_OFF,
+    SUBTITLE_SOURCE_SPOTIFY,
     SUBTITLE_SOURCE_SPOTIFY_SYNC,
     SUBTITLE_SOURCE_TEKSTOWO_SYNC,
     SUBTITLE_SOURCE_USER,
@@ -1489,6 +1490,7 @@ class Karaoke:
         SUBTITLE_SOURCE_USER,
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
+        SUBTITLE_SOURCE_SPOTIFY,
         SUBTITLE_SOURCE_GENIUS_SYNC,
         SUBTITLE_SOURCE_SPOTIFY_SYNC,
         SUBTITLE_SOURCE_TEKSTOWO_SYNC,
@@ -1613,6 +1615,8 @@ class Karaoke:
                     na_reason = "no aligner configured"
                 elif source == SUBTITLE_SOURCE_TEKSTOWO_SYNC and not has_aligner:
                     na_reason = "no aligner configured"
+                elif source == SUBTITLE_SOURCE_SPOTIFY and not has_spotify_cookie:
+                    na_reason = "no spotify_sp_dc preference"
                 elif source == SUBTITLE_SOURCE_SPOTIFY_SYNC and not (
                     has_spotify_cookie and has_aligner
                 ):

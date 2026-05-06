@@ -39,6 +39,7 @@ from pikaraoke.lib.karaoke_database import (
     SUBTITLE_SOURCE_GENIUS_SYNC,
     SUBTITLE_SOURCE_LRCLIB,
     SUBTITLE_SOURCE_LRCLIB_SYNC,
+    SUBTITLE_SOURCE_SPOTIFY,
     SUBTITLE_SOURCE_SPOTIFY_SYNC,
     SUBTITLE_SOURCE_TEKSTOWO_SYNC,
     SUBTITLE_SOURCE_USER,
@@ -298,6 +299,7 @@ _TIER_NAMES = {
 # line-level renders, but the UI doesn't need that distinction.
 _VARIANT_SOURCE_TIERS: dict[str, str] = {
     SUBTITLE_SOURCE_LRCLIB: "line",
+    SUBTITLE_SOURCE_SPOTIFY: "line",
     SUBTITLE_SOURCE_YOUTUBE_VTT: "line",
     SUBTITLE_SOURCE_LRCLIB_SYNC: "word",
     SUBTITLE_SOURCE_GENIUS_SYNC: "word",
@@ -412,6 +414,14 @@ class LyricsService:
         # lived (~1h) and is regenerated lazily from the sp_dc cookie.
         self._spotify_token_cache: tuple[str, float] | None = None
         self._spotify_token_lock = threading.Lock()
+        # Memoized track-id lookups + global rate-limit cooldown. The
+        # public Search API (api.spotify.com/v1/search) throttles
+        # web-player tokens hard — without these two, hitting 429 once
+        # blocks subsequent unrelated lookups for ~40s. Both are
+        # process-local; clearing happens implicitly when LyricsService
+        # is recreated.
+        self._spotify_search_cache: dict[tuple[str, str, str], str | None] = {}
+        self._spotify_rate_limited_until: float = 0.0
         # Per-song tier of the most recently written .ass. Parallel source
         # workers go through `_try_write_ass_tiered` which reads + updates
         # this under `_tier_lock` — a later source with a lower tier is
@@ -895,6 +905,11 @@ class LyricsService:
             if not info:
                 return None
             return self._render_tekstowo_word_ass(song_path, info)
+        if source == SUBTITLE_SOURCE_SPOTIFY:
+            info = self._read_metadata_for_lrclib(song_path)
+            if not info:
+                return None
+            return self._render_spotify_native_ass(song_path, info)
         if source == SUBTITLE_SOURCE_SPOTIFY_SYNC:
             info = self._read_metadata_for_lrclib(song_path)
             if not info:
@@ -1415,6 +1430,55 @@ class LyricsService:
             return None
         return self._align_plain_text_to_ass(song_path, text, source_label="Tekstowo")
 
+    def _render_spotify_native_ass(self, song_path: str, info: dict) -> str | None:
+        """Spotify Color Lyrics → ASS using Spotify's own timings. No aligner.
+
+        Picks the highest-precision render Spotify itself ships:
+          * ``SYLLABLE_SYNCED`` → word-level karaoke ASS with per-syllable
+            ``\\kf`` parts. Rare on Spotify (mostly Apple Music feed) but
+            preferred when present.
+          * ``LINE_SYNCED`` → line-level ASS, same shape as the
+            ``lrclib`` source.
+          * ``UNSYNCED`` or no payload → ``None``.
+
+        Companion to the wav2vec2-driven ``spotify-sync`` variant: this
+        one is faster and aligner-free, but lower granularity for the
+        99% of tracks Spotify returns line-level.
+        """
+        track = info.get("track")
+        artist = info.get("artist")
+        if not track or not artist:
+            return None
+        isrc = info.get("isrc")
+        try:
+            lyrics_block = self._fetch_spotify_lyrics_payload(track, artist, isrc=isrc)
+        except Exception:
+            logger.exception("_render_spotify_native_ass: fetch crashed for %r / %r", artist, track)
+            return None
+        if not lyrics_block:
+            return None
+        sync_type = lyrics_block.get("syncType")
+        lines = lyrics_block.get("lines") or []
+        if not lines:
+            return None
+
+        if sync_type == "SYLLABLE_SYNCED":
+            ass = _spotify_syllable_lines_to_ass(lines)
+            if ass:
+                return ass
+            # Heuristic mapping failed (syllables don't reconstruct words);
+            # fall through to line-level so the operator still gets subtitles.
+        if sync_type in ("LINE_SYNCED", "SYLLABLE_SYNCED"):
+            lrc = _spotify_lines_to_lrc(lines)
+            if not lrc:
+                return None
+            if self._is_lyrics_language_mismatch(
+                song_path, _lrc_plain_text(lrc), source_label="Spotify"
+            ):
+                return None
+            return _lrc_to_ass_line_level(lrc)
+        return None
+
     def _render_spotify_word_ass(self, song_path: str, info: dict) -> str | None:
         """Spotify Color Lyrics LRC + wav2vec2 → word-level ASS. None on miss.
 
@@ -1533,19 +1597,23 @@ class LyricsService:
             self._spotify_token_cache = (token, float(exp_ms) / 1000.0)
             return token
 
-    def _fetch_spotify_lrc(self, track: str, artist: str, isrc: str | None = None) -> str | None:
-        """Return Spotify Color Lyrics for a song as LRC text, or None on miss.
+    def _resolve_spotify_track_id(self, track: str, artist: str, isrc: str | None) -> str | None:
+        """Search Spotify for a matching track and return its ID, or None.
 
-        Two paths to a track ID:
-          * ISRC (when stored in the songs table from MusicBrainz lookup) →
-            ``q=isrc:<code>`` is deterministic.
-          * Artist + title fallback → first hit whose primary artist matches
-            (accent-folded, case-insensitive).
-
-        Returns None on missing token, no track match, unsynced lyrics, or
-        any HTTP failure. ``LINE_SYNCED`` is the only sync type we accept —
-        ``UNSYNCED`` plain text is useless to the LRC-windowed aligner.
+        Memoized per ``(track, artist, isrc)`` key — repeated requests for
+        the same song hit cache instead of the rate-limited search API.
+        Honors a global rate-limit cooldown: if Spotify recently returned
+        429, all callers fast-fail with None until the Retry-After window
+        expires. ``api.spotify.com/v1/search`` is aggressively throttled
+        for web-player tokens, so cache + cooldown is what makes the
+        backend actually usable in practice.
         """
+        cache_key = (track, artist, isrc or "")
+        if cache_key in self._spotify_search_cache:
+            return self._spotify_search_cache[cache_key]
+        if time.time() < self._spotify_rate_limited_until:
+            return None
+
         token = self._get_spotify_access_token()
         if not token:
             return None
@@ -1564,6 +1632,14 @@ class LyricsService:
                 },
                 timeout=SPOTIFY_TIMEOUT,
             )
+            if r.status_code == 429:
+                try:
+                    cooldown = float(r.headers.get("Retry-After", "60"))
+                except ValueError:
+                    cooldown = 60.0
+                self._spotify_rate_limited_until = time.time() + cooldown
+                logger.warning("Spotify search rate-limited; cooling down for %.0fs", cooldown)
+                return None
             if r.status_code != 200:
                 logger.warning("Spotify search HTTP %s for %r", r.status_code, query)
                 return None
@@ -1572,19 +1648,35 @@ class LyricsService:
             logger.warning("Spotify search failed: %s", e)
             return None
 
-        if not items:
-            return None
+        track_id: str | None = None
+        if items:
+            if isrc:
+                track_id = items[0].get("id")
+            else:
+                artist_key = remove_accents(artist.strip().lower())
+                for item in items:
+                    primary = ((item.get("artists") or [{}])[0]).get("name", "")
+                    if remove_accents(primary.strip().lower()) == artist_key:
+                        track_id = item.get("id")
+                        break
+        # Cache the result (including misses) to avoid retrying the rate-
+        # limited search endpoint for songs Spotify simply doesn't index.
+        self._spotify_search_cache[cache_key] = track_id
+        return track_id
 
-        artist_key = remove_accents(artist.strip().lower())
-        track_id = None
-        if isrc:
-            track_id = items[0].get("id")
-        else:
-            for item in items:
-                primary = ((item.get("artists") or [{}])[0]).get("name", "")
-                if remove_accents(primary.strip().lower()) == artist_key:
-                    track_id = item.get("id")
-                    break
+    def _fetch_spotify_lyrics_payload(
+        self, track: str, artist: str, isrc: str | None = None
+    ) -> dict | None:
+        """Return the raw ``lyrics`` block from Spotify Color Lyrics, or None.
+
+        Caller dispatches on ``syncType`` (``LINE_SYNCED`` or
+        ``SYLLABLE_SYNCED``). ``UNSYNCED`` flows back unchanged so the
+        caller can decide whether to drop it.
+        """
+        token = self._get_spotify_access_token()
+        if not token:
+            return None
+        track_id = self._resolve_spotify_track_id(track, artist, isrc)
         if not track_id:
             return None
 
@@ -1611,9 +1703,18 @@ class LyricsService:
         except (requests.RequestException, ValueError) as e:
             logger.warning("Spotify lyrics fetch failed: %s", e)
             return None
+        return payload.get("lyrics") or None
 
-        lyrics_block = payload.get("lyrics") or {}
-        if lyrics_block.get("syncType") != "LINE_SYNCED":
+    def _fetch_spotify_lrc(self, track: str, artist: str, isrc: str | None = None) -> str | None:
+        """LINE_SYNCED Spotify lyrics as LRC text, or None on miss.
+
+        Used by the wav2vec2-aligned ``spotify-sync`` variant.
+        ``UNSYNCED`` and ``SYLLABLE_SYNCED`` are dropped here — the
+        former has no timing info, the latter is consumed natively
+        by ``_render_spotify_native_ass`` instead.
+        """
+        lyrics_block = self._fetch_spotify_lyrics_payload(track, artist, isrc=isrc)
+        if not lyrics_block or lyrics_block.get("syncType") != "LINE_SYNCED":
             return None
         return _spotify_lines_to_lrc(lyrics_block.get("lines") or [])
 
@@ -3889,6 +3990,100 @@ def _spotify_lines_to_lrc(lines: list[dict]) -> str | None:
         ss = (start_ms % 60_000) / 1000.0
         out.append(f"[{mm:02d}:{ss:05.2f}]{words}")
     return "\n".join(out) or None
+
+
+def _group_spotify_syllables(line_text: str, syllables: list[dict]) -> list[Word] | None:
+    """Glue Spotify per-syllable timings into per-token ``Word`` objects.
+
+    Spotify's ``SYLLABLE_SYNCED`` payload lists syllables independently of
+    word boundaries. We walk the line tokens left-to-right, consuming
+    syllables until their concatenated text covers the current token.
+    Each token becomes one ``Word`` with sub-syllable ``WordPart`` parts
+    so the ASS renderer can emit one ``\\kf`` per syllable.
+
+    Returns ``None`` when reconstruction fails (token / syllable text
+    mismatch) — caller falls back to line-level rendering.
+    """
+    tokens = line_text.split()
+    if not tokens:
+        return None
+    out: list[Word] = []
+    syl_idx = 0
+    for tok in tokens:
+        accumulated = ""
+        token_syls: list[dict] = []
+        target = "".join(tok.split())  # whitespace-stripped target
+        while syl_idx < len(syllables) and len(accumulated) < len(target):
+            syl = syllables[syl_idx]
+            text = (syl.get("text") or "").strip()
+            if not text:
+                syl_idx += 1
+                continue
+            accumulated += text
+            token_syls.append(syl)
+            syl_idx += 1
+        if not token_syls or accumulated[: len(target)] != target:
+            return None
+        try:
+            ws = int(token_syls[0].get("startTimeMs") or 0) / 1000.0
+            we = int(token_syls[-1].get("endTimeMs") or 0) / 1000.0
+        except (TypeError, ValueError):
+            return None
+        if we <= ws:
+            return None
+        parts: list[WordPart] = []
+        for syl in token_syls:
+            try:
+                ps = int(syl.get("startTimeMs") or 0) / 1000.0
+                pe = int(syl.get("endTimeMs") or 0) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            text = (syl.get("text") or "").strip()
+            if text and pe > ps:
+                parts.append(WordPart(text=text, start=ps, end=pe))
+        out.append(
+            Word(
+                text=tok,
+                start=ws,
+                end=we,
+                parts=tuple(parts) if len(parts) > 1 else None,
+            )
+        )
+    return out
+
+
+def _spotify_syllable_lines_to_ass(lines: list[dict]) -> str | None:
+    """Render SYLLABLE_SYNCED Spotify lines as word-level karaoke ASS.
+
+    Builds a synthetic LRC for line positioning and a flat ``Word`` list
+    for ``_words_to_ass_with_k_tags``. Returns ``None`` when no line
+    reconstructs cleanly — the caller falls back to ``LINE_SYNCED``-
+    style line-level rendering.
+    """
+    all_words: list[Word] = []
+    lrc_lines: list[str] = []
+    for line in lines:
+        line_text = (line.get("words") or "").strip()
+        if not line_text:
+            continue
+        try:
+            start_ms = int(line.get("startTimeMs") or 0)
+        except (TypeError, ValueError):
+            continue
+        syllables = line.get("syllables") or []
+        if not syllables:
+            return None
+        line_words = _group_spotify_syllables(line_text, syllables)
+        if line_words is None:
+            return None
+        all_words.extend(line_words)
+        mm = start_ms // 60_000
+        ss = (start_ms % 60_000) / 1000.0
+        lrc_lines.append(f"[{mm:02d}:{ss:05.2f}]{line_text}")
+    if not all_words or not lrc_lines:
+        return None
+    lrc = "\n".join(lrc_lines)
+    return _words_to_ass_with_k_tags(all_words, lrc, params=_anim_params_for_bpm(None))
 
 
 # ----- LRC parser -----
