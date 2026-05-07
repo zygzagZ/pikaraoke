@@ -52,6 +52,10 @@ def _no_classifier_http(monkeypatch):
             return_value=None,
         ),
         patch(
+            "pikaraoke.lib.lyrics.search_musicbrainz",
+            return_value=(),
+        ),
+        patch(
             "pikaraoke.lib.lyrics._probe_audio_language",
             return_value=None,
         ),
@@ -721,6 +725,218 @@ class TestArtistMatches:
     def test_empty_query_with_real_primary_rejected(self):
         # Empty artist key + real primary: no overlap, must reject.
         assert _artist_matches("", "Foo") is False
+
+
+# ----- Candidate generator + retry wrapper -----
+
+
+class TestSplitArtistCredits:
+    def test_single_artist_returns_single_token(self):
+        from pikaraoke.lib.lyrics import _split_artist_credits
+
+        assert _split_artist_credits("Eminem") == ["Eminem"]
+
+    def test_ampersand_splits(self):
+        from pikaraoke.lib.lyrics import _split_artist_credits
+
+        assert _split_artist_credits("Gibbs & Kiełas") == ["Gibbs", "Kiełas"]
+
+    def test_feat_splits(self):
+        from pikaraoke.lib.lyrics import _split_artist_credits
+
+        assert _split_artist_credits("Eminem feat. Dido") == ["Eminem", "Dido"]
+
+    def test_short_tokens_dropped(self):
+        from pikaraoke.lib.lyrics import _split_artist_credits
+
+        # Single-letter aliases are excluded — same threshold as the matcher.
+        assert _split_artist_credits("X & A & Real Name") == ["Real Name"]
+
+    def test_empty_returns_empty_list(self):
+        from pikaraoke.lib.lyrics import _split_artist_credits
+
+        assert _split_artist_credits("") == []
+
+    def test_band_names_with_internal_x_preserved(self):
+        from pikaraoke.lib.lyrics import _split_artist_credits
+
+        # "x" only splits surrounded by whitespace; "AC/DC", "Malcolm X",
+        # and similar should remain a single token.
+        assert _split_artist_credits("AC/DC") == ["AC/DC"]
+
+
+class _DummyAligner:
+    """Minimal aligner stand-in — never actually called by candidate tests."""
+
+    model_id = "stub"
+
+
+def _make_service(tmp_path):
+    """Build a LyricsService with no DB, no aligner, no events."""
+    from pikaraoke.lib.lyrics import LyricsService
+
+    return LyricsService(str(tmp_path), EventSystem(), aligner=None, db=None)
+
+
+class TestMetadataCandidates:
+    def test_returns_empty_when_info_missing(self, tmp_path):
+        service = _make_service(tmp_path)
+        assert service._metadata_candidates(None, None) == []
+        assert service._metadata_candidates({"track": "T"}, None) == []
+        assert service._metadata_candidates({"artist": "A"}, None) == []
+
+    def test_first_entry_is_original_info(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "Stan", "artist": "Eminem", "duration": 489, "isrc": None}
+        out = service._metadata_candidates(info, None)
+        assert out[0]["track"] == "Stan"
+        assert out[0]["artist"] == "Eminem"
+        # Duration / isrc propagate so Spotify's ISRC fast-path keeps working
+        # when an alternative credit hits.
+        assert out[0]["duration"] == 489
+
+    def test_multi_artist_yields_solo_candidates(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {
+            "track": "Piękny Świat",
+            "artist": "Gibbs & Kiełas",
+            "duration": 233,
+            "isrc": None,
+        }
+        out = service._metadata_candidates(info, None)
+        artists = [c["artist"] for c in out]
+        # Original first, then each collaborator solo.
+        assert artists[0] == "Gibbs & Kiełas"
+        assert "Gibbs" in artists
+        assert "Kiełas" in artists
+
+    def test_filename_regex_tidy_adds_candidate(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "noisy title", "artist": "noisy artist", "duration": 200, "isrc": None}
+        # Filename is human-typed and clearly says Adele - Hello.
+        song_path = str(tmp_path / "Adele - Hello---abc12345678.mp4")
+        out = service._metadata_candidates(info, song_path)
+        assert any(c["track"] == "Hello" and c["artist"] == "Adele" for c in out)
+
+    def test_itunes_hits_added(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "Stan", "artist": "Eminem", "duration": 489, "isrc": None}
+        itunes_row = (
+            "Eminem",  # artistName
+            "Stan (feat. Dido)",  # trackName
+            12345,
+            "Album",
+            3,
+            "2000-05-23",
+            "https://example.com/cover.jpg",
+            "Hip-Hop/Rap",
+            "USA",
+            "USD",
+        )
+        with patch(
+            "pikaraoke.lib.lyrics._search_itunes_cached",
+            return_value=(itunes_row,),
+        ):
+            out = service._metadata_candidates(info, None)
+        assert any(c["track"] == "Stan (feat. Dido)" and c["artist"] == "Eminem" for c in out)
+
+    def test_dedup_is_case_and_accent_insensitive(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "Hello", "artist": "Adele", "duration": 200, "isrc": None}
+        # iTunes returns the same song with different casing — must not
+        # duplicate the original entry.
+        itunes_row = ("ADELE", "hello", 1, "", 0, "", "", "", "", "")
+        with patch(
+            "pikaraoke.lib.lyrics._search_itunes_cached",
+            return_value=(itunes_row,),
+        ):
+            out = service._metadata_candidates(info, None)
+        # Dedup folds case → only the original survives from this pair.
+        assert len(out) == 1
+
+    def test_caps_at_candidate_limit(self, tmp_path):
+        from pikaraoke.lib.lyrics import _CANDIDATE_LIMIT
+
+        service = _make_service(tmp_path)
+        info = {"track": "Track", "artist": "A", "duration": 200, "isrc": None}
+        # Build many distinct iTunes rows.
+        rows = tuple(
+            ("A", f"Track v{i}", i, "", 0, "", "", "", "", "") for i in range(_CANDIDATE_LIMIT * 2)
+        )
+        with patch(
+            "pikaraoke.lib.lyrics._search_itunes_cached",
+            return_value=rows,
+        ):
+            out = service._metadata_candidates(info, None)
+        assert len(out) <= _CANDIDATE_LIMIT
+
+    def test_itunes_failure_does_not_abort_list(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "Track", "artist": "Gibbs & Kiełas", "duration": 200, "isrc": None}
+        with patch(
+            "pikaraoke.lib.lyrics._search_itunes_cached",
+            side_effect=RuntimeError("iTunes down"),
+        ):
+            out = service._metadata_candidates(info, None)
+        # Original + token splits still surface even when iTunes raised.
+        artists = [c["artist"] for c in out]
+        assert "Gibbs & Kiełas" in artists
+        assert "Gibbs" in artists
+
+
+class TestTryWithCandidates:
+    def test_first_candidate_hit_returns_immediately(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "T", "artist": "A", "duration": 200, "isrc": None}
+        fetcher = MagicMock(return_value="hit")
+        result, winner = service._try_with_candidates(fetcher, info, None, label="X")
+        assert result == "hit"
+        assert winner["track"] == "T"
+        # No rescue: only the first candidate was consulted.
+        assert fetcher.call_count == 1
+
+    def test_falls_through_on_miss(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "T", "artist": "Gibbs & Kiełas", "duration": 200, "isrc": None}
+        # First two miss, third hits — exact ordering depends on candidate gen,
+        # but we expect at least the original + 2 solo splits.
+        fetcher = MagicMock(side_effect=[None, None, "hit", "should-not-call"])
+        result, winner = service._try_with_candidates(fetcher, info, None, label="X")
+        assert result == "hit"
+        assert winner is not None
+        assert fetcher.call_count == 3
+
+    def test_per_candidate_exception_does_not_abort(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "T", "artist": "Gibbs & Kiełas", "duration": 200, "isrc": None}
+        fetcher = MagicMock(side_effect=[RuntimeError("boom"), "hit"])
+        result, _winner = service._try_with_candidates(fetcher, info, None, label="X")
+        assert result == "hit"
+
+    def test_all_miss_returns_none_pair(self, tmp_path):
+        service = _make_service(tmp_path)
+        info = {"track": "T", "artist": "A", "duration": 200, "isrc": None}
+        fetcher = MagicMock(return_value=None)
+        result, winner = service._try_with_candidates(fetcher, info, None, label="X")
+        assert result is None
+        assert winner is None
+
+    def test_empty_info_skips_fetcher(self, tmp_path):
+        service = _make_service(tmp_path)
+        fetcher = MagicMock()
+        result, winner = service._try_with_candidates(fetcher, None, None, label="X")
+        assert (result, winner) == (None, None)
+        fetcher.assert_not_called()
+
+    def test_logs_rescue_index(self, tmp_path, caplog):
+        import logging
+
+        service = _make_service(tmp_path)
+        info = {"track": "T", "artist": "Gibbs & Kiełas", "duration": 200, "isrc": None}
+        fetcher = MagicMock(side_effect=[None, "hit"])
+        with caplog.at_level(logging.INFO, logger="pikaraoke.lib.lyrics"):
+            service._try_with_candidates(fetcher, info, None, label="LRCLib")
+        assert any("rescued" in rec.message for rec in caplog.records)
 
 
 # ----- Genius client -----
@@ -2696,9 +2912,11 @@ class TestLyricsServiceNewFlow:
         assert vtt.exists(), "VTT must be preserved when no .ass was written"
         db.close()
 
-    def test_itunes_fallback_when_lrclib_misses(self, tmp_path):
-        """DB has noisy artist/title; first LRCLib call misses. iTunes
-        canonicalises and the second LRCLib call hits."""
+    def test_lrclib_rescued_by_itunes_candidate(self, tmp_path):
+        """DB has a noisy artist/title; first LRCLib call misses. iTunes
+        returns a canonicalised alternative via ``_search_itunes_cached``
+        and ``_metadata_candidates`` retries LRCLib with it; the second
+        call hits."""
         from pikaraoke.lib.karaoke_database import KaraokeDatabase
 
         song = tmp_path / "Foo---abc.mp4"
@@ -2716,19 +2934,32 @@ class TestLyricsServiceNewFlow:
             },
         )
         service = LyricsService(str(tmp_path), EventSystem(), db=db)
+        # iTunes row tuple shape mirrors ``_ITUNES_FIELDS`` in music_metadata
+        # — the candidate generator unwraps it via ``_itunes_row_to_dict``.
+        itunes_row = (
+            "Eminem",
+            "Stan (feat. Dido)",
+            12345,
+            "The Marshall Mathers LP",
+            3,
+            "2000-05-23T07:00:00Z",
+            "https://example.com/cover.jpg",
+            "Hip-Hop/Rap",
+            "USA",
+            "USD",
+        )
         with patch(
             "pikaraoke.lib.lyrics._fetch_lrclib",
             side_effect=[None, "[00:01.00]clean line"],
         ) as mock_fetch, patch(
-            "pikaraoke.lib.lyrics.resolve_metadata",
-            return_value={"artist": "Eminem", "track": "Stan (feat. Dido)"},
-        ) as mock_resolve:
+            "pikaraoke.lib.lyrics._search_itunes_cached",
+            return_value=(itunes_row,),
+        ):
             service.fetch_and_convert(str(song))
         assert mock_fetch.call_count == 2
         second_call_args = mock_fetch.call_args_list[1].args
         assert second_call_args[0] == "Stan (feat. Dido)"
         assert second_call_args[1] == "Eminem"
-        mock_resolve.assert_called_once()
         ass = (tmp_path / "Foo---abc.ass").read_text(encoding="utf-8")
         assert "clean line" in ass
         db.close()
