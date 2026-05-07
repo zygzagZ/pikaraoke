@@ -22,6 +22,7 @@ events. Outputs a `<div class="subtitle-chips">` with one chip per
 source.
 
 Chip visual states:
+
 - `success` ready, inactive — solid color, source label
 - `success` ready, **active** — solid color + highlighted border + active glyph
 - `running` — pulsing spinner glyph
@@ -30,8 +31,7 @@ Chip visual states:
 - `rate_limited` — amber outline + clock glyph, tooltip = `retry in Xm`
 - `skipped` — hidden by default; toggle "show all" reveals
 
-Order is fixed (matches picker today): `user, youtube-vtt, lrclib,
-lrclib-sync, genius-sync, spotify-sync, tekstowo-sync, AI`. Source
+Order is fixed (matches picker today): `user, youtube-vtt, lrclib, lrclib-sync, genius-sync, spotify-sync, tekstowo-sync, AI`. Source
 labels come from existing `LYRICS_SOURCE_LABELS` (extended in Phase 1).
 
 Click on a `success` chip → POST `/subtitle_source` with that source
@@ -42,6 +42,7 @@ the retry; Phase 2 stub returns 501 with friendly toast).
 ### Splash placement
 
 Replace single badge in `splash.html:65-68` with the chip row. Two layouts:
+
 - **Idle / between songs** — full chip row, large.
 - **During playback** — collapsed: only active chip large, others as small
   dots. Hovering or remote action expands. Auto-collapse after 4s of no
@@ -76,6 +77,7 @@ timeline shows the chip row.
 ### Settings — operator policies
 
 Add to admin/settings:
+
 - `SUBTITLE_CHIPS_DENSITY`: compact / full (default compact on mobile,
   full on desktop)
 - `SUBTITLE_CHIPS_AUTOCOLLAPSE_MS`: integer, 0 disables (default 4000

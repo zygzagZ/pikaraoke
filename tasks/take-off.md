@@ -16,6 +16,7 @@ Implementation has not started.
 ## Plan source of truth
 
 Read these in order, then stop reading:
+
 1. `/Users/zygzagz/github/pikaraoke/tasks/todo.md` — current operational
    plan with locked UI direction, 6-file scope, decision audit trail,
    resolved taste decisions. THIS is canonical.
@@ -32,6 +33,7 @@ Read these in order, then stop reading:
 
 Mockup the user signed off on (open in a browser if you want to see what
 was approved):
+
 - `~/.gstack/projects/zygzagZ-pikaraoke/master-phase2-mockup-20260504.html`
   (durable copy)
 - `/tmp/pikaraoke-mockups/index.html` (working copy from the previous
@@ -49,8 +51,8 @@ Do NOT read the other plan docs in `tasks/` — they are unrelated phases.
   existing `pk-tool-subtitle-src` slot. Slot moves to be **below**
   Wokal + Podkład sliders. Trigger shows `[● LRCLib + sync] [5/7 ✓] [▼]`.
   Popover **auto-flips upward** when no room below. `max-height: 320px`
-  + scroll. Disabled rows for failed/running/rate_limited (visible but
-  unpickable).
+  - scroll. Disabled rows for failed/running/rate_limited (visible but
+    unpickable).
 - **Queue rosette + edit-view chip row:** DEFERRED to Phase 2.5 — gated
   on resolving the structural gap that queue items lack `song_id`.
 - **Approach:** C-like split. Phase 2 ships splash + remote + bulk
@@ -64,40 +66,41 @@ Do NOT read the other plan docs in `tasks/` — they are unrelated phases.
 These came out of the CEO review. They are non-negotiable — the
 implementation must address each:
 
-1. Pre-Phase-1 songs have empty `subtitle_jobs`. Picker/badge MUST
-   render `DEFAULT_AUTO_SOURCES` as `na/skipped` placeholders, not blank.
-2. Embed `label` field in `subtitle_job_update` socket payload
-   (`subtitle_orchestrator.py:307`) so the picker doesn't need a
-   separate label-registry fetch. One-line change.
-3. Embed `label` per source in the `GET /api/songs/<id>/subtitles`
-   response.
-4. Edit view (when Phase 2.5 lands) MUST use `window.socket`, NOT
-   create a second `io()` connection. `base.html:103` already creates
-   the global socket.
-5. JS-load fallback: if `subtitle-source-picker.js` fails to mount,
-   fall back to the native `<select>` (keep it hidden in DOM as a
-   safety net). Operator must never lose the source picker.
-6. `MAX_BULK = 100` enforced on `POST /api/songs/subtitles/bulk`.
-   Return 400 if exceeded.
-7. Component lifecycle: explicit `destroy()` MUST be called before
-   re-mounting on song change in now-playing-bar (otherwise socket
-   listeners leak).
-8. JS tests must follow the project's vitest constraint (CLAUDE.md):
-   pure functions only, no DOM mocking. Extract
-   `computeReadySummary`, `deriveOptionState`, `computeCountdown`,
-   `sortSourcesCanonically` as named exports and test those. The DOM
-   wiring is manual e2e.
-9. Bulk endpoint contract: even though Phase 2 doesn't consume it for
-   the queue (2.5 does), document whether the response is a dict
-   `{<song_id>: {...}}` or a list `[{song_id, ...}]`. The dict form
-   silently dedupes if the same song is queued twice — not a bug for
-   the rest endpoint, but the queue consumer in 2.5 must be aware.
+01. Pre-Phase-1 songs have empty `subtitle_jobs`. Picker/badge MUST
+    render `DEFAULT_AUTO_SOURCES` as `na/skipped` placeholders, not blank.
+02. Embed `label` field in `subtitle_job_update` socket payload
+    (`subtitle_orchestrator.py:307`) so the picker doesn't need a
+    separate label-registry fetch. One-line change.
+03. Embed `label` per source in the `GET /api/songs/<id>/subtitles`
+    response.
+04. Edit view (when Phase 2.5 lands) MUST use `window.socket`, NOT
+    create a second `io()` connection. `base.html:103` already creates
+    the global socket.
+05. JS-load fallback: if `subtitle-source-picker.js` fails to mount,
+    fall back to the native `<select>` (keep it hidden in DOM as a
+    safety net). Operator must never lose the source picker.
+06. `MAX_BULK = 100` enforced on `POST /api/songs/subtitles/bulk`.
+    Return 400 if exceeded.
+07. Component lifecycle: explicit `destroy()` MUST be called before
+    re-mounting on song change in now-playing-bar (otherwise socket
+    listeners leak).
+08. JS tests must follow the project's vitest constraint (CLAUDE.md):
+    pure functions only, no DOM mocking. Extract
+    `computeReadySummary`, `deriveOptionState`, `computeCountdown`,
+    `sortSourcesCanonically` as named exports and test those. The DOM
+    wiring is manual e2e.
+09. Bulk endpoint contract: even though Phase 2 doesn't consume it for
+    the queue (2.5 does), document whether the response is a dict
+    `{<song_id>: {...}}` or a list `[{song_id, ...}]`. The dict form
+    silently dedupes if the same song is queued twice — not a bug for
+    the rest endpoint, but the queue consumer in 2.5 must be aware.
 10. Render `error_message` via `textContent` / `setAttribute('title')`,
     NEVER `innerHTML` (XSS).
 
 ## Files in scope (Phase 2 = 6 files)
 
 NEW:
+
 - `pikaraoke/static/js/subtitle-source-picker.js` — module exporting
   `mountCornerBadge(songIdGetter, options)` + `mountSmartPicker(...)`
   factory functions returning `{ el, update(data), destroy() }` lifecycle
@@ -115,6 +118,7 @@ NEW:
   tests only.
 
 MODIFIED:
+
 - `pikaraoke/templates/splash.html` — replace `#lyrics-source` with
   the corner badge mount point.
 - `pikaraoke/templates/base.html` — keep `pk-tool-subtitle-src` slot,
@@ -154,6 +158,7 @@ tasks — this qualifies. They invoked /autoplan voluntarily, so default
 to continuing the pipeline unless they redirect.
 
 If you continue /autoplan, the protocol is:
+
 - Phase 2: Design review — fork a Plan agent + an independent design
   subagent (Codex unavailable). Both review on the LOCKED direction
   only — do not re-evaluate "chip row vs dropdown". Build a design

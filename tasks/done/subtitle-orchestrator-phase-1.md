@@ -2,8 +2,7 @@
 
 ## Status (2026-05-04)
 
-**SHIPPED** — commit `2a2b78ca feat(subtitle): orchestrate per-source
-fan-out with lifecycle state`. Phase 1 landed: `subtitle_jobs` schema,
+**SHIPPED** — commit `2a2b78ca feat(subtitle): orchestrate per-source fan-out with lifecycle state`. Phase 1 landed: `subtitle_jobs` schema,
 `SubtitleOrchestrator`, per-source executor pools, `subtitle_job_update`
 SocketIO event, `GET /api/songs/<id>/subtitles` endpoint, and the
 quick-win additions (tekstowo/spotify in `LYRICS_SOURCE_LABELS`,
@@ -15,7 +14,7 @@ The enrichment-trigger bug listed under quick-wins was handled
 separately in `enrichment-trigger-bug.md` (mitigated 2026-05-04 with
 the `metadata_status='error'` stamp).
 
----
+______________________________________________________________________
 
 ## Goal
 
@@ -62,6 +61,7 @@ Replaces ad-hoc orchestration in `LyricsService.fetch_and_convert`
 (lyrics.py:874). Entry point: `orchestrator.kickoff(song_id)`.
 
 Behavior:
+
 - Read enabled sources from config (`SUBTITLE_SOURCES_AUTO`, defaults to
   the full `VARIANT_FILE_SOURCES` list minus `user`).
 - For each source: insert/update `subtitle_jobs` row with `state='queued'`,
@@ -84,9 +84,11 @@ always fans out; consensus selection moves to Phase 3.
 ### Events
 
 New SocketIO event `subtitle_job_update`:
+
 ```
 { song_id, youtube_id, source, state, tier?, error_code?, error_message?, ts }
 ```
+
 Emitted on every state transition. `song_event` (Phase 0) keeps emitting
 phase=`lyrics` info/error rows for the timeline; `subtitle_job_update` is
 for live UI state.
@@ -94,6 +96,7 @@ for live UI state.
 ### REST
 
 `GET /api/songs/<song_id>/subtitles`:
+
 ```
 {
   active_source: 'lrclib-sync',           // current subtitle_source_override or auto-pick
@@ -108,6 +111,7 @@ for live UI state.
   ]
 }
 ```
+
 Drives splash + remote chips (Phase 2 consumer).
 
 ### Quick wins shipped with Phase 1

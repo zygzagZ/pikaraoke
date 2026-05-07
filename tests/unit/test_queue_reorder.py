@@ -130,9 +130,7 @@ class TestReorderWithCurrentRoute:
         k.reorder_with_current.return_value = True
         mock_get_instance.return_value = k
 
-        response = client.post(
-            "/queue/reorder_with_current", data={"old_index": 1, "new_index": 0}
-        )
+        response = client.post("/queue/reorder_with_current", data={"old_index": 1, "new_index": 0})
 
         assert response.status_code == 200
         assert json.loads(response.data) == {"success": True}
@@ -140,7 +138,5 @@ class TestReorderWithCurrentRoute:
 
     @patch("pikaraoke.routes.queue.is_admin", return_value=False)
     def test_route_blocks_non_admin(self, mock_is_admin, client):
-        response = client.post(
-            "/queue/reorder_with_current", data={"old_index": 1, "new_index": 0}
-        )
+        response = client.post("/queue/reorder_with_current", data={"old_index": 1, "new_index": 0})
         assert response.status_code == 403

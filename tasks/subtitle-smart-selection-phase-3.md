@@ -18,6 +18,7 @@ Computed at orchestrator success time (or on-demand via batch
 recompute). Stored in `subtitle_jobs.quality_score` (new column, FLOAT).
 
 Score components, weighted:
+
 - **Tier**: word=1.0, line=0.6 — biggest factor
 - **Language match**: source `language` (where exposed — LRCLib, Spotify,
   Genius) matches `songs.language`: +0.15
@@ -36,6 +37,7 @@ Score tie-breakers (in order): tier preference, source order in
 ### Selection policy
 
 Setting `SUBTITLE_SELECTION_POLICY`:
+
 - `auto-best` (default) — pick highest quality_score among `success`
   jobs. Re-evaluate when a new source completes.
 - `prefer-word-level` — only word-tier sources eligible; fallback to
@@ -51,6 +53,7 @@ event so chips update + edit view logs it. Operator's manual override
 
 Setting `SUBTITLE_LANGUAGE_PREFERENCES`: map of `lang → ordered source list`.
 Default seeded with:
+
 - `pl` → `tekstowo-sync, lrclib-sync, genius-sync, AI`
 - `en` → `lrclib-sync, genius-sync, spotify-sync, AI`
 - `*`  → `lrclib-sync, genius-sync, spotify-sync, tekstowo-sync, AI`
@@ -61,6 +64,7 @@ Used as a tie-breaker boost: source position in the language list adds
 ### A/B compare in edit view
 
 Below the chip row, a "Compare" button opens a split-pane:
+
 - Left: source A picker, renders ASS preview (existing renderer reused).
 - Right: source B picker, same.
 - Shared timeline scrubber synchronizing both panes.

@@ -10,11 +10,7 @@ from flask import flash, redirect, request, url_for
 from flask_smorest import Blueprint
 from marshmallow import Schema, fields
 
-from pikaraoke.lib.current_app import (
-    broadcast_event,
-    get_karaoke_instance,
-    is_admin,
-)
+from pikaraoke.lib.current_app import broadcast_event, get_karaoke_instance, is_admin
 
 _ = flask_babel.gettext
 
