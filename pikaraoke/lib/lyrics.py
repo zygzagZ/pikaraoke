@@ -64,13 +64,18 @@ from pikaraoke.lib.lyrics_pipeline_failure_cache import (
 from pikaraoke.lib.lyrics_pipeline_failure_cache import (
     record_failure as _record_pipeline_failure,
 )
-from pikaraoke.lib.metadata_parser import remove_accents
+from pikaraoke.lib.metadata_parser import (
+    has_artist_title_separator,
+    regex_tidy,
+    remove_accents,
+)
 from pikaraoke.lib.music_metadata import (
     _itunes_row_to_dict,
     _search_itunes_cached,
     fetch_musicbrainz_language_signals,
     normalize_title,
     resolve_metadata,
+    search_musicbrainz,
 )
 from pikaraoke.lib.whisper_transcript_cache import (
     read_cached_transcript as _read_cached_whisper_transcript,
@@ -921,11 +926,11 @@ class LyricsService:
             return self._render_vtt_ass(song_path)
         if source == SUBTITLE_SOURCE_LRCLIB:
             info = self._read_metadata_for_lrclib(song_path)
-            ass, _sha, _info = self._render_lrclib_line_ass(info)
+            ass, _sha, _info = self._render_lrclib_line_ass(info, song_path=song_path)
             return ass
         if source == SUBTITLE_SOURCE_LRCLIB_SYNC:
             info = self._read_metadata_for_lrclib(song_path)
-            lrc, _info = self._fetch_lrc_with_itunes_fallback(info)
+            lrc, _info = self._fetch_lrc_with_itunes_fallback(info, song_path=song_path)
             if not lrc:
                 return None
             return self._render_lrclib_word_ass(song_path, lrc)
@@ -1164,7 +1169,7 @@ class LyricsService:
         # the cached .ass is still valid. Subtitle changes (LRCLib updated the
         # lyrics for this song) must force a whisper re-run even if the audio
         # and models haven't moved.
-        lrc, info = self._fetch_lrc_with_itunes_fallback(info)
+        lrc, info = self._fetch_lrc_with_itunes_fallback(info, song_path=song_path)
         if lrc and self._is_lrc_language_mismatch(song_path, lrc):
             # Dub-trap: LRCLib indexes by canonical song name, so a Polish
             # dub of an English original gets the English lyrics (the
@@ -1318,15 +1323,15 @@ class LyricsService:
         )
 
     def _render_lrclib_line_ass(
-        self, info: dict | None
+        self, info: dict | None, song_path: str | None = None
     ) -> tuple[str | None, str | None, dict | None]:
-        """Fetch LRCLib (with iTunes fallback) and render line-level ASS.
+        """Fetch LRCLib (across candidate credits) and render line-level ASS.
 
         Returns ``(ass, lyrics_sha, info)``. ``info`` is returned with
-        canonical artist/track when iTunes canonicalisation hit, mirroring
-        ``_fetch_lrc_with_itunes_fallback``.
+        the winning artist/track when an alternative candidate rescued
+        the fetch, mirroring ``_fetch_lrc_with_itunes_fallback``.
         """
-        lrc, info = self._fetch_lrc_with_itunes_fallback(info)
+        lrc, info = self._fetch_lrc_with_itunes_fallback(info, song_path=song_path)
         if not lrc:
             return None, None, info
         ass = _lrc_to_ass_line_level(lrc)
@@ -1378,21 +1383,28 @@ class LyricsService:
             return None
 
     def _render_genius_word_ass(self, song_path: str, info: dict) -> str | None:
-        """Genius lyrics + wav2vec2 → word-level ASS. Returns ASS string or None."""
+        """Genius lyrics + wav2vec2 → word-level ASS. Returns ASS string or None.
+
+        Iterates through ``_metadata_candidates`` so a Genius miss on the
+        DB credit retries with token-split / iTunes / MusicBrainz
+        alternatives before giving up. Language-mismatch hits count as
+        misses so the loop keeps trying.
+        """
         if self._aligner is None:
             return None
-        track = info.get("track")
-        artist = info.get("artist")
-        if not track or not artist:
+        if not info.get("track") or not info.get("artist"):
             return None
-        try:
-            genius_text = _fetch_genius(track, artist)
-        except Exception:
-            logger.exception("_render_genius_word_ass: fetch crashed for %r / %r", artist, track)
-            return None
+
+        def _fetch(cand: dict) -> str | None:
+            text = _fetch_genius(cand["track"], cand["artist"])
+            if not text:
+                return None
+            if self._is_genius_language_mismatch(song_path, text):
+                return None
+            return text
+
+        genius_text, _winner = self._try_with_candidates(_fetch, info, song_path, label="Genius")
         if not genius_text:
-            return None
-        if self._is_genius_language_mismatch(song_path, genius_text):
             return None
         return self._align_plain_text_to_ass(song_path, genius_text, source_label="Genius")
 
@@ -1446,21 +1458,26 @@ class LyricsService:
             return None
 
     def _render_tekstowo_word_ass(self, song_path: str, info: dict) -> str | None:
-        """Tekstowo.pl lyrics + wav2vec2 → word-level ASS. None on miss."""
+        """Tekstowo.pl lyrics + wav2vec2 → word-level ASS. None on miss.
+
+        Iterates through ``_metadata_candidates`` so a Tekstowo miss on
+        the DB credit retries with the alternative-credits list.
+        """
         if self._aligner is None:
             return None
-        track = info.get("track")
-        artist = info.get("artist")
-        if not track or not artist:
+        if not info.get("track") or not info.get("artist"):
             return None
-        try:
-            text = _fetch_tekstowo(track, artist)
-        except Exception:
-            logger.exception("_render_tekstowo_word_ass: fetch crashed for %r / %r", artist, track)
-            return None
+
+        def _fetch(cand: dict) -> str | None:
+            text = _fetch_tekstowo(cand["track"], cand["artist"])
+            if not text:
+                return None
+            if self._is_lyrics_language_mismatch(song_path, text, source_label="Tekstowo"):
+                return None
+            return text
+
+        text, _winner = self._try_with_candidates(_fetch, info, song_path, label="Tekstowo")
         if not text:
-            return None
-        if self._is_lyrics_language_mismatch(song_path, text, source_label="Tekstowo"):
             return None
         return self._align_plain_text_to_ass(song_path, text, source_label="Tekstowo")
 
@@ -1475,20 +1492,23 @@ class LyricsService:
             ``lrclib`` source.
           * ``UNSYNCED`` or no payload → ``None``.
 
+        Iterates through ``_metadata_candidates`` so a Spotify miss on
+        the DB credit retries with the alternative-credits list.
         Companion to the wav2vec2-driven ``spotify-sync`` variant: this
         one is faster and aligner-free, but lower granularity for the
         99% of tracks Spotify returns line-level.
         """
-        track = info.get("track")
-        artist = info.get("artist")
-        if not track or not artist:
+        if not info.get("track") or not info.get("artist"):
             return None
-        isrc = info.get("isrc")
-        try:
-            lyrics_block = self._fetch_spotify_lyrics_payload(track, artist, isrc=isrc)
-        except Exception:
-            logger.exception("_render_spotify_native_ass: fetch crashed for %r / %r", artist, track)
-            return None
+
+        def _fetch(cand: dict) -> dict | None:
+            return self._fetch_spotify_lyrics_payload(
+                cand["track"], cand["artist"], isrc=cand.get("isrc")
+            )
+
+        lyrics_block, _winner = self._try_with_candidates(
+            _fetch, info, song_path, label="Spotify-native"
+        )
         if not lyrics_block:
             return None
         sync_type = lyrics_block.get("syncType")
@@ -1520,25 +1540,25 @@ class LyricsService:
         through the existing LRC-windowed aligner pipeline used by LRCLib.
         ISRC from the songs table gives us a deterministic Spotify track
         match when available; otherwise we fall back to artist+title
-        search.
+        search and iterate ``_metadata_candidates`` on miss.
         """
         if self._aligner is None:
             return None
-        track = info.get("track")
-        artist = info.get("artist")
-        if not track or not artist:
+        if not info.get("track") or not info.get("artist"):
             return None
-        isrc = info.get("isrc")
-        try:
-            lrc = self._fetch_spotify_lrc(track, artist, isrc=isrc)
-        except Exception:
-            logger.exception("_render_spotify_word_ass: fetch crashed for %r / %r", artist, track)
-            return None
+
+        def _fetch(cand: dict) -> str | None:
+            lrc = self._fetch_spotify_lrc(cand["track"], cand["artist"], isrc=cand.get("isrc"))
+            if not lrc:
+                return None
+            if self._is_lyrics_language_mismatch(
+                song_path, _lrc_plain_text(lrc), source_label="Spotify"
+            ):
+                return None
+            return lrc
+
+        lrc, _winner = self._try_with_candidates(_fetch, info, song_path, label="Spotify-sync")
         if not lrc:
-            return None
-        if self._is_lyrics_language_mismatch(
-            song_path, _lrc_plain_text(lrc), source_label="Spotify"
-        ):
             return None
         return self._render_lrclib_word_ass(song_path, lrc)
 
@@ -1964,6 +1984,148 @@ class LyricsService:
             "duration": row["duration_seconds"],
             "isrc": isrc,
         }
+
+    def _metadata_candidates(self, info: dict | None, song_path: str | None) -> list[dict]:
+        """Ordered, deduped (track, artist, duration, isrc) candidates.
+
+        Builds an alternative-credits list to retry against any lyrics
+        source whose primary lookup missed on the DB defaults. Sources,
+        in priority order:
+
+          1. ``info`` itself (DB defaults — usually right).
+          2. Each collaborator from the artist credit as a solo artist
+             (``"Gibbs & Kiełas"`` -> tries ``"Gibbs"`` and ``"Kiełas"``).
+          3. ``regex_tidy`` of the filename split on ``" - "`` — catches
+             cases where info.json's ``track``/``artist`` fields disagree
+             with the filename a human typed.
+          4. Top iTunes hits for ``"<artist> - <track>"`` — surfaces
+             canonical artist credits when the indexer files the song
+             under a different name (e.g. studio version under the
+             label-credited artist instead of the YouTube uploader's).
+          5. Top MusicBrainz hits — same shape, complementary catalogue.
+
+        ``isrc`` propagates from the DB row to every candidate so Spotify's
+        ISRC fast-path keeps working across the alternative credits.
+        Service failures are independent — one timing out doesn't abort
+        the others. Capped at ``_CANDIDATE_LIMIT`` total entries to bound
+        worst-case cost on all-miss songs.
+        """
+        if not info:
+            return []
+        track = (info.get("track") or "").strip()
+        artist = (info.get("artist") or "").strip()
+        if not track or not artist:
+            return []
+
+        seen: set[tuple[str, str]] = set()
+        out: list[dict] = []
+
+        def _add(t: str, a: str) -> None:
+            t = (t or "").strip()
+            a = (a or "").strip()
+            if not t or not a:
+                return
+            key = _candidate_dedup_key(t, a)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append({**info, "track": t, "artist": a})
+
+        # 1. Original DB values first.
+        _add(track, artist)
+
+        # 2. Each collaborator solo. "Gibbs & Kiełas" -> Gibbs, Kiełas.
+        for solo in _split_artist_credits(artist):
+            if len(out) >= _CANDIDATE_LIMIT:
+                break
+            _add(track, solo)
+
+        # 3. Filename regex_tidy (zero-cost local cleanup). Strip the
+        # 11-char YouTube ID suffix first so it doesn't leak into the
+        # candidate's track field.
+        if song_path and len(out) < _CANDIDATE_LIMIT:
+            try:
+                tidied = regex_tidy(_title_from_filename(song_path))
+                if has_artist_title_separator(tidied):
+                    f_artist, _, f_track = tidied.partition(" - ")
+                    _add(f_track, f_artist)
+            except Exception:
+                logger.exception("candidate gen: regex_tidy crashed for %s", song_path)
+
+        # 4. iTunes top hits. Use ``_search_itunes_cached`` directly (the
+        # already-imported, monkeypatch-friendly entry point used by the
+        # language classifier) rather than the ``search_itunes`` wrapper
+        # in music_metadata — keeps unit tests hermetic without an extra
+        # patch site, and the LRU cache means the classifier's earlier
+        # call is reused for free.
+        if len(out) < _CANDIDATE_LIMIT:
+            try:
+                query = normalize_title(f"{artist} - {track}")
+                rows = _search_itunes_cached(query, 5)
+                for row in rows:
+                    if len(out) >= _CANDIDATE_LIMIT:
+                        break
+                    hit = _itunes_row_to_dict(row)
+                    _add(hit.get("trackName", ""), hit.get("artistName", ""))
+            except Exception:
+                logger.exception("candidate gen: iTunes search crashed for %r", track)
+
+        # 5. MusicBrainz top hits (LRU-cached, separate catalogue).
+        if len(out) < _CANDIDATE_LIMIT:
+            try:
+                query = f"{artist} {track}"
+                for hit in search_musicbrainz(query, limit=3):
+                    if len(out) >= _CANDIDATE_LIMIT:
+                        break
+                    _add(hit.get("track", ""), hit.get("artist", ""))
+            except Exception:
+                logger.exception("candidate gen: MusicBrainz search crashed for %r", track)
+
+        return out
+
+    def _try_with_candidates(
+        self,
+        fetcher,
+        info: dict | None,
+        song_path: str | None,
+        *,
+        label: str,
+    ):
+        """Call ``fetcher(candidate)`` for each candidate until one returns truthy.
+
+        Returns ``(result, winning_candidate)``. Both are ``None`` when
+        every candidate missed. The first candidate is always the DB
+        defaults, so a song whose tag is correct pays no extra cost
+        beyond the original single-shot fetch. Per-candidate exceptions
+        are logged and skipped so a transient crash on one alternative
+        never aborts the search.
+        """
+        candidates = self._metadata_candidates(info, song_path)
+        if not candidates:
+            return None, None
+        for index, cand in enumerate(candidates):
+            try:
+                result = fetcher(cand)
+            except Exception:
+                logger.exception(
+                    "%s candidate %d crashed for track=%r artist=%r",
+                    label,
+                    index,
+                    cand.get("track"),
+                    cand.get("artist"),
+                )
+                continue
+            if result:
+                if index > 0:
+                    logger.info(
+                        "%s rescued by candidate %d: track=%r artist=%r",
+                        label,
+                        index,
+                        cand.get("track"),
+                        cand.get("artist"),
+                    )
+                return result, cand
+        return None, None
 
     def _run_language_classifier(self, song_path: str, info: dict | None) -> None:
         """Collect Tier 1 language signals and persist each at its rung.
@@ -2391,31 +2553,27 @@ class LyricsService:
         except Exception:
             logger.exception("failed to persist VTT language for song_id=%s", song_id)
 
-    def _fetch_lrc_with_itunes_fallback(self, info: dict | None) -> tuple[str | None, dict | None]:
-        """Query LRCLib; on miss, canonicalize metadata via iTunes and retry.
+    def _fetch_lrc_with_itunes_fallback(
+        self, info: dict | None, song_path: str | None = None
+    ) -> tuple[str | None, dict | None]:
+        """Query LRCLib across candidate ``(track, artist)`` pairs.
 
-        Returns (lrc_or_None, info_with_updated_fields_or_None). ``info`` is
-        returned with canonical artist/track when the iTunes fallback hit, so
-        later log lines show the cleaned names.
+        First candidate is ``info`` (DB defaults). On miss, retries with
+        each alternative credit produced by ``_metadata_candidates`` —
+        artist-token splits, filename regex_tidy, and iTunes/MusicBrainz
+        top hits. Returns ``(lrc_or_None, info_with_winning_fields)`` so
+        downstream log lines and DB writes see the canonical names that
+        actually hit.
         """
         if not info:
             return None, info
-        lrc = _fetch_lrclib(info["track"], info["artist"], info["duration"])
-        if lrc:
-            return lrc, info
-        clean = resolve_metadata(f"{info['artist']} - {info['track']}")
-        if not clean:
-            return None, info
-        logger.info(
-            "iTunes canonicalized %r / %r -> %r / %r",
-            info["artist"],
-            info["track"],
-            clean["artist"],
-            clean["track"],
-        )
-        lrc = _fetch_lrclib(clean["track"], clean["artist"], info["duration"])
-        if lrc:
-            info = {**info, "artist": clean["artist"], "track": clean["track"]}
+
+        def _fetch(cand: dict) -> str | None:
+            return _fetch_lrclib(cand["track"], cand["artist"], cand.get("duration"))
+
+        lrc, winner = self._try_with_candidates(_fetch, info, song_path, label="LRCLib")
+        if lrc and winner is not None:
+            return lrc, {**info, "artist": winner["artist"], "track": winner["track"]}
         return lrc, info
 
     def _upgrade_to_word_level(self, song_path: str, lrc: str, lyrics_sha: str | None) -> None:
@@ -2610,11 +2768,18 @@ class LyricsService:
         if not track or not artist:
             return False
         logger.info("Genius: querying track=%r artist=%r", track, artist)
-        try:
-            genius_text = _fetch_genius(track, artist)
-        except Exception:
-            logger.exception("Genius fetch crashed for %r / %r", artist, track)
-            return False
+
+        def _fetch(cand: dict) -> str | None:
+            text = _fetch_genius(cand["track"], cand["artist"])
+            if not text:
+                return None
+            if self._is_genius_language_mismatch(song_path, text):
+                return None
+            return text
+
+        genius_text, _winner = self._try_with_candidates(
+            _fetch, info, song_path, label="Genius (fallback)"
+        )
         if not genius_text:
             logger.info("Genius: miss track=%r artist=%r", track, artist)
             return False
@@ -2624,9 +2789,6 @@ class LyricsService:
             artist,
             len(genius_text),
         )
-
-        if self._is_genius_language_mismatch(song_path, genius_text):
-            return False
 
         self._emit_stage_notification(song_path, "Aligning Genius lyrics")
         _prewarm_stems(song_path)
@@ -3066,16 +3228,32 @@ class LyricsService:
                 lc.SourceResult(name="lrclib", kind="title_matched", lrc=lrclib_lrc, is_synced=True)
             )
 
-        # 3. Parallel fan-out: MXM, Megalobiz, Genius, Whisper
+        # 3. Parallel fan-out: MXM, Megalobiz, Genius, Whisper.
+        # Each text-source fetcher iterates ``_metadata_candidates`` so an
+        # artist-tag drift on the DB row doesn't deny the consensus voter
+        # an opinion from a source that would otherwise have one.
         providers = _consensus_providers()
         fetchers: dict[str, callable] = {}  # type: ignore[type-arg]
         if track and artist:
+
+            def _wrap(label: str, fn):
+                def _runner():
+                    result, _winner = self._try_with_candidates(
+                        lambda c: fn(c["track"], c["artist"]),
+                        info,
+                        song_path,
+                        label=label,
+                    )
+                    return result
+
+                return _runner
+
             if "musixmatch" in providers:
-                fetchers["musixmatch"] = lambda: _fetch_musixmatch(track, artist)
+                fetchers["musixmatch"] = _wrap("Musixmatch (consensus)", _fetch_musixmatch)
             if "megalobiz" in providers:
-                fetchers["megalobiz"] = lambda: _fetch_megalobiz(track, artist)
+                fetchers["megalobiz"] = _wrap("Megalobiz (consensus)", _fetch_megalobiz)
             if GENIUS_ACCESS_TOKEN:
-                fetchers["genius"] = lambda: _fetch_genius(track, artist)
+                fetchers["genius"] = _wrap("Genius (consensus)", _fetch_genius)
         if _whisper_fallback_enabled():
             fetchers["whisper"] = lambda: self._run_whisper_for_consensus(song_path)
 
@@ -3570,6 +3748,39 @@ def _artist_matches(artist: str, primary: str, others: list[str] | None = None) 
         if other_key:
             candidates.add(other_key)
     return bool(tokens & candidates)
+
+
+def _split_artist_credits(artist: str) -> list[str]:
+    """Return each collaborator from a multi-artist credit as a standalone string.
+
+    ``"Gibbs & Kiełas"`` -> ``["Gibbs", "Kiełas"]``. Casing and diacritics
+    are preserved (the splitter is for generating alternative search
+    queries, not for comparison). Tokens shorter than two chars are
+    dropped to match the matcher's behaviour. Single-artist strings
+    return a single-element list, which the candidate generator dedups
+    against the original.
+    """
+    if not artist:
+        return []
+    parts = _ARTIST_SPLIT_RE.split(artist.strip())
+    out: list[str] = []
+    for part in parts:
+        token = (part or "").strip()
+        if len(token) >= 2:
+            out.append(token)
+    return out
+
+
+def _candidate_dedup_key(track: str, artist: str) -> tuple[str, str]:
+    """Folded (track, artist) tuple used as the dedup key for candidates."""
+    return (_fold_for_match(track or ""), _fold_for_match(artist or ""))
+
+
+# Per-song candidate count cap. Holds total cost of an all-miss song to
+# at most ``_CANDIDATE_LIMIT`` rounds against each source. iTunes and
+# MusicBrainz are LRU-cached per query; Genius/Spotify/Tekstowo searches
+# pay a network round-trip per unique (track, artist) pair.
+_CANDIDATE_LIMIT = 8
 
 
 def _fetch_lrclib(track: str, artist: str, duration: int | float | None) -> str | None:
