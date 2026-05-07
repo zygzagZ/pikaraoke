@@ -30,6 +30,14 @@ def _no_classifier_http(monkeypatch):
     that fans out to syncedlyrics. Tests exercising the consensus path
     re-enable it via ``monkeypatch.setenv``.
 
+    ``resolve_metadata`` is the iTunes-canonicalize fallback inside
+    ``_fetch_lrc_with_itunes_fallback``. It dispatches through
+    ``music_metadata.search_itunes`` (different module namespace from
+    the classifier's ``_search_itunes_cached``), so mocking the latter
+    doesn't catch it. Default-stub to None — when the conftest HTTP
+    block raises, the lyrics pipeline aborts mid-flight and the parallel
+    VTT worker may not finish writing before the test asserts.
+
     Individual tests override these patches with ``with patch(...)`` as
     needed to drive specific classifier scenarios.
     """
@@ -52,6 +60,7 @@ def _no_classifier_http(monkeypatch):
             return_value=None,
         ),
         patch("pikaraoke.lib.lyrics._prewarm_stems"),
+        patch("pikaraoke.lib.lyrics.resolve_metadata", return_value=None),
     ):
         yield
 
