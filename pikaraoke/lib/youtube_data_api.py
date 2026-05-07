@@ -37,7 +37,7 @@ def batch_caption_info(video_ids: list[str], api_key: str) -> dict[str, bool]:
     probes — a partial degradation is better than blocking the search
     page on a misconfigured key.
     """
-    if not api_key or not video_ids:
+    if not (api_key or "").strip() or not video_ids:
         return {}
     # De-dupe while preserving order so we don't waste quota on repeats.
     seen: set[str] = set()

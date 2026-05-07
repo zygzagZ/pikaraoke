@@ -9,7 +9,7 @@ import requests
 
 
 @pytest.fixture(autouse=True)
-def _no_classifier_http():
+def _no_classifier_http(monkeypatch):
     """Keep the Tier 1 + Tier 2a classifier path hermetic in lyrics tests.
 
     ``LyricsService._run_language_classifier`` calls iTunes + MusicBrainz
@@ -22,9 +22,18 @@ def _no_classifier_http():
     info.json / no iTunes row). Loading the Whisper model at test time is
     ~5-15s of cold-start; stub it to a silent no-op by default.
 
+    ``_prewarm_stems`` shells out to ffmpeg and loads the Demucs model
+    (~80MB download from HuggingFace on first run) — no-op it.
+
+    ``LYRICS_CONSENSUS_ENABLED=0`` skips the consensus thread by default
+    so ``fetch_and_convert`` doesn't ``join(timeout=180)`` on a worker
+    that fans out to syncedlyrics. Tests exercising the consensus path
+    re-enable it via ``monkeypatch.setenv``.
+
     Individual tests override these patches with ``with patch(...)`` as
     needed to drive specific classifier scenarios.
     """
+    monkeypatch.setenv("LYRICS_CONSENSUS_ENABLED", "0")
     with (
         patch(
             "pikaraoke.lib.lyrics._search_itunes_cached",
@@ -42,6 +51,7 @@ def _no_classifier_http():
             "pikaraoke.lib.lyrics._probe_audio_language_whole_song",
             return_value=None,
         ),
+        patch("pikaraoke.lib.lyrics._prewarm_stems"),
     ):
         yield
 

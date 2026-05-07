@@ -1,11 +1,30 @@
 """Pytest fixtures for PiKaraoke tests."""
 
+from unittest.mock import patch
+
 import pytest
+import requests.adapters
 
 from pikaraoke.lib.events import EventSystem
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.queue_manager import QueueManager
 from pikaraoke.lib.song_manager import SongManager
+
+
+@pytest.fixture(autouse=True)
+def _block_real_http():
+    # Backstop against unmocked requests calls. A missing per-test patch
+    # otherwise hangs CI on Spotify's 90s rate-limit sleep, iTunes timeouts
+    # cascading across 1700 tests, etc. Tests that need HTTP must mock
+    # at the call site (patch("<module>.requests.get", ...)).
+    def _refuse(self, request, **kwargs):
+        raise RuntimeError(
+            f"Real HTTP not allowed in tests: {request.method} {request.url}. "
+            'Mock with patch("<module>.requests.get") at the call site.'
+        )
+
+    with patch.object(requests.adapters.HTTPAdapter, "send", _refuse):
+        yield
 
 
 class _MockStreamManager:

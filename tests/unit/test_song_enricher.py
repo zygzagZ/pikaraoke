@@ -8,6 +8,15 @@ from pikaraoke.lib import song_enricher
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
 
 
+@pytest.fixture(autouse=True)
+def _no_cover_download():
+    # iTunes hits carry an artwork URL; the enricher tries to download
+    # the cover via requests. The conftest HTTP block would otherwise
+    # raise on every test that doesn't explicitly mock _download_cover.
+    with patch.object(song_enricher, "_download_cover", return_value=False):
+        yield
+
+
 @pytest.fixture
 def db(tmp_path):
     d = KaraokeDatabase(str(tmp_path / "test.db"))
