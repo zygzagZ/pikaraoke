@@ -80,6 +80,16 @@ Tools: Black (100 char), isort, pycln, pylint, mdformat.
 
 PRs must include a test plan: a minimal checklist targeting only the changes made, enabling quick manual verification.
 
+## Branch Hygiene
+
+Every branch ships as a PR or gets deleted — nothing rots in between.
+
+- **No dangling features.** If a feature is worth starting, it's worth a PR. Open one (draft is fine) as soon as the change is testable; never accumulate finished-but-unpushed branches on disk.
+- **One branch in flight per topic.** Before starting new work, check `git branch -vv` and `git worktree list` for an existing branch on the same topic. Resume or close it — don't fork a parallel `feat/foo-v2`.
+- **Stale = dead.** A local branch with no PR and no commits in 7 days is dead. Either open a PR or `git branch -D` it. No "I'll get back to it" hoarding.
+- **Worktrees are ephemeral.** Delete the worktree the moment its experiment lands or dies (`git worktree remove`). Don't leave abandoned worktrees as bookmarks.
+- **Post-merge cleanup is mandatory.** After pulling master, prune every branch whose PR merged and every worktree pointing at one. Same step, every time.
+
 ## What NOT to Do
 
 - Add unrequested features

@@ -2,6 +2,7 @@
 *.swp
 .venv/
 .venv*
+venv/
 /.vscode/
 __pycache__/
 dist/
@@ -29,3 +30,6 @@ docker-compose.yml
 
 # JS test infra
 node_modules/
+
+# Lyrics provider runtime cache (musixmatch token, etc.)
+.syncedlyrics/
