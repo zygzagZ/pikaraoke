@@ -68,7 +68,7 @@ Net: 107 passed / 0 skipped across the affected files (was 105 + 3 silent skips)
 - **Plan said "next step: start implementation"**; actually shipped
   2026-04-28 (commit `12d927a7`), six days before this status update.
 
----
+______________________________________________________________________
 
 # Replace greedy line→anchor matching with global DP assignment
 

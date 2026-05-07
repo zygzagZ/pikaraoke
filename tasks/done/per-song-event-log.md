@@ -2,13 +2,12 @@
 
 ## Status (2026-05-04)
 
-**SHIPPED** — commit `f8e09b37 feat(events): per-song processing
-timeline on edit view`. The `song_events` ledger, mirror handler,
+**SHIPPED** — commit `f8e09b37 feat(events): per-song processing timeline on edit view`. The `song_events` ledger, mirror handler,
 emit points, JSON endpoint, and edit-view rendering all landed as
 designed. Out-of-scope items (live SocketIO on edit view, raw
 subprocess log capture) remain out of scope.
 
----
+______________________________________________________________________
 
 ## Goal
 
@@ -65,8 +64,7 @@ emit calls needed for the negative path.
 `song_enricher` is a module of free functions, not a class with an
 events handle. Follows the existing `demucs_processor.set_warning_hook`
 pattern: module-level `_event_hook` + `set_event_hook`. karaoke.py
-registers a forwarder at startup that calls `events.emit("song_event",
-...)` for every hook invocation.
+registers a forwarder at startup that calls `events.emit("song_event", ...)` for every hook invocation.
 
 `demucs_processor` already has `set_progress_hook` and `set_ready_hook`
 that karaoke.py wires into SocketIO. The `_forward_progress` and

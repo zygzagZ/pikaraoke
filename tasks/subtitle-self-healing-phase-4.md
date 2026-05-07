@@ -16,9 +16,7 @@ it durable and editable.
 
 Single retry worker (`SubtitleRetryWorker`) loop, 60s tick:
 
-- Query `subtitle_jobs WHERE state IN ('failed', 'rate_limited')
-  AND (next_retry_at IS NULL OR next_retry_at <= now())
-  AND attempt_count < MAX_ATTEMPTS`.
+- Query `subtitle_jobs WHERE state IN ('failed', 'rate_limited') AND (next_retry_at IS NULL OR next_retry_at <= now()) AND attempt_count < MAX_ATTEMPTS`.
 - Re-submit each via `SubtitleOrchestrator.retry(song_id, source)`.
 - Backoff schedule per `error_code`:
   - `http_429` / `rate_limited`: 1h, 4h, 24h, then give up.
@@ -34,6 +32,7 @@ Manual retry (chip long-press from Phase 2): bypasses backoff, resets
 ### "Report broken" feedback
 
 Chip context menu: "Mark as broken". Effect:
+
 - `subtitle_jobs` gets `quality_flag='bad'`.
 - `subtitle_source_trust` table accumulates per-source bias (rolling
   count of bad / total) — feeds Phase 3 score component.
@@ -60,6 +59,7 @@ Persisted per-song: next play of the same file uses the saved offset.
 ### In-browser lyrics editor
 
 Edit view gets an "Edit lyrics" tab with:
+
 - Monaco editor showing the active variant ASS (raw).
 - Waveform view (existing if there is one; otherwise
   `wavesurfer.js`-style visualization of the audio file).

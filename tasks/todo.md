@@ -1,5 +1,7 @@
 <!-- /autoplan restore point: /Users/zygzagz/.gstack/projects/zygzagZ-pikaraoke/master-autoplan-restore-20260504-163101.md -->
+
 <!-- prior restore point: /Users/zygzagz/.gstack/projects/zygzagZ-pikaraoke/master-autoplan-restore-20260504-143641.md -->
+
 # Phase 2: subtitle status chips — todo
 
 Scoped-down implementation of `subtitle-status-chips-phase-2.md`.
@@ -28,41 +30,39 @@ Pushes back on speculative config; defers retry-stub to Phase 4.
 
 ### New
 
-- [ ] `pikaraoke/static/js/subtitle-chips.js` — shared component
+- \[ \] `pikaraoke/static/js/subtitle-chips.js` — shared component
   (`createChipRow(songId, options)` returning `{ el, update(data), destroy() }`).
-- [ ] `pikaraoke/static/css/subtitle-chips.css` — chip styles using
+- \[ \] `pikaraoke/static/css/subtitle-chips.css` — chip styles using
   `var(--pk-*)` tokens, both themes.
-- [ ] `pikaraoke/routes/subtitle_jobs.py` — new blueprint:
+- \[ \] `pikaraoke/routes/subtitle_jobs.py` — new blueprint:
   - `GET /api/songs/<song_id>/subtitles` (moved from admin.py)
   - `POST /api/songs/subtitles/bulk` `{ song_ids: [int, ...] }` →
     `{ <song_id>: { active_source, sources: [...] } }` for queue rosettes.
-- [ ] `tests/js/subtitle-chips.test.js` — render states from fixtures
+- \[ \] `tests/js/subtitle-chips.test.js` — render states from fixtures
   (success/active, success/inactive, running, queued, failed, rate_limited).
-- [ ] `tests/unit/test_subtitle_jobs_routes.py` — bulk endpoint tests
+- \[ \] `tests/unit/test_subtitle_jobs_routes.py` — bulk endpoint tests
   (admin gate, missing ids, partial-found, malformed body, label embedded).
 
 ### Modified
 
-- [ ] `pikaraoke/karaoke.py` — register `subtitle_jobs_bp`. Embed `label`
+- \[ \] `pikaraoke/karaoke.py` — register `subtitle_jobs_bp`. Embed `label`
   field per source in payloads (or expose `/api/subtitle_sources/labels`).
-- [ ] `pikaraoke/routes/admin.py` — remove the `song_subtitles` route
+- \[ \] `pikaraoke/routes/admin.py` — remove the `song_subtitles` route
   (moved to new blueprint).
-- [ ] `pikaraoke/templates/splash.html` — replace `#lyrics-source` badge
+- \[ \] `pikaraoke/templates/splash.html` — replace `#lyrics-source` badge
   with `<div id="subtitle-chips" data-pk-chips></div>`.
-- [ ] `pikaraoke/static/js/splash.js` — drop `updateLyricsSourceBadge`,
+- \[ \] `pikaraoke/static/js/splash.js` — drop `updateLyricsSourceBadge`,
   fetch initial state from API, mount chip row, subscribe to
   `subtitle_job_update`. Autocollapse during playback, full when idle.
-- [ ] `pikaraoke/templates/base.html` — replace `data-pk-subtitle-src`
+- \[ \] `pikaraoke/templates/base.html` — replace `data-pk-subtitle-src`
   `<select>` with `<div data-pk-subtitle-chips>`. Include
   `subtitle-chips.css`/`.js`.
-- [ ] `pikaraoke/static/js/now-playing-bar.js` — drop
+- \[ \] `pikaraoke/static/js/now-playing-bar.js` — drop
   `updateSubtitleSourceSelect` and dropdown change handler; mount chip
   row, click → `POST /subtitle_source`.
-- [ ] `pikaraoke/templates/edit.html` — add `<section
-  class="pk-subtitle-state"><h3>Aktualny stan napisów</h3><div
-  data-pk-chips></div></section>` above the `.pk-events` block.
+- \[ \] `pikaraoke/templates/edit.html` — add `<section class="pk-subtitle-state"><h3>Aktualny stan napisów</h3><div data-pk-chips></div></section>` above the `.pk-events` block.
   Initialize chip row + `io()` socket connection in inline script.
-- [ ] `pikaraoke/templates/home.html` — extend `renderQueue()` to add
+- \[ \] `pikaraoke/templates/home.html` — extend `renderQueue()` to add
   rosette `<div class="pk-queue-rosette" data-song-id></div>` inside
   `.pk-queue-body`. After render, batch-fetch via bulk endpoint, mount
   chip rows in compact (rosette) mode. Subscribe to
@@ -101,12 +101,12 @@ Pushes back on speculative config; defers retry-stub to Phase 4.
 - Edit view: auto-updates as enrichment progresses, no Refresh click
   needed for chip state (timeline still uses Refresh for the log).
 
----
+______________________________________________________________________
 
 # /autoplan — Phase 1 (CEO) findings
 
 Voices: Plan agent (primary, full plan-ceo-review methodology) + Claude subagent
-(independent CEO/strategist, cold read). Codex unavailable. Tag: **[subagent-only]**.
+(independent CEO/strategist, cold read). Codex unavailable. Tag: **\[subagent-only\]**.
 Full CEO artifact: `~/.gstack/projects/zygzagZ-pikaraoke/master-ceo-review-20260504-143641.md`.
 
 ## CEO Dual Voices — Consensus Table
@@ -125,33 +125,33 @@ contract is broken; new blueprint is questionable in single-owner repo.
 
 ## Critical scope gaps to resolve before implementation
 
-1. **Queue items lack `song_id`** (Plan agent §0A, §0B). The bulk endpoint as
-   designed cannot serve queue rosettes without resolving `file → song_id`.
-   Either add `song_id` to queue items in `queue_manager.py`, or change bulk API
-   to accept `{files: [str]}`. Outside chip blast radius — Approach C defers.
-2. **Edit view second-`io()` bug** (Plan agent §0A). `edit.html` extends
-   `base.html`, which already creates `window.socket` at line 103. Plan as
-   written would create a second socket connection. Use `window.socket`.
-3. **No JS-load fallback** (Plan agent §7). If `subtitle-chips.js` fails to load
-   or throw on mount, operator loses source picker entirely. Keep `<select>`
-   hidden as fallback; show it if chip mount fails.
-4. **Pre-Phase-1 songs have empty `subtitle_jobs`** (Plan agent §0E Hour 1).
-   Chip row must render `DEFAULT_AUTO_SOURCES` as `na/skipped` chips when API
-   returns empty `sources` — not blank.
-5. **`label` missing from `subtitle_job_update` socket payload** (Plan agent
-   §0B). One-line `orchestrator.py:307` change to embed `label` so chip
-   component doesn't need separate label-registry fetch.
-6. **MAX_BULK undefined** (Plan agent §5). DoS risk on Pi 3 with large
-   `{song_ids: [...]}`. Enforce MAX_BULK=100, return 400 if exceeded.
-7. **Component `destroy()` lifecycle not explicit** (Plan agent §1). Song
-   change in now-playing-bar without `destroy()` = leaked socket listener.
-8. **JS tests violate CLAUDE.md** (Plan agent §3). Plan listed
-   "render states from fixtures" — DOM testing. CLAUDE.md prohibits DOM
-   mocking in vitest. Extract pure functions: `computeRosetteLabel`,
-   `deriveChipState`, `computeCountdown`, `sortSourcesCanonically`.
-9. **Bulk API contract: dict-by-song_id silently dedupes** (Subagent #3).
-   Same song queued twice → only one entry returned. Either return list keyed
-   by queue position, or document the dedup behavior explicitly.
+01. **Queue items lack `song_id`** (Plan agent §0A, §0B). The bulk endpoint as
+    designed cannot serve queue rosettes without resolving `file → song_id`.
+    Either add `song_id` to queue items in `queue_manager.py`, or change bulk API
+    to accept `{files: [str]}`. Outside chip blast radius — Approach C defers.
+02. **Edit view second-`io()` bug** (Plan agent §0A). `edit.html` extends
+    `base.html`, which already creates `window.socket` at line 103. Plan as
+    written would create a second socket connection. Use `window.socket`.
+03. **No JS-load fallback** (Plan agent §7). If `subtitle-chips.js` fails to load
+    or throw on mount, operator loses source picker entirely. Keep `<select>`
+    hidden as fallback; show it if chip mount fails.
+04. **Pre-Phase-1 songs have empty `subtitle_jobs`** (Plan agent §0E Hour 1).
+    Chip row must render `DEFAULT_AUTO_SOURCES` as `na/skipped` chips when API
+    returns empty `sources` — not blank.
+05. **`label` missing from `subtitle_job_update` socket payload** (Plan agent
+    §0B). One-line `orchestrator.py:307` change to embed `label` so chip
+    component doesn't need separate label-registry fetch.
+06. **MAX_BULK undefined** (Plan agent §5). DoS risk on Pi 3 with large
+    `{song_ids: [...]}`. Enforce MAX_BULK=100, return 400 if exceeded.
+07. **Component `destroy()` lifecycle not explicit** (Plan agent §1). Song
+    change in now-playing-bar without `destroy()` = leaked socket listener.
+08. **JS tests violate CLAUDE.md** (Plan agent §3). Plan listed
+    "render states from fixtures" — DOM testing. CLAUDE.md prohibits DOM
+    mocking in vitest. Extract pure functions: `computeRosetteLabel`,
+    `deriveChipState`, `computeCountdown`, `sortSourcesCanonically`.
+09. **Bulk API contract: dict-by-song_id silently dedupes** (Subagent #3).
+    Same song queued twice → only one entry returned. Either return list keyed
+    by queue position, or document the dedup behavior explicitly.
 10. **`error_message` rendered as innerHTML risks XSS** (Plan agent §5).
     Use `textContent` or `setAttribute('title', ...)`.
 
@@ -208,7 +208,7 @@ contract is broken; new blueprint is questionable in single-owner repo.
 | 10 | CEO | Mark "new blueprint vs inline admin.py" as taste decision | n/a | Both voices disagree |
 | 11 | CEO | Source order returned from API canonically (not hard-coded JS) | P4 (DRY) | Single source of truth for ordering |
 
----
+______________________________________________________________________
 
 # /autoplan — premise gate RESOLVED (2026-05-04)
 
@@ -220,6 +220,7 @@ treatment per surface.
 ## LOCKED — Phase 2 UI direction
 
 ### Splash (TV)
+
 - **Single corner badge** at **top-left** (top-right is `#top-container`,
   bottom corners are `#bottom-container` / up-next).
 - Shows **only the active source + status**. No row of chips, no shimmer
@@ -233,6 +234,7 @@ treatment per surface.
 - Operator monitors and switches from the remote, not the splash.
 
 ### Phone / now-playing-bar (full panel)
+
 - **Smart dropdown** in the **existing `pk-tool-subtitle-src` slot**
   inside the now-playing-bar full panel (`base.html:529`). DO NOT MOVE
   the slot.
@@ -241,7 +243,7 @@ treatment per surface.
   `npb-tools` becomes: Wokal → Podkład → Źródło.
 - Native `<select>` is replaced by a custom popover button:
   - Trigger: `[● LRCLib + sync]   [5/7 ✓]   [▼]` — active glyph + label
-    + ready-count summary + arrow.
+    - ready-count summary + arrow.
   - Popover: each row is `[glyph] [label] [status suffix]` with
     `running`/`failed`/`rate_limited`/`queued` rows disabled
     (visible-but-unpickable).
@@ -258,6 +260,7 @@ treatment per surface.
     in `now-playing-bar.js:489`.
 
 ### Queue list
+
 - **Rosette `N/7` per row** at the right edge of each `.pk-queue-row`
   in `home.html:473-491`. Color-coded count: green (≥4), amber (1–3),
   red (0), spinner (any source running).
@@ -266,6 +269,7 @@ treatment per surface.
   `song_id`) is not resolved in this PR.
 
 ### Edit view
+
 - Live-updated **chip row** above the existing `Historia przetwarzania`
   block. Read-only display of all sources with state. Uses
   `window.socket` (NOT a second `io()`).
@@ -283,6 +287,7 @@ treatment per surface.
 ## File count (revised)
 
 Phase 2 (now): **6 files** (within 8-file threshold ✓)
+
 - NEW: `pikaraoke/static/js/subtitle-source-picker.js` — smart dropdown
   for now-playing-bar + corner badge for splash. Single module, two
   exported render functions.
@@ -300,6 +305,7 @@ Phase 2 (now): **6 files** (within 8-file threshold ✓)
   `updateSubtitleSourceSelect`, mount the smart picker.
 
 Plus required Phase 1 amendments (one-line each):
+
 - `pikaraoke/lib/subtitle_orchestrator.py:307` — embed `label` in
   `subtitle_job_update` payload.
 - `pikaraoke/karaoke.py` — register `subtitle_jobs_bp`.
@@ -357,7 +363,7 @@ rosette, edit view chip row, queue_manager.py change to embed
 | 16 | CEO→user | **Component naming:** `subtitle-source-picker.js` (not `subtitle-chips.js`) since chips are not the primary primitive anymore. | P5 explicit | Picker is the dominant UI; chips appear only in queue rosette expand + edit view (Phase 2.5). |
 | 17 | CEO→user | **Subagent #6 LOW (new blueprint bureaucracy):** OVERRIDDEN. Keep `routes/subtitle_jobs.py` because it'll house bulk endpoint + Phase 2.5's queue endpoints. Consolidating in admin.py would force another move later. | P3 pragmatic | Two endpoints today, four in Phase 2.5+. Worth the file move now. |
 
----
+______________________________________________________________________
 
 # /autoplan — Phase 2 (Design review) on the LOCKED direction
 
@@ -376,7 +382,7 @@ in existing slot. Design review focuses on:
 
 Will dispatch the Phase 2 design review next.
 
----
+______________________________________________________________________
 
 # /autoplan — Phase 2 (Design review) findings
 
@@ -405,6 +411,7 @@ collision (`#ap-container` already at top-left).
 ## Findings — auto-decide rules
 
 Per /autoplan Phase 2 rules:
+
 - **Structural** (missing states, broken hierarchy, a11y) → auto-fix (P5)
 - **Aesthetic/taste** → mark TASTE DECISION
 - **Design-system alignment** with obvious fix → auto-fix
@@ -422,8 +429,7 @@ badge above ap-container). Implementation note: keep badge `z-index` above
 shadow on small TVs (720p edge case).
 
 **P1.2 — Trigger row visual height vs interactive height** *(both)*
-Mockup `.pk-tool-subtitle-src { padding: 12px 14px }` outer + `.smart-trigger
-{ min-height: 40px }` inner = 64px visible row but only 40px clickable hit area.
+Mockup `.pk-tool-subtitle-src { padding: 12px 14px }` outer + `.smart-trigger { min-height: 40px }` inner = 64px visible row but only 40px clickable hit area.
 **Severity: HIGH (a11y).**
 **Auto-fix (P1+P5):** Set `.smart-trigger` to `min-height: 44px` and bump option
 rows to `min-height: 44px`. Total width unaffected. iOS HIG compliant.
@@ -434,8 +440,7 @@ rows to `min-height: 44px`. Total width unaffected. iOS HIG compliant.
 `rgba(0,0,0,0.45)` + `backdrop-filter: blur(6px)` is insufficient on white
 title cards / bright concert footage. Subagent: text-shadow pattern already
 exists on `.sp-now-title` (`text-shadow: 0 2px 16px rgba(0,0,0,0.8)`). **Severity: HIGH.**
-**Auto-fix (P5):** Adopt the same pattern — add `text-shadow: 0 1px 4px
-rgba(0,0,0,0.9)` to badge text, bump background to `rgba(0,0,0,0.58)`, add
+**Auto-fix (P5):** Adopt the same pattern — add `text-shadow: 0 1px 4px rgba(0,0,0,0.9)` to badge text, bump background to `rgba(0,0,0,0.58)`, add
 `box-shadow: 0 0 0 1px rgba(0,0,0,0.4)` for outer ring. (DESIGN.md doesn't
 exist; aligning with established splash overlay pattern instead.)
 
@@ -483,6 +488,7 @@ row, call `showNotification(message, 'is-error')` (existing helper at
 Plan calls out `aria-haspopup="listbox"` but doesn't specify Esc/Arrow/Enter
 behaviour. **Severity: MEDIUM.**
 **Auto-fix:** Specify in `subtitle-source-picker.js`:
+
 - `Enter`/`Space` on trigger → open popover, focus active row
 - `ArrowUp`/`ArrowDown` → cycle enabled rows (skip disabled)
 - `Enter`/`Space` on row → trigger tap path
@@ -496,15 +502,13 @@ Hot pink (Late Show `--pk-danger: #ff4d8f`) reads as "accent" not "alarm" from
 2-3m. Static border colour change is insufficient. **Severity: MEDIUM.**
 **Decision:** TASTE — competing principles. P1 (completeness) says add a pulse;
 P3 (pragmatic) says the operator knows the splash is decorative and watches the
-remote. Recommended: subtle 2s background pulse `rgba(danger, 0.15) ↔
-rgba(danger, 0.35)` — closer to "ambient indicator" than "klaxon". Surface to
+remote. Recommended: subtle 2s background pulse `rgba(danger, 0.15) ↔ rgba(danger, 0.35)` — closer to "ambient indicator" than "klaxon". Surface to
 user at gate.
 
 **P5.2 — "brak napisów" used as both label and status** *(subagent)*
 On error, what fills the badge's source-name slot? Plan implies "brak napisów"
 goes there — looks like a fictional source. **Severity: MEDIUM.**
-**Auto-fix (P5):** Structure: `source-name = "—"` (em-dash) + `status = "brak
-napisów"`. Keeps slot semantics consistent across all 4 states.
+**Auto-fix (P5):** Structure: `source-name = "—"` (em-dash) + `status = "brak napisów"`. Keeps slot semantics consistent across all 4 states.
 
 ### Pass 6: Specificity gaps
 
@@ -568,11 +572,13 @@ radius (P2). Recommended IN SCOPE; surface to user at gate.
 ## Mandatory outputs
 
 **NOT in scope (Phase 2):**
+
 - Animated entry/exit for popover (open/close currently `display: none` toggle).
   Defer to Phase 3 if user wants polish (P3 pragmatic — current is shippable).
 - DESIGN.md authoring (none exists; deferred — out of scope).
 
 **What already exists:**
+
 - `text-shadow: 0 2px 16px rgba(0,0,0,0.8)` pattern on `.sp-now-title`.
 - `showNotification(message, categoryClass, timeout)` in `base.html:112`.
 - `pkSig` re-render guard pattern in `now-playing-bar.js:489`.
@@ -581,6 +587,7 @@ radius (P2). Recommended IN SCOPE; surface to user at gate.
   current dropdown — partial overlap with new `/api/songs/<id>/subtitles`).
 
 **Phase 2 design completion summary:**
+
 - Status: **REVIEW COMPLETE** with 13 auto-fixes folded into spec, 3 taste
   decisions surfaced for user.
 - Critical structural gaps closed: ap-container collision, 4th badge state,
@@ -591,7 +598,7 @@ radius (P2). Recommended IN SCOPE; surface to user at gate.
 additional (#ap-container collision). Consensus: 7/7 confirmed. 3 taste
 decisions surfaced at gate. Passing to Phase 3.
 
----
+______________________________________________________________________
 
 # /autoplan — Phase 3 (Eng review) findings
 
@@ -649,6 +656,7 @@ DELETED: routes/admin.py:115 song_subtitles route (moved)
 ```
 
 **Coupling assessment:**
+
 - One module exporting two factory functions (badge + picker) is defensible but borderline. They share ~20% of pure-function logic (`sortSourcesCanonically`, `deriveOptionState`) and ~0% of DOM/lifecycle code. Recommended IN SCOPE; keep as a single module for Phase 2 (small enough). If Phase 2.5's queue rosette adds a third factory, split then.
 - The `_SUBTITLE_SOURCE_LABELS` lift to `karaoke_database.py` resolves the otherwise-circular orchestrator → karaoke.py path that subagent F1 flagged.
 
@@ -671,7 +679,7 @@ Cross-voice agreement on all 6 dimensions. Three HIGH severity findings: F1
 
 ### HIGH
 
-**F1 — Circular import risk: orchestrator → karaoke._SUBTITLE_SOURCE_LABELS**
+**F1 — Circular import risk: orchestrator → karaoke.\_SUBTITLE_SOURCE_LABELS**
 Verified: `karaoke.py:509` already does deferred (in-method) import of
 `SubtitleOrchestrator` to dodge the cycle. `subtitle_orchestrator.py:28`
 already imports from `karaoke_database`. Fix: lift `_SUBTITLE_SOURCE_LABELS`
@@ -680,18 +688,16 @@ module-level. Both orchestrator and the new route can import it.
 **Auto-fix (P5).**
 
 **F2 — Two incompatible source DTOs (`status` vs `state`)**
+
 - `now_playing_update.subtitle_sources[*]` shape (existing, computed by
-  `_get_subtitle_sources_for_now_playing` at karaoke.py:1489): `{source,
-  label, status: ready|downloading|na, downloadable}`
-- `/api/songs/<id>/subtitles` `sources[*]` shape (new): `{id, state:
-  queued|running|success|failed|rate_limited, tier, error_code,
-  error_message, ...}`
+  `_get_subtitle_sources_for_now_playing` at karaoke.py:1489): `{source, label, status: ready|downloading|na, downloadable}`
+- `/api/songs/<id>/subtitles` `sources[*]` shape (new): `{id, state: queued|running|success|failed|rate_limited, tier, error_code, error_message, ...}`
 - Picker has to consume both. Subagent's recommended fix: translate
   `state → status` at the route level so the frontend has one vocabulary.
-**Auto-fix (P5):** route layer translates DB `state` to UI `status` and
-embeds `label`. Frontend never sees raw DB enum. Apply in both
-`subtitle_jobs.py` (GET single + POST bulk) and `subtitle_orchestrator.py`
-emit (line 307). **One canonical UI DTO.**
+  **Auto-fix (P5):** route layer translates DB `state` to UI `status` and
+  embeds `label`. Frontend never sees raw DB enum. Apply in both
+  `subtitle_jobs.py` (GET single + POST bulk) and `subtitle_orchestrator.py`
+  emit (line 307). **One canonical UI DTO.**
 
 **F4 — Corner badge collides with `#ap-container` (top-left)**
 Already covered by Phase 2 P1.1 (consensus 2/2). Subagent's fix —
@@ -742,7 +748,8 @@ or server-side? Subagent's recommendation: synthesize at the route
 level so the frontend stays dumb. **Auto-fix (P5):** in
 `subtitle_jobs.py`, when DB returns no rows for a song, synthesize
 placeholder records from `DEFAULT_AUTO_SOURCES` with `state="na"`
-+ `tier=null` + nulls for all other fields. Same for the bulk endpoint.
+
+- `tier=null` + nulls for all other fields. Same for the bulk endpoint.
 
 **F13 — Corner badge has no pure-function test export**
 Plan listed 4 pure helpers; all are dropdown-related. Badge mapping
@@ -778,8 +785,8 @@ to one query so this is a non-issue post-fix. No action.
 *Primary observation, not in subagent output.* The picker on now-playing-bar
 already receives `data.subtitle_sources` via the existing `now_playing_update`
 socket event. Adding a new GET (`/api/songs/<id>/subtitles`) for the picker
-is a second source of truth for the same data, just with `state/tier/
-error_*` added.
+is a second source of truth for the same data, just with `state/tier/ error_*` added.
+
 - Option A: keep new GET endpoint (current plan). Pro: bulk version is
   reused for Phase 2.5 queue. Con: 2 sources of truth for picker data;
   one extra HTTP round-trip per song change.
@@ -934,7 +941,7 @@ feedback. Folded in (D#25 + D#42).
 the same teardown sequence: close popover synchronously, remove listeners,
 remove element. Folded in (D#24 + D#39).
 
----
+______________________________________________________________________
 
 # /autoplan — Phase 4 (Final approval gate) — APPROVED 2026-05-04 16:43
 
@@ -952,6 +959,7 @@ User approved as-is. All 4 taste decisions accepted at recommended option:
 Phase 2 ships **5 files** (down from 6 — T1 dropped the single-song GET):
 
 NEW:
+
 - `pikaraoke/static/js/subtitle-source-picker.js` — exports `mountCornerBadge`,
   `mountSmartPicker` factories + 5 pure helpers (`computeReadySummary`,
   `deriveOptionState`, `computeCountdown`, `sortSourcesCanonically`,
@@ -963,6 +971,7 @@ NEW:
   - `POST /api/songs/subtitles/bulk` (consumed by Phase 2.5 queue rosettes)
 
 MODIFIED:
+
 - `pikaraoke/templates/splash.html` — remove `#lyrics-source` from
   `#top-container`; add badge mount as third child of `#ap-container`
   (top-left, after `#clock` and `#hostap`).
@@ -975,6 +984,7 @@ MODIFIED:
   `LYRICS_SOURCE_LABELS`; mount `mountCornerBadge` on song change.
 
 AMENDMENTS (one-line each):
+
 - `pikaraoke/lib/subtitle_orchestrator.py:307` — embed `label` + translated
   `status` in `subtitle_job_update` payload.
 - `pikaraoke/karaoke.py` — register `subtitle_jobs_bp`. `_SUBTITLE_SOURCE_LABELS`
@@ -984,6 +994,7 @@ AMENDMENTS (one-line each):
   dict + `get_subtitle_jobs_bulk(song_ids)` method using `IN(...)`.
 
 NEW TESTS:
+
 - `tests/unit/test_subtitle_jobs_routes.py` — bulk endpoint suite (admin gate,
   MAX_BULK, malformed body, partial-found, dedupe, label embedded, pre-Phase-1
   synthesis, single-query assertion).
@@ -1031,8 +1042,7 @@ NEW TESTS:
 on PR #228 and #242).
 
 Next steps:
+
 - `/ship` when ready to create the PR.
 - Implement step-by-step per "Implementation order" above; commit after
   each numbered step.
-
-

@@ -21,8 +21,7 @@ probe), and today the enricher fires once at the very start.
 - Every later language-write site (Tier 1 classifier in `lyrics.py`,
   Tier 2a `whisper_probe_raw`, Tier 2b `whisper_probe_stems`) gets a
   re-enrich dispatch immediately after persisting the new language.
-- `enrich_song` is **self-idempotent**: if `songs.metadata_status ==
-  'enriched'` and `songs.language_at_enrich == songs.language`, it
+- `enrich_song` is **self-idempotent**: if `songs.metadata_status == 'enriched'` and `songs.language_at_enrich == songs.language`, it
   returns without touching iTunes. Otherwise it re-runs the iTunes
   search (LRU-cached, so repeated calls are free), picks the first hit
   whose derived language matches `songs.language`, and stamps
@@ -50,7 +49,7 @@ the new flow never enriches without a language signal.
 
 ### Schema
 
-- [ ] `pikaraoke/lib/karaoke_database.py`
+- \[ \] `pikaraoke/lib/karaoke_database.py`
   - `ALTER TABLE songs ADD COLUMN language_at_enrich TEXT;` (idempotent
     migration block, same pattern as the existing `audio_sha256` /
     `metadata_sources` columns).
@@ -59,27 +58,25 @@ the new flow never enriches without a language signal.
 
 ### Modified
 
-- [ ] `pikaraoke/lib/lyrics_language_classifier.py`
+- \[ \] `pikaraoke/lib/lyrics_language_classifier.py`
   - Expose `COUNTRY_TO_LANG` (drop leading underscore) and
     `signal_itunes_text` (renamed from `_signal_itunes_text`) — both
     needed by the enricher's per-hit language derivation. Keep all
     other helpers private.
-  - Add `pre_itunes_signals(*, yt_info, db_title, db_artist) ->
-    list[LanguageSignal]`: thin wrapper around `collect_signals` with
+  - Add `pre_itunes_signals(*, yt_info, db_title, db_artist) -> list[LanguageSignal]`: thin wrapper around `collect_signals` with
     `itunes_hit=None, mb_signals=None`. Documents the
     "no-iTunes-yet" use case.
   - Existing `classify_and_persist` unchanged.
-- [ ] `pikaraoke/lib/music_metadata.py`
+- \[ \] `pikaraoke/lib/music_metadata.py`
   - Extract `_project_full_hit(raw_full_hit) -> dict` from
     `fetch_itunes_track`. `fetch_itunes_track` becomes a thin
     `search_itunes_full(..., limit=1) → _project_full_hit` wrapper.
     Both the enricher and existing callers use the same projection.
-- [ ] `pikaraoke/lib/song_enricher.py`
+- \[ \] `pikaraoke/lib/song_enricher.py`
   - Add `_hit_language(itunes_full_hit) -> str | None`: runs
     `signal_itunes_text` on the full hit, falls back to
     `COUNTRY_TO_LANG.get(country)`. Returns the primary subtag or None.
-  - Add `_pick_hit_for_language(candidates, expected_lang) ->
-    tuple[dict|None, str]`: returns `(chosen_hit, reason)` where
+  - Add `_pick_hit_for_language(candidates, expected_lang) -> tuple[dict|None, str]`: returns `(chosen_hit, reason)` where
     reason is `lang_match` or `no_match`. With `expected_lang=None`
     this isn't called — the enricher early-returns to
     `awaiting_language`.
@@ -104,7 +101,7 @@ the new flow never enriches without a language signal.
        `language_at_enrich = expected_lang`.
   - Drop `fetch_itunes_track` import (replaced by
     `search_itunes_full` + `_project_full_hit`).
-- [ ] `pikaraoke/lib/song_manager.py`
+- \[ \] `pikaraoke/lib/song_manager.py`
   - In `register_download`, after info.json seeding and before
     `_start_enrichment`:
     - Read info.json into a dict (use the existing
@@ -115,7 +112,7 @@ the new flow never enriches without a language signal.
       the winning rung.
   - `_start_enrichment` always fires (even with no consensus) — the
     enricher handles `awaiting_language` itself.
-- [ ] `pikaraoke/lib/lyrics.py`
+- \[ \] `pikaraoke/lib/lyrics.py`
   - Around `classify_and_persist` (line ~1806): if it returned a
     verdict, dispatch `enrich_song` in a daemon thread.
   - Around the Tier-2a `whisper_probe_raw` persist (line ~1873):
@@ -127,7 +124,7 @@ the new flow never enriches without a language signal.
     (`_dispatch_reenrich(song_id, song_path)`) at module scope —
     same daemon-thread pattern song_manager already uses, with
     deferred import to avoid cycles.
-- [ ] `pikaraoke/templates/edit.html`
+- \[ \] `pikaraoke/templates/edit.html`
   - Add `<section class="pk-edit-metadata">` between `pk-edit-sources`
     and `pk-events`. Renders only when `metadata_status` is one of
     `awaiting_language` / `language_mismatch`.
@@ -139,7 +136,7 @@ the new flow never enriches without a language signal.
     Ustaw ręcznie."
   - CSS chips reuse `--pk-amber` / `--pk-amber-2` and the existing
     `pk-event.is-warning` / `is-error` border-left pattern.
-- [ ] `pikaraoke/routes/files.py`
+- \[ \] `pikaraoke/routes/files.py`
   - In `edit_file`, fetch `row = k.db.get_song_by_id(song_id)` once;
     pass `metadata_status` and `row_language` (`row["language"]`) to
     the template.
@@ -150,7 +147,7 @@ the new flow never enriches without a language signal.
 
 ## Tests
 
-- [ ] `tests/unit/test_song_enricher.py`
+- \[ \] `tests/unit/test_song_enricher.py`
   - `test_skips_when_no_language_signal_yet` — no whisper cache, no
     `songs.language`, mock `search_itunes_full` (must NOT be called).
     Assert `metadata_status='awaiting_language'`, no fields written.
@@ -173,7 +170,7 @@ the new flow never enriches without a language signal.
     fields written, `metadata_status='language_mismatch'`.
   - `test_keeps_variant_guard` — `_itunes_adds_variant` still fires
     after the language filter passes.
-- [ ] `tests/unit/test_song_manager.py` (or extend if exists)
+- \[ \] `tests/unit/test_song_manager.py` (or extend if exists)
   - `test_register_download_runs_pre_itunes_classifier` — info.json
     with Polish title, no other signals. Assert `songs.language`
     is set to `pl` from `yt_title_lang` consensus, enrich is
@@ -182,17 +179,17 @@ the new flow never enriches without a language signal.
     info.json title, no info.json language, no manual subs. Assert
     `songs.language` stays empty, enricher dispatched anyway and
     stamps `awaiting_language`.
-- [ ] `tests/unit/test_music_metadata.py`
+- \[ \] `tests/unit/test_music_metadata.py`
   - `test_fetch_itunes_track_uses_shared_projection` — extracted
     helper produces the same shape `fetch_itunes_track` returns
     today.
-- [ ] `tests/unit/test_files_routes.py` (create or extend)
+- \[ \] `tests/unit/test_files_routes.py` (create or extend)
   - `test_edit_page_chip_for_language_mismatch` — seed row with
     `metadata_status='language_mismatch'`, assert chip in HTML.
   - `test_edit_page_chip_for_awaiting_language` — same for the
     awaiting state.
   - `test_edit_page_no_chip_for_enriched` — assert chip absent.
-- [ ] `tests/unit/test_lyrics_language_classifier.py`
+- \[ \] `tests/unit/test_lyrics_language_classifier.py`
   - `test_pre_itunes_signals_excludes_itunes_and_mb` — assert it's
     `collect_signals` minus the iTunes/MB extractors.
 
@@ -235,15 +232,15 @@ the new flow never enriches without a language signal.
 
 ## Verification checklist
 
-- [ ] All existing `tests/unit/test_song_enricher.py` cases still
+- \[ \] All existing `tests/unit/test_song_enricher.py` cases still
   pass (no regression in the happy path).
-- [ ] New language-driven cases pass.
-- [ ] Pedalini ends up at `language_mismatch` with no textual
+- \[ \] New language-driven cases pass.
+- \[ \] Pedalini ends up at `language_mismatch` with no textual
   iTunes fields.
-- [ ] A known-good Polish song (e.g. id=95 Edyta Górniak) ends up
+- \[ \] A known-good Polish song (e.g. id=95 Edyta Górniak) ends up
   `enriched` with the same iTunes fields it has today.
-- [ ] A known-good English song (e.g. id=86 Jessie J) ends up
+- \[ \] A known-good English song (e.g. id=86 Jessie J) ends up
   `enriched` with English iTunes fields.
-- [ ] Edit page renders the right chip variant for each non-enriched
+- \[ \] Edit page renders the right chip variant for each non-enriched
   state.
-- [ ] Pre-commit clean.
+- \[ \] Pre-commit clean.

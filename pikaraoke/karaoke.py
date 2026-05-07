@@ -1877,9 +1877,7 @@ class Karaoke:
         with self._subtitle_offsets_lock:
             return self._subtitle_offsets.get((song_id, source), 0.0)
 
-    def set_subtitle_offset(
-        self, song_id: int | None, source: str | None, offset: float
-    ) -> float:
+    def set_subtitle_offset(self, song_id: int | None, source: str | None, offset: float) -> float:
         """Store an offset for ``(song_id, source)`` and return the clamped value."""
         clamped = max(self.SUBTITLE_OFFSET_MIN, min(self.SUBTITLE_OFFSET_MAX, float(offset)))
         # Round to 2 decimals so the stored value matches what the UI shows;

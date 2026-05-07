@@ -15,7 +15,6 @@
   the bug recurs, look for `metadata_status='error'` rows and the
   `enrich_song crashed for song_id=…` log line they leave behind.
 
-
 ## Symptom
 
 All recently downloaded songs (12/12 inspected, IDs 100–111, downloaded
@@ -86,8 +85,7 @@ Three possibilities:
 1. Add `logger.info("register_download CALLED for %s", song_path)` and
    `logger.info("_start_enrichment dispatched for song_id=%d", song_id)`
    to `song_manager.py`.
-2. Add `logger.info("enrich_song START %s", song_path)` and a `try/
-   finally` that always logs at exit in `song_enricher.py:enrich_song`.
+2. Add `logger.info("enrich_song START %s", song_path)` and a `try/ finally` that always logs at exit in `song_enricher.py:enrich_song`.
 3. Download a song through the UI and grep the logs for those markers.
 4. If `register_download CALLED` is missing → check event wiring
    (`karaoke.py:488`) and `LibraryScanner` interaction.
