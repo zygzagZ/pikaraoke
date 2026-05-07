@@ -324,3 +324,141 @@ class TestFairQueuePosition:
 
         # add_to_front should still put song at position 0
         assert mock_karaoke.queue_manager.queue[0]["file"] == "/songs/a2---a02.mp4"
+
+
+class TestReorderWithCurrent:
+    """Tests for Karaoke.reorder_with_current — drag-and-drop including the
+    currently playing song as virtual index 0."""
+
+    @staticmethod
+    def _start_playing(k, file_path: str, user: str = "Singer") -> None:
+        pc = k.playback_controller
+        pc.now_playing = file_path.split("/")[-1].split("---")[0]
+        pc.now_playing_filename = file_path
+        pc.now_playing_user = user
+        pc.is_playing = True
+        pc.is_paused = False
+
+    def test_promote_queue_top_to_now_playing_skips_current(self, mock_karaoke):
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+        mock_karaoke.queue_manager.enqueue("/songs/later---lat001.mp4", "Cara")
+
+        result = mock_karaoke.reorder_with_current(1, 0)
+
+        assert result is True
+        # Current was demoted (skip reset playback state) and the dragged
+        # queue[0] was promoted to position 0 of the queue, ready for the
+        # run loop's pop_next.
+        assert mock_karaoke.playback_controller.is_playing is False
+        files = [item["file"] for item in mock_karaoke.queue_manager.queue]
+        assert files == [
+            "/songs/next---nxt001.mp4",
+            "/songs/current---cur001.mp4",
+            "/songs/later---lat001.mp4",
+        ]
+
+    def test_demote_current_to_immediate_next_slot(self, mock_karaoke):
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+        mock_karaoke.queue_manager.enqueue("/songs/third---thr001.mp4", "Cara")
+
+        # Drag current down one slot. Sortable.js newIndex is the
+        # post-move position of the dragged item, so dropping at the gap
+        # between next and third lands current at queue[1] (next promoted
+        # to head, current right behind it).
+        result = mock_karaoke.reorder_with_current(0, 1)
+
+        assert result is True
+        assert mock_karaoke.playback_controller.is_playing is False
+        files = [item["file"] for item in mock_karaoke.queue_manager.queue]
+        assert files == [
+            "/songs/next---nxt001.mp4",
+            "/songs/current---cur001.mp4",
+            "/songs/third---thr001.mp4",
+        ]
+
+    def test_demote_current_past_third_to_queue_position(self, mock_karaoke):
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+        mock_karaoke.queue_manager.enqueue("/songs/third---thr001.mp4", "Cara")
+        mock_karaoke.queue_manager.enqueue("/songs/fourth---fou001.mp4", "Dan")
+
+        # Drag current past next AND third — Sortable.js newIndex=2 is
+        # the post-move position, so current ends up between third and
+        # fourth (queue[2]) and next is promoted to the head.
+        result = mock_karaoke.reorder_with_current(0, 2)
+
+        assert result is True
+        assert mock_karaoke.playback_controller.is_playing is False
+        files = [item["file"] for item in mock_karaoke.queue_manager.queue]
+        assert files == [
+            "/songs/next---nxt001.mp4",
+            "/songs/third---thr001.mp4",
+            "/songs/current---cur001.mp4",
+            "/songs/fourth---fou001.mp4",
+        ]
+
+    def test_demoted_current_resets_position(self, mock_karaoke):
+        """A re-queued current song restarts from the beginning, not from its
+        playback position."""
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.playback_controller.now_playing_position = 42.5
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+
+        mock_karaoke.reorder_with_current(0, 1)
+
+        demoted = next(
+            item
+            for item in mock_karaoke.queue_manager.queue
+            if item["file"] == "/songs/current---cur001.mp4"
+        )
+        assert "resume_position" not in demoted
+
+    def test_in_queue_drag_skips_skip(self, mock_karaoke):
+        """When neither old nor new index is 0, only the queue is reordered
+        and playback is left alone."""
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+        mock_karaoke.queue_manager.enqueue("/songs/third---thr001.mp4", "Cara")
+
+        result = mock_karaoke.reorder_with_current(1, 2)
+
+        assert result is True
+        assert mock_karaoke.playback_controller.is_playing is True
+        assert mock_karaoke.playback_controller.now_playing_filename == (
+            "/songs/current---cur001.mp4"
+        )
+        files = [item["file"] for item in mock_karaoke.queue_manager.queue]
+        assert files == ["/songs/third---thr001.mp4", "/songs/next---nxt001.mp4"]
+
+    def test_no_op_when_indices_match(self, mock_karaoke):
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+
+        assert mock_karaoke.reorder_with_current(0, 0) is True
+        assert mock_karaoke.playback_controller.is_playing is True
+
+    def test_falls_back_to_queue_reorder_when_nothing_playing(self, mock_karaoke):
+        mock_karaoke.queue_manager.enqueue("/songs/a---a01.mp4", "UserA")
+        mock_karaoke.queue_manager.enqueue("/songs/b---b01.mp4", "UserB")
+
+        # Nothing playing → indices map directly to queue (1 → queue[0]).
+        result = mock_karaoke.reorder_with_current(1, 2)
+
+        assert result is True
+        files = [item["file"] for item in mock_karaoke.queue_manager.queue]
+        assert files == ["/songs/b---b01.mp4", "/songs/a---a01.mp4"]
+
+    def test_returns_false_for_index_zero_when_nothing_playing(self, mock_karaoke):
+        mock_karaoke.queue_manager.enqueue("/songs/a---a01.mp4", "UserA")
+
+        assert mock_karaoke.reorder_with_current(0, 1) is False
+        assert mock_karaoke.reorder_with_current(1, 0) is False
+
+    def test_returns_false_for_out_of_range(self, mock_karaoke):
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+
+        assert mock_karaoke.reorder_with_current(0, 9) is False
+        assert mock_karaoke.reorder_with_current(9, 0) is False

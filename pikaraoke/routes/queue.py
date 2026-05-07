@@ -99,6 +99,26 @@ def reorder(form):
     return json.dumps({"success": False})
 
 
+@queue_bp.route("/queue/reorder_with_current", methods=["POST"])
+@queue_bp.arguments(ReorderForm, location="form")
+def reorder_with_current(form):
+    """Drag-and-drop including the currently playing song as virtual index 0.
+
+    Index 0 = currently playing; 1..N = queue[0..N-1]. Moving an item across
+    index 0 stops the playing song (re-queued from start) and starts the new
+    top item.
+    """
+    if not is_admin():
+        return json.dumps({"success": False, "error": "Unauthorized"}), 403
+
+    k = get_karaoke_instance()
+    try:
+        success = k.reorder_with_current(form["old_index"], form["new_index"])
+        return json.dumps({"success": success})
+    except (ValueError, IndexError):
+        return json.dumps({"success": False})
+
+
 @queue_bp.route("/queue/edit", methods=["GET"])
 @queue_bp.arguments(QueueEditQuery, location="query")
 def queue_edit(query):

@@ -170,6 +170,7 @@ class MockKaraoke:
     vol_up = Karaoke.vol_up
     vol_down = Karaoke.vol_down
     restart = Karaoke.restart
+    reorder_with_current = Karaoke.reorder_with_current
     stop = Karaoke.stop
     reset_now_playing_notification = Karaoke.reset_now_playing_notification
     _handle_song_warning = Karaoke._handle_song_warning
