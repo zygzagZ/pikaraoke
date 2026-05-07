@@ -3500,22 +3500,33 @@ def _strip_variant_markers(title: str) -> str:
     return stripped or title
 
 
-# Polish has two letters that Unicode NFKD won't decompose because they
-# aren't accented base letters: ``ł``/``Ł`` (slashed L). ``remove_accents``
-# leaves them alone, so a query like ``Kielas`` would never substring-match
-# ``Kiełas`` even after accent folding both sides. Apply this fold *after*
-# ``remove_accents`` to canonicalise everything to ASCII.
-_LATIN_FOLD = str.maketrans({"ł": "l", "Ł": "L"})
+# Letters that Unicode NFKD won't decompose because they aren't accented
+# base letters: Polish ``ł``/``Ł`` (slashed L) and Scandinavian ``ø``/``Ø``
+# (slashed O). ``remove_accents`` leaves them alone, so a query like
+# ``Kielas`` would never substring-match ``Kiełas`` even after folding
+# both sides. Apply this fold *after* ``remove_accents``.
+_LATIN_FOLD = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O"})
 
 
 def _fold_for_match(text: str) -> str:
-    """Accent-strip + Polish ł/Ł flatten + lowercase. Comparison-only key."""
+    """Accent-strip + Latin extension flatten + lowercase. Comparison-only key."""
     return remove_accents(text).translate(_LATIN_FOLD).lower()
 
 
+# Delimiters that split a multi-artist credit. ``&`` and ``,`` always
+# split because they're never part of an artist name; the others
+# (``/``, ``x``, ``feat``, ``ft``, ``vs``, ``with``) require surrounding
+# whitespace to preserve names like ``AC/DC``, ``Malcolm X``,
+# ``X Ambassadors``, and ``Living With Lions``.
 _ARTIST_SPLIT_RE = re.compile(
-    r"\s*(?:&|,|/|\bfeat\.?|\bft\.?|\bvs\.?|\bx\b|\bwith\b)\s*",
-    re.IGNORECASE,
+    r"""
+        \s*&\s*                              # &
+      | \s*,\s*                              # ,
+      | \s+/\s+                              # /  (only with surrounding ws)
+      | \s+(?:feat\.?|ft\.?|vs\.?|with)\s+   # word delimiters
+      | \s+x\s+                              # x  (only with surrounding ws)
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -3538,8 +3549,8 @@ def _artist_matches(artist: str, primary: str, others: list[str] | None = None) 
 
     Accepts on (a) folded equality with ``primary``, or (b) any token of
     ``artist`` matching ``primary`` or any name in ``others``. Token
-    splitting on ``&``/``feat``/``ft``/``vs``/``x``/``with``/``,`` means
-    a query for ``"Gibbs & Kiełas"`` matches a hit credited as
+    splitting on ``&``/``,``/``/``/``feat``/``ft``/``vs``/``x``/``with``
+    means a query for ``"Gibbs & Kiełas"`` matches a hit credited as
     primary=``"Gibbs"`` with ``"Kiełas"`` featured -- the common shape on
     Genius and Spotify when collaborator metadata is split between
     primary and featured arrays.
@@ -3905,9 +3916,8 @@ def _fetch_tekstowo(track: str, artist: str) -> str | None:
         logger.warning("Tekstowo search failed: %s", e)
         return None
 
-    artist_key = _tekstowo_fold(artist.strip())
     track_key = _tekstowo_fold(track_clean.strip())
-    parser = _TekstowoSearchParser(artist_key, track_key)
+    parser = _TekstowoSearchParser(artist, track_key)
     try:
         parser.feed(r.text)
     except Exception:
@@ -3948,9 +3958,9 @@ class _TekstowoSearchParser(HTMLParser):
     the page even when "Halo" doesn't appear in any result.
     """
 
-    def __init__(self, artist_key: str, track_key: str) -> None:
+    def __init__(self, artist: str, track_key: str) -> None:
         super().__init__()
-        self._artist_key = artist_key
+        self._artist = artist
         self._track_key = track_key
         self._capturing = False
         self._text_buf: list[str] = []
@@ -3986,7 +3996,7 @@ class _TekstowoSearchParser(HTMLParser):
         if " - " not in text:
             return
         result_artist, result_track = text.split(" - ", 1)
-        if _tekstowo_fold(result_artist.strip()) != self._artist_key:
+        if not _artist_matches(self._artist, result_artist.strip()):
             return
         if self._track_key and self._track_key not in _tekstowo_fold(result_track.strip()):
             return

@@ -537,12 +537,16 @@ class TestFetchLrclib:
         with patch("pikaraoke.lib.lyrics.requests.get", side_effect=[get_resp, search_resp]):
             assert _fetch_lrclib("T", "A", None) is None
 
-    def test_network_error_returns_none(self):
+    def test_get_connection_error_falls_back_to_search(self):
+        # Companion to the timeout case: any RequestException on /get must
+        # let /search rescue, not abort the function.
+        search_resp = MagicMock(status_code=200)
+        search_resp.json.return_value = [{"syncedLyrics": "[00:01.00]rescued"}]
         with patch(
             "pikaraoke.lib.lyrics.requests.get",
-            side_effect=requests.ConnectionError(),
+            side_effect=[requests.ConnectionError(), search_resp],
         ):
-            assert _fetch_lrclib("T", "A", 180) is None
+            assert _fetch_lrclib("T", "A", None) == "[00:01.00]rescued"
 
     def test_get_timeout_falls_back_to_search(self):
         # /api/get hangs forever when the artist tag drifts from LRCLib's
@@ -666,6 +670,24 @@ class TestArtistTokens:
         # Single-letter aliases like "X" alone would match too liberally.
         assert _artist_tokens("X & Adele") == ["adele"]
 
+    def test_preserves_slash_in_band_names(self):
+        # AC/DC must NOT split on the slash (no surrounding whitespace).
+        assert _artist_tokens("AC/DC") == ["ac/dc"]
+
+    def test_preserves_x_in_band_names(self):
+        # ``Malcolm X`` and ``X Ambassadors`` -- ``x`` only splits when
+        # surrounded by whitespace, so these stay intact.
+        assert _artist_tokens("Malcolm X") == ["malcolm x"]
+        assert _artist_tokens("X Ambassadors") == ["x ambassadors"]
+
+    def test_splits_x_only_with_surrounding_whitespace(self):
+        # The real "x" delimiter case: " x " between two artists.
+        assert _artist_tokens("Doja Cat x SZA") == ["doja cat", "sza"]
+
+    def test_folds_scandinavian_o_slash(self):
+        # remove_accents leaves ø alone; the LATIN_FOLD must catch it.
+        assert _artist_tokens("Bjørk") == ["bjork"]
+
     def test_empty_input_returns_empty_list(self):
         assert _artist_tokens("") == []
         assert _artist_tokens("   ") == []
@@ -695,6 +717,10 @@ class TestArtistMatches:
 
     def test_empty_query_with_empty_primary_rejected(self):
         assert _artist_matches("", "") is False
+
+    def test_empty_query_with_real_primary_rejected(self):
+        # Empty artist key + real primary: no overlap, must reject.
+        assert _artist_matches("", "Foo") is False
 
 
 # ----- Genius client -----
@@ -980,6 +1006,25 @@ class TestFetchTekstowo:
             _fetch_tekstowo("X", "Y")
             ua = mock_get.call_args.kwargs["headers"]["User-Agent"]
             assert "Mozilla" in ua
+
+    def test_token_match_accepts_subset_artist_credit(self):
+        # The same artist-tag-drift the LRCLib/Genius fix targets: query
+        # is "Gibbs & Kiełas" but Tekstowo files the song under one of
+        # the names. Token-aware matching must accept this; pre-fix the
+        # parser did exact-equality and silently missed.
+        html = (
+            "<html><body>"
+            '<a href="/gibbs/piekny-swiat" class="title">'
+            "Gibbs - Piękny Świat</a>"
+            "</body></html>"
+        )
+        page = MagicMock(status_code=200, text=self.LYRICS_HTML)
+        with patch(
+            "pikaraoke.lib.lyrics.requests.get",
+            side_effect=[MagicMock(status_code=200, text=html), page],
+        ) as mock_get:
+            _fetch_tekstowo("Piękny Świat", "Gibbs & Kiełas")
+            assert "gibbs/piekny-swiat" in mock_get.call_args_list[1].args[0]
 
 
 class TestExtractTekstowoLyrics:
