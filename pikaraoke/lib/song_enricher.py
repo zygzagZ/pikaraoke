@@ -38,7 +38,7 @@ from typing import Any
 import requests
 
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
-from pikaraoke.lib.lyrics import _VARIANT_RE
+from pikaraoke.lib.lyrics import _VARIANT_RE, _artist_tokens
 from pikaraoke.lib.lyrics_language_classifier import COUNTRY_TO_LANG, signal_itunes_text
 from pikaraoke.lib.metadata_parser import (
     has_artist_title_separator,
@@ -151,6 +151,32 @@ def _itunes_adds_variant(query: str, itunes: dict) -> bool:
     if not itunes_track or not query:
         return False
     return bool(_VARIANT_RE.search(itunes_track)) and not _VARIANT_RE.search(query)
+
+
+def _itunes_variant_implies_cover(query: str, itunes: dict) -> bool:
+    """True when an iTunes variant hit is likely a *cover* by a different artist.
+
+    Caller guarantees ``_itunes_adds_variant`` already fired. We then check
+    whether the iTunes artist shares any token with the query's artist
+    portion ("<artist> - <title>"). When tokens are disjoint, the recording
+    is almost certainly a cover/tribute by a different artist — keeping
+    iTunes' artist would poison the row (the Bug 97 case: query "Gejtos -
+    Antyczny Napaleniec ...", iTunes hit was a Punk Version by "Punko polo").
+
+    Returns False conservatively: if either side lacks parseable tokens,
+    fall back to the default variant-guard behaviour (keep artist).
+    """
+    itunes_artist = (itunes.get("artist") or "").strip()
+    if not itunes_artist or " - " not in query:
+        return False
+    query_artist = query.split(" - ", 1)[0].strip()
+    if not query_artist:
+        return False
+    query_tokens = set(_artist_tokens(query_artist))
+    itunes_tokens = set(_artist_tokens(itunes_artist))
+    if not query_tokens or not itunes_tokens:
+        return False
+    return query_tokens.isdisjoint(itunes_tokens)
 
 
 def enrich_song(db: KaraokeDatabase, song_id: int, song_path: str) -> None:
@@ -396,18 +422,35 @@ def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: s
     itunes = project_full_hit(chosen_raw)
 
     if _itunes_adds_variant(query, itunes):
-        logger.info(
-            "iTunes canonical track %r adds a variant marker not in %r; "
-            "dropping title override (artist still trusted)",
-            itunes.get("track"),
-            query,
-        )
-        # Artist is variant-invariant: "I Want to Break Free (Remastered 2011)"
-        # is still by Queen, only the recording-specific title suffix is
-        # untrustworthy. Nulling the artist alongside the title leaves the
-        # row stamped ``enriched`` (because the side-fields applied) with
-        # no usable artist/title for the lyrics pipeline.
-        itunes = {**itunes, "track": None}
+        # Artist is *usually* variant-invariant: "I Want to Break Free
+        # (Remastered 2011)" is still by Queen, only the recording-specific
+        # title suffix is untrustworthy. So by default we keep iTunes'
+        # artist and drop only the title.
+        #
+        # Exception: covers / tributes. When the variant marker is something
+        # like "(Punk Version)" or "(Cover)" and iTunes' artist shares no
+        # tokens with the query artist, the recording is almost certainly
+        # by a different artist (Bug 97 case: query "Gejtos - Antyczny
+        # Napaleniec ...", iTunes returned a "(Punk Version)" by "Punko
+        # polo"). In that case drop the artist too — we don't want a cover
+        # artist polluting the row.
+        cover_like = _itunes_variant_implies_cover(query, itunes)
+        if cover_like:
+            logger.info(
+                "iTunes canonical track %r looks like a cover (variant + "
+                "artist mismatch with query %r); dropping title and artist",
+                itunes.get("track"),
+                query,
+            )
+            itunes = {**itunes, "track": None, "artist": None}
+        else:
+            logger.info(
+                "iTunes canonical track %r adds a variant marker not in %r; "
+                "dropping title override (artist still trusted)",
+                itunes.get("track"),
+                query,
+            )
+            itunes = {**itunes, "track": None}
 
     applied = db.update_track_metadata_with_provenance(
         song_id,

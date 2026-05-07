@@ -526,26 +526,27 @@ class TestEnrichSong:
         """When iTunes' chosen hit is an Instrumental/Karaoke cut, its
         canonical track name must not clobber the existing title — otherwise
         LRCLib queries get poisoned with a suffix that doesn't exist in its
-        index. Per Bug C: the artist is variant-invariant, so iTunes' artist
-        IS allowed to flow through and overwrite the lower-confidence
-        YouTube seed. Other iTunes fields (album, itunes_id, etc.) still
-        flow through too.
+        index. Per Bug C: the artist is variant-invariant for same-artist
+        variants (live/remaster/karaoke), so iTunes' artist IS allowed to
+        flow through and overwrite the lower-confidence YouTube seed. Other
+        iTunes fields (album, itunes_id, etc.) still flow through too.
         """
-        song_path = str(tmp_path / "Artist - Antyczny Napaleniec---abc12345678.mp4")
+        song_path = str(tmp_path / "Queen - Antyczny Napaleniec---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "pl")
         db.update_track_metadata_with_provenance(
             sid,
             "youtube",
-            {"artist": "Artist", "title": "Antyczny Napaleniec"},
+            {"artist": "Queen", "title": "Antyczny Napaleniec"},
         )
         # Polish text in the album name so signal_itunes_text reads "pl"
         # (matches the seeded language). The variant marker "(live)" in the
         # track triggers _itunes_adds_variant; the test verifies that guard
-        # drops only the canonical title (Bug C: artist now still flows
-        # through) while letting album + itunes_id land.
+        # drops only the canonical title (Bug C: artist still flows through
+        # because iTunes' artist token "Queen" overlaps with the query's
+        # token, so the cover-detection guard does NOT fire).
         hit = _raw_hit(
-            artist="Artist Canonical",
+            artist="Queen",
             track="Antyczny Napaleniec (live)",
             track_id=55555,
             collection="Płyta nazwa",
@@ -563,14 +564,52 @@ class TestEnrichSong:
         # Title stays at whatever was there (YouTube-seeded) — variant guard
         # blocks the (live) suffix from poisoning LRCLib lookups.
         assert row["title"] == "Antyczny Napaleniec"
-        # Artist now flows through: it's variant-invariant, and iTunes
+        # Artist still flows through: same artist on both sides, iTunes
         # outranks the youtube seed in the confidence ladder.
-        assert row["artist"] == "Artist Canonical"
+        assert row["artist"] == "Queen"
         # Other iTunes-only fields still land.
         assert row["itunes_id"] == "55555"
         assert row["album"] == "Płyta nazwa"
         assert row["track_number"] == 4
         assert row["genre"] == "Rap"
+
+    def test_itunes_variant_cover_drops_artist_too(self, db, tmp_path):
+        """The Bug 97 case: iTunes' only language-matching hit is a
+        "(Punk Version)" cover by a different artist (token-disjoint from
+        the query). Both title AND artist must be dropped — keeping the
+        cover artist would poison the row. Other iTunes-only fields
+        (album, itunes_id, genre) still flow through; they describe the
+        wrong recording but at least the identity fields stay clean.
+        """
+        song_path = str(tmp_path / "Gejtos - Antyczny Napaleniec---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "pl")
+        db.update_track_metadata_with_provenance(
+            sid,
+            "youtube",
+            {"artist": "Gejtos", "title": "Antyczny Napaleniec"},
+        )
+        # iTunes' canonical hit is a Punk Version by a different artist.
+        # The "(Punk Version)" suffix is now in _VARIANT_RE via the
+        # ``\w+\s+version`` alternation, so _itunes_adds_variant fires;
+        # the cover-detection guard then notices "Gejtos" and "Punko polo"
+        # share no tokens and drops the artist alongside the title.
+        hit = _raw_hit(
+            artist="Punko polo",
+            track="Antyczny Napaleniec (Punk Version)",
+            track_id=99999,
+            collection="Punk Tribute",
+            country="POL",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        # Title and artist preserved from YouTube; iTunes cover never wrote.
+        assert row["title"] == "Antyczny Napaleniec"
+        assert row["artist"] == "Gejtos"
 
     def test_itunes_variant_matching_query_still_applies(self, db, tmp_path):
         """When the query itself carries the variant suffix (user really

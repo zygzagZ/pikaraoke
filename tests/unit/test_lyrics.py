@@ -636,6 +636,25 @@ class TestStripVariantMarkers:
         assert _strip_variant_markers("Song (Remix)") == "Song"
         assert _strip_variant_markers("Song (2011 Remastered)") == "Song"
 
+    def test_strips_cover_and_unplugged_and_demo(self):
+        # Extended variant set: covers, unplugged, demo, bonus tracks.
+        assert _strip_variant_markers("Song (Cover)") == "Song"
+        assert _strip_variant_markers("Song (Cover Version)") == "Song"
+        assert _strip_variant_markers("Song [Unplugged]") == "Song"
+        assert _strip_variant_markers("Song (Demo)") == "Song"
+        assert _strip_variant_markers("Song (Bonus Track)") == "Song"
+
+    def test_strips_genre_prefixed_version_and_mix(self):
+        # The ``\w+\s+version`` and ``\w+\s+mix`` alternations catch
+        # arbitrary genre/style prefixes without enumerating each one
+        # (the Bug 97 case: a "Punk Version" cover slipped through the
+        # old regex).
+        assert _strip_variant_markers("Song (Punk Version)") == "Song"
+        assert _strip_variant_markers("Song (Album Version)") == "Song"
+        assert _strip_variant_markers("Song (Studio Version)") == "Song"
+        assert _strip_variant_markers("Song (Club Mix)") == "Song"
+        assert _strip_variant_markers("Song (DJ Mix)") == "Song"
+
     def test_noop_when_no_marker(self):
         assert _strip_variant_markers("Song Title") == "Song Title"
 

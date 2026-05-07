@@ -265,14 +265,26 @@ def _get_consensus_semaphore() -> threading.Semaphore:
 
 
 # Trailing mix/version markers in parens or brackets: "(Instrumental)",
-# "[Karaoke]", "(Acoustic Version)", etc. LRCLib + Genius index lyrics once
-# per song regardless of release variant, so these suffixes drop otherwise-
-# good matches. Applied to the upstream query only; DB titles are untouched.
+# "[Karaoke]", "(Acoustic Version)", "(Punk Version)", "(Cover)", etc.
+# LRCLib + Genius index lyrics once per song regardless of release variant,
+# so these suffixes drop otherwise-good matches. Applied to the upstream
+# query only; DB titles are untouched.
+#
+# The ``\w+\s+version`` and ``\w+\s+mix`` alternations catch genre-prefixed
+# variants ("Punk Version", "Album Version", "Studio Version", "Club Mix")
+# without enumerating every genre — and the upstream caller only strips
+# this from the iTunes side, so a query that genuinely names "Punk Version"
+# won't be touched (the guard fires only when iTunes adds a variant the
+# query lacks).
 _VARIANT_RE = re.compile(
     r"\s*[\(\[]"
     r"[^)\]]*?"
-    r"\b(?:instrumental|karaoke|acoustic(?:\s+version)?|live|remix|"
-    r"remastered|extended|radio\s+edit)\b"
+    r"\b(?:"
+    r"instrumental|karaoke|acoustic(?:\s+version)?|live|remix|"
+    r"remastered|extended|radio\s+edit|"
+    r"cover(?:\s+version)?|unplugged|demo|bonus\s+track|"
+    r"\w+\s+version|\w+\s+mix"
+    r")\b"
     r"[^)\]]*"
     r"[\)\]]\s*$",
     re.IGNORECASE,
