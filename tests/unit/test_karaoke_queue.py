@@ -358,15 +358,16 @@ class TestReorderWithCurrent:
             "/songs/later---lat001.mp4",
         ]
 
-    def test_demote_current_to_queue_position(self, mock_karaoke):
+    def test_demote_current_to_immediate_next_slot(self, mock_karaoke):
         self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
         mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
         mock_karaoke.queue_manager.enqueue("/songs/third---thr001.mp4", "Cara")
-        mock_karaoke.queue_manager.enqueue("/songs/fourth---fou001.mp4", "Dan")
 
-        # Drag current (virtual 0) to slot 2 — current should sit between
-        # next and third in the queue, with next promoted to playback.
-        result = mock_karaoke.reorder_with_current(0, 2)
+        # Drag current down one slot. Sortable.js newIndex is the
+        # post-move position of the dragged item, so dropping at the gap
+        # between next and third lands current at queue[1] (next promoted
+        # to head, current right behind it).
+        result = mock_karaoke.reorder_with_current(0, 1)
 
         assert result is True
         assert mock_karaoke.playback_controller.is_playing is False
@@ -375,6 +376,26 @@ class TestReorderWithCurrent:
             "/songs/next---nxt001.mp4",
             "/songs/current---cur001.mp4",
             "/songs/third---thr001.mp4",
+        ]
+
+    def test_demote_current_past_third_to_queue_position(self, mock_karaoke):
+        self._start_playing(mock_karaoke, "/songs/current---cur001.mp4", "Alice")
+        mock_karaoke.queue_manager.enqueue("/songs/next---nxt001.mp4", "Bob")
+        mock_karaoke.queue_manager.enqueue("/songs/third---thr001.mp4", "Cara")
+        mock_karaoke.queue_manager.enqueue("/songs/fourth---fou001.mp4", "Dan")
+
+        # Drag current past next AND third — Sortable.js newIndex=2 is
+        # the post-move position, so current ends up between third and
+        # fourth (queue[2]) and next is promoted to the head.
+        result = mock_karaoke.reorder_with_current(0, 2)
+
+        assert result is True
+        assert mock_karaoke.playback_controller.is_playing is False
+        files = [item["file"] for item in mock_karaoke.queue_manager.queue]
+        assert files == [
+            "/songs/next---nxt001.mp4",
+            "/songs/third---thr001.mp4",
+            "/songs/current---cur001.mp4",
             "/songs/fourth---fou001.mp4",
         ]
 
