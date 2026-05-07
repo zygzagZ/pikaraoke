@@ -293,9 +293,6 @@
     const $addQueueSearch = document.getElementById('pk-add-to-queue-search');
     const $addQueueDirect = document.getElementById('pk-add-to-queue-direct');
 
-    // Ensure pilot name is set before any queue action
-    setPilotName();
-
     // Restore preferences
     if (Cookies.get('include-non-karaoke') === 'true') {
       $includeNK.checked = true;

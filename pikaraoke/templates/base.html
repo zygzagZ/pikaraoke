@@ -178,6 +178,12 @@
         $("#current-user .pk-user-name").text(currentUser);
       }
 
+      // Auto-prompt for pilot name on first visit to any pilot page.
+      // setPilotName() is idempotent: returns early when a name is already stored.
+      {% if use_new_shell is defined and use_new_shell %}
+      setPilotName();
+      {% endif %}
+
       // Highlight active tab
       var path = window.location.pathname;
       var activeTab = (path === '/' || path === '/queue') ? '#tab-home'
