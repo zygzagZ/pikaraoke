@@ -358,10 +358,13 @@ class TestDBCoordination:
             }
         ]
 
-    def test_register_download_seeds_metadata_then_deletes_info_json(self, tmp_path, real_db):
+    def test_register_download_seeds_metadata_and_keeps_info_json(self, tmp_path, real_db):
         """After register_download, the DB owns the metadata and the
-        info.json is gone from disk — downstream consumers (enricher,
-        LyricsService) read the DB.
+        info.json stays on disk as the canonical YouTube provenance
+        record (registered as an ``info_json`` artifact). Downstream
+        consumers (enricher, LyricsService) still read the DB; the
+        file is preserved so a future scan or backfill reseed has
+        access to the raw yt-dlp output without re-hitting YouTube.
         """
         import json
 
@@ -382,12 +385,12 @@ class TestDBCoordination:
         sm = SongManager(str(tmp_path), db=real_db, enrich_on_download=False)
         sm.register_download(_native(song))
 
-        # info.json is gone and the artifact row is unregistered.
-        assert not info.exists()
+        # info.json is preserved on disk and registered as an artifact.
+        assert info.exists()
         sid = real_db.get_song_id_by_path(_native(song))
         roles = {a["role"] for a in real_db.get_artifacts(sid)}
-        assert "info_json" not in roles
-        # DB carries what was in info.json.
+        assert "info_json" in roles
+        # DB still carries what was in info.json.
         row = real_db.get_song_by_id(sid)
         assert row["artist"] == "Queen"
         assert row["title"] == "Bohemian Rhapsody"

@@ -98,25 +98,6 @@ def discover_song_artifacts(song_path: str) -> list[dict]:
     return artifacts
 
 
-def _consume_info_json(song_path: str, db: KaraokeDatabase, song_id: int) -> None:
-    """Delete <stem>.info.json from disk and drop its artifact row.
-
-    Called by ``register_download`` after info.json has been seeded into the
-    songs table. Scanner-discovered songs (user-owned collections) skip this
-    path so the original yt-dlp metadata stays on disk.
-    """
-    info_path = f"{os.path.splitext(song_path)[0]}.info.json"
-    if os.path.exists(info_path):
-        try:
-            os.unlink(info_path)
-        except OSError as e:
-            logging.warning("failed to remove %s: %s", info_path, e)
-    try:
-        db.delete_artifacts_by_role(song_id, "info_json")
-    except Exception:
-        logging.exception("failed to unregister info_json artifact for song_id=%s", song_id)
-
-
 def _track_metadata_from_info_json(song_path: str) -> dict:
     """Extract track metadata from <stem>.info.json for DB seeding.
 
@@ -301,13 +282,14 @@ class SongManager:
         background thread so the 3-6s of external network latency doesn't
         block the download pipeline.
 
-        The info.json is consumed-then-deleted here: yt-dlp wrote it for
-        this pipeline's benefit, everything useful has just been copied to
-        the ``songs`` row, and downstream consumers (song_enricher,
-        LyricsService) now read track metadata straight from the DB. The
-        scanner backfill path (``library_scanner.LibraryScanner._backfill_artifacts``)
-        deliberately does NOT delete info.json — it treats user-placed
-        collections as external data that must not be mutated.
+        The info.json is preserved on disk and registered as an
+        ``info_json`` artifact: it is the canonical YouTube provenance
+        record for the row and the only signal the
+        ``scripts/backfill_info_json.py`` reseed path can rely on
+        without re-hitting YouTube. Downstream consumers (song_enricher,
+        LyricsService) still read track metadata straight from the DB —
+        the file just stays on disk so a future scan, backfill, or
+        forensic check has access to the raw yt-dlp output.
         """
         self.songs.add_if_valid(song_path)
         self._db.insert_songs([build_song_record(song_path)])
@@ -327,7 +309,6 @@ class SongManager:
         # and mb_signals are None — those are exactly the signals the
         # enricher will produce.
         self._classify_pre_itunes(song_id, song_path)
-        _consume_info_json(song_path, self._db, song_id)
         if self._enrich_on_download:
             self._start_enrichment(song_id, song_path)
 

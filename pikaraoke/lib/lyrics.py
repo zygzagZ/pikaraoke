@@ -130,6 +130,12 @@ SPOTIFY_USER_AGENT = (
 # on a 429 to ``/v1/search``. Beyond this we punt back to the orchestrator
 # rather than parking a worker.
 SPOTIFY_RATE_LIMIT_SLEEP_CAP = 90.0
+# Above this Retry-After value we treat Spotify as locked-out for the day
+# and short-circuit without sleeping any of it — the cooldown gate alone
+# parks future calls until the window passes. Avoids stacking 30s+50s+...
+# sleeps on a single song right before the second 429 inevitably hands
+# us a 24h Retry-After.
+SPOTIFY_RATE_LIMIT_LONG_S = 300.0
 
 # Last-resort ASR fallback. When LRCLib / Genius / YouTube VTT all miss,
 # transcribe the vocals stem with faster-whisper so the song still gets
@@ -1735,10 +1741,21 @@ class LyricsService:
         try:
             r = _do_search()
             if r.status_code == 429:
+                retry_after = _retry_after(r)
+                if retry_after > SPOTIFY_RATE_LIMIT_LONG_S:
+                    # Spotify is plainly locked out for the day. Don't
+                    # sleep any of it — set the cooldown gate so future
+                    # calls fast-fail and return immediately.
+                    self._spotify_rate_limited_until = time.time() + retry_after
+                    logger.warning(
+                        "Spotify search locked out for %.0fs; deferring without sleep",
+                        retry_after,
+                    )
+                    return None
                 # Cap the in-thread sleep so a pathological Retry-After
                 # can't park a worker for hours; if Spotify really wants
                 # more, the second 429 below punts to orchestrator backoff.
-                cooldown = min(_retry_after(r), SPOTIFY_RATE_LIMIT_SLEEP_CAP)
+                cooldown = min(retry_after, SPOTIFY_RATE_LIMIT_SLEEP_CAP)
                 self._spotify_rate_limited_until = time.time() + cooldown
                 logger.warning("Spotify search rate-limited; sleeping %.0fs and retrying", cooldown)
                 time.sleep(cooldown)
@@ -2053,7 +2070,27 @@ class LyricsService:
         track = (info.get("track") or "").strip()
         artist = (info.get("artist") or "").strip()
         if not track or not artist:
-            return []
+            # The DB row is empty (a metadata-bug row, or a never-enriched
+            # scanner import). Re-seed from the filename so the candidate
+            # ladder has *something* to query against — without this every
+            # downstream lyrics lookup short-circuits to "no candidates"
+            # and the song stays caption-less even though the filename
+            # spells out "Artist - Title" right there on disk.
+            if not song_path:
+                return []
+            try:
+                tidied = regex_tidy(_title_from_filename(song_path))
+            except Exception:
+                logger.exception("candidate gen: filename regex_tidy crashed for %s", song_path)
+                return []
+            if not has_artist_title_separator(tidied):
+                return []
+            f_artist, _, f_track = tidied.partition(" - ")
+            track = f_track.strip()
+            artist = f_artist.strip()
+            if not track or not artist:
+                return []
+            info = {**info, "track": track, "artist": artist}
 
         seen: set[tuple[str, str]] = set()
         out: list[dict] = []
@@ -5147,10 +5184,10 @@ def _user_owned_ass(song_path: str) -> bool:
 def _cleanup_yt_vtt(song_path: str, db=None) -> None:
     """Remove <stem>*.vtt after conversion and drop the matching DB rows.
 
-    info.json is owned elsewhere: ``register_download`` consumes-then-
-    deletes it for fresh yt-dlp downloads, and scanner-imported
-    collections deliberately preserve it (user's own files). Lyrics
-    pipeline has no business touching it here.
+    info.json is intentionally preserved here: it's the canonical YouTube
+    provenance record (registered as an ``info_json`` artifact) and the
+    only signal the backfill reseed path can use without re-hitting
+    YouTube. The lyrics pipeline has no business touching it.
     """
     stem, _ext = os.path.splitext(song_path)
     directory = os.path.dirname(stem) or "."

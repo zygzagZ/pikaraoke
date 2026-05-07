@@ -4364,19 +4364,42 @@ class TestSpotifySearchRateLimit:
             assert mock_get.call_count == 2
 
     def test_429_sleep_capped(self):
-        """Retry-After of 600s gets capped to SPOTIFY_RATE_LIMIT_SLEEP_CAP
-        so a worker can't be parked for an hour by a pathological header."""
+        """Retry-After of 200s (above SLEEP_CAP=90, below LONG=300) gets
+        capped to SPOTIFY_RATE_LIMIT_SLEEP_CAP so a worker can't be parked
+        for an hour by a pathological header."""
         from pikaraoke.lib.lyrics import SPOTIFY_RATE_LIMIT_SLEEP_CAP
 
         svc = self._make_service()
         rate_limited = MagicMock(status_code=429)
-        rate_limited.headers = {"Retry-After": "600"}
+        rate_limited.headers = {"Retry-After": "200"}
         with (
             patch("pikaraoke.lib.lyrics.requests.get", return_value=rate_limited),
             patch("pikaraoke.lib.lyrics.time.sleep") as mock_sleep,
         ):
             svc._resolve_spotify_track_id("a", "b", None)
             mock_sleep.assert_called_once_with(SPOTIFY_RATE_LIMIT_SLEEP_CAP)
+
+    def test_429_long_retry_after_short_circuits_without_sleep(self):
+        """Retry-After above SPOTIFY_RATE_LIMIT_LONG_S (e.g. a 24h lockout)
+        bypasses the sleep entirely — the in-process cooldown gate alone
+        defers future calls. Without this, the verification script and
+        the orchestrator stack 30s+50s+... sleeps on a single song right
+        before the second 429 hands them back the same 24h header."""
+        from pikaraoke.lib.lyrics import SPOTIFY_RATE_LIMIT_LONG_S
+
+        svc = self._make_service()
+        long_lockout = MagicMock(status_code=429)
+        long_lockout.headers = {"Retry-After": str(int(SPOTIFY_RATE_LIMIT_LONG_S) + 100)}
+        with (
+            patch("pikaraoke.lib.lyrics.requests.get", return_value=long_lockout) as mock_get,
+            patch("pikaraoke.lib.lyrics.time.sleep") as mock_sleep,
+        ):
+            assert svc._resolve_spotify_track_id("a", "b", None) is None
+            mock_sleep.assert_not_called()
+            # Only the initial request — no retry, no sleep.
+            assert mock_get.call_count == 1
+            # Cooldown gate is set so future calls fast-fail.
+            assert svc._spotify_rate_limited_until > time.time() + SPOTIFY_RATE_LIMIT_LONG_S
 
     def test_successful_search_is_cached_per_key(self):
         svc = self._make_service()

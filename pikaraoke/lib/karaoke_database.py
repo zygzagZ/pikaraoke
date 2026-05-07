@@ -812,6 +812,27 @@ class KaraokeDatabase:
                     (status, attempted_at, language_at_enrich, song_id),
                 )
 
+    def reset_enrichment_state(self, song_id: int) -> None:
+        """Reset metadata_status='pending' and enrichment_attempts=0.
+
+        Used by the info.json backfill path when a row's artist/title
+        changed and the enricher should re-evaluate from scratch on the
+        next dispatch. Atomic with respect to ``stamp_enrichment_attempt``.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE songs
+                SET metadata_status = 'pending',
+                    enrichment_attempts = 0,
+                    last_enrichment_attempt = NULL,
+                    language_at_enrich = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (song_id,),
+            )
+
     def clear_audio_fingerprint(self, song_id: int) -> None:
         with self._lock, self._conn:
             self._conn.execute(

@@ -232,10 +232,22 @@ class TestEnrichSong:
         every iTunes hit is Portuguese. No textual fields get written; the
         row stamps ``language_mismatch`` and snapshots the language so we
         won't retry until language changes again.
+
+        Pre-condition: the row must already have artist/title for
+        ``language_mismatch`` to be a meaningful verdict — without that
+        there is nothing for the iTunes hits to mismatch against, and the
+        enricher down-grades the status to ``not_found`` (covered by
+        ``test_language_mismatch_downgraded_to_not_found_when_metadata_empty``).
         """
         song_path = str(tmp_path / "Don Pedalini---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "pl")
+        # Pre-seed prior metadata so ``language_mismatch`` is the right
+        # verdict — without it the enricher correctly downgrades to
+        # ``not_found`` (Bug D fix).
+        db.update_track_metadata_with_provenance(
+            sid, "scanner", {"artist": "Don Pedalini", "title": "Some Song"}
+        )
 
         # All 5 hits are Brazilian/Portuguese hymns.
         hits = [
@@ -255,12 +267,46 @@ class TestEnrichSong:
         row = db.get_song_by_id(sid)
         assert row["metadata_status"] == "language_mismatch"
         assert row["language_at_enrich"] == "pl"
-        # Critically: no textual iTunes fields leaked through.
-        assert row["artist"] is None
-        assert row["title"] is None
+        # Critically: no textual iTunes fields leaked through; the
+        # scanner-seeded artist/title are preserved verbatim.
+        assert row["artist"] == "Don Pedalini"
+        assert row["title"] == "Some Song"
         assert row["album"] is None
         assert row["genre"] is None
         assert row["itunes_id"] is None  # match was wrong wholesale
+
+    def test_language_mismatch_downgraded_to_not_found_when_metadata_empty(self, db, tmp_path):
+        """Bug D: a row with no prior artist/title can't logically be
+        ``language_mismatch`` — there's nothing to mismatch against.
+        Stamp ``not_found`` instead so the status reflects reality and
+        the row stays a candidate for re-validation. The filename here
+        ('Don Pedalini' alone, no separator) deliberately can't be
+        parsed by the Bug F filename re-validation either.
+        """
+        song_path = str(tmp_path / "Don Pedalini---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "pl")
+        # No artist/title pre-seeded — this is the metadata-empty case.
+
+        hits = [
+            _raw_hit(
+                artist=f"Padrinho Fábio Pedalino {i}",
+                track="A Arte e o Dom do Amor",
+                track_id=10000 + i,
+                collection="IV Livro - Hinário da Humanidade",
+                country="BRA",
+                genre="Worldwide",
+            )
+            for i in range(5)
+        ]
+        with patch.object(song_enricher, "search_itunes_full", return_value=hits):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        assert row["metadata_status"] == "not_found"
+        assert row["language_at_enrich"] == "pl"
+        assert row["artist"] is None
+        assert row["title"] is None
 
     def test_idempotent_when_language_unchanged(self, db, tmp_path):
         """Second run with the same songs.language as the snapshot is a no-op
@@ -478,10 +524,12 @@ class TestEnrichSong:
 
     def test_itunes_variant_does_not_override_title(self, db, tmp_path):
         """When iTunes' chosen hit is an Instrumental/Karaoke cut, its
-        canonical artist/track must not clobber the existing row — otherwise
+        canonical track name must not clobber the existing title — otherwise
         LRCLib queries get poisoned with a suffix that doesn't exist in its
-        index. Other iTunes fields (album, itunes_id, etc.) still flow
-        through.
+        index. Per Bug C: the artist is variant-invariant, so iTunes' artist
+        IS allowed to flow through and overwrite the lower-confidence
+        YouTube seed. Other iTunes fields (album, itunes_id, etc.) still
+        flow through too.
         """
         song_path = str(tmp_path / "Artist - Antyczny Napaleniec---abc12345678.mp4")
         sid = _insert_song(db, song_path)
@@ -494,11 +542,11 @@ class TestEnrichSong:
         # Polish text in the album name so signal_itunes_text reads "pl"
         # (matches the seeded language). The variant marker "(live)" in the
         # track triggers _itunes_adds_variant; the test verifies that guard
-        # still drops the canonical title/artist while letting album +
-        # itunes_id flow through.
+        # drops only the canonical title (Bug C: artist now still flows
+        # through) while letting album + itunes_id land.
         hit = _raw_hit(
-            artist="A",
-            track="X (live)",
+            artist="Artist Canonical",
+            track="Antyczny Napaleniec (live)",
             track_id=55555,
             collection="Płyta nazwa",
             track_number=4,
@@ -512,9 +560,12 @@ class TestEnrichSong:
             song_enricher.enrich_song(db, sid, song_path)
 
         row = db.get_song_by_id(sid)
-        # Identity fields stay at whatever was there (YouTube-seeded).
+        # Title stays at whatever was there (YouTube-seeded) — variant guard
+        # blocks the (live) suffix from poisoning LRCLib lookups.
         assert row["title"] == "Antyczny Napaleniec"
-        assert row["artist"] == "Artist"
+        # Artist now flows through: it's variant-invariant, and iTunes
+        # outranks the youtube seed in the confidence ladder.
+        assert row["artist"] == "Artist Canonical"
         # Other iTunes-only fields still land.
         assert row["itunes_id"] == "55555"
         assert row["album"] == "Płyta nazwa"
@@ -610,10 +661,17 @@ class TestEnrichSong:
         assert "no match" in captured[-1]["detail"]
 
     def test_event_hook_emits_warning_on_language_mismatch(self, db, tmp_path):
-        """Mismatch is the noteworthy outcome — surface it as a warning event."""
+        """Mismatch is the noteworthy outcome — surface it as a warning event.
+
+        Requires prior metadata for the verdict to be ``language_mismatch``
+        rather than the metadata-empty downgrade to ``not_found`` (Bug D).
+        """
         song_path = str(tmp_path / "Don Pedalini---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "pl")
+        db.update_track_metadata_with_provenance(
+            sid, "scanner", {"artist": "Don Pedalini", "title": "Some Song"}
+        )
 
         captured: list[dict] = []
         song_enricher.set_event_hook(captured.append)

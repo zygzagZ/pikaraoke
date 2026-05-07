@@ -40,12 +40,23 @@ import requests
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
 from pikaraoke.lib.lyrics import _VARIANT_RE
 from pikaraoke.lib.lyrics_language_classifier import COUNTRY_TO_LANG, signal_itunes_text
+from pikaraoke.lib.metadata_parser import (
+    has_artist_title_separator,
+    regex_tidy,
+    youtube_id_suffix,
+)
 from pikaraoke.lib.music_metadata import (
     fetch_musicbrainz_ids,
     normalize_title,
     project_full_hit,
     search_itunes_full,
 )
+
+# Sources whose artist/title we treat as "low-confidence and worth
+# re-validating from the filename" when iTunes returned zero hits. Anything
+# at or above ``itunes`` is trusted — only the bottom rungs (raw scanner
+# tag, raw youtube info.json) get re-parsed.
+_LOW_CONFIDENCE_TEXT_SOURCES = frozenset({"scanner", "youtube"})
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +222,74 @@ def _pick_hit_for_language(candidates: list[dict], expected_lang: str) -> tuple[
     return None, "no_match"
 
 
+def _try_filename_revalidation(db: KaraokeDatabase, song_id: int, song_path: str, row) -> None:
+    """Re-seed artist/title from the filename when iTunes drew a blank.
+
+    Only fires when the existing artist or title came from a low-confidence
+    source (``scanner`` or raw ``youtube``) — those are the rungs that
+    can hold a garbled non-music tag (e.g. iTunes Connect's empty fields,
+    yt-dlp's literal channel name on a Topic upload). A clean
+    "Artist - Title" filename is at least as trustworthy as those, so
+    we write with provenance ``scanner`` and let any later iTunes /
+    MusicBrainz hit override via the confidence ladder.
+    """
+    sources = {}
+    try:
+        sources = db.get_metadata_sources(song_id)
+    except Exception:
+        logger.exception("metadata_sources read failed for song_id=%d", song_id)
+        return
+
+    artist_source = sources.get("artist")
+    title_source = sources.get("title")
+    # If neither field has a low-confidence source we either have nothing
+    # to override or already have a higher-confidence write — leave it.
+    if (
+        artist_source not in _LOW_CONFIDENCE_TEXT_SOURCES
+        and title_source not in _LOW_CONFIDENCE_TEXT_SOURCES
+        and artist_source is not None
+        and title_source is not None
+    ):
+        return
+
+    stem = os.path.splitext(os.path.basename(song_path))[0]
+    suffix = youtube_id_suffix(song_path)
+    if suffix:
+        stem = stem[: -len(suffix)]
+    try:
+        tidied = regex_tidy(stem)
+    except Exception:
+        logger.exception("filename re-validation: regex_tidy crashed for %s", song_path)
+        return
+    if not tidied or not has_artist_title_separator(tidied):
+        return
+
+    f_artist, _, f_title = tidied.partition(" - ")
+    f_artist = f_artist.strip()
+    f_title = f_title.strip()
+    if not f_artist or not f_title:
+        return
+
+    db_artist = (row["artist"] or "").strip() if row is not None else ""
+    db_title = (row["title"] or "").strip() if row is not None else ""
+    if f_artist == db_artist and f_title == db_title:
+        return
+
+    applied = db.update_track_metadata_with_provenance(
+        song_id,
+        "scanner",
+        {"artist": f_artist, "title": f_title},
+    )
+    if applied:
+        logger.info(
+            "filename re-validation seeded %s for song_id=%d (was artist=%r title=%r)",
+            sorted(applied),
+            song_id,
+            db_artist,
+            db_title,
+        )
+
+
 def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: str) -> None:
     row = db.get_song_by_id(song_id)
     if row is None:
@@ -269,12 +348,38 @@ def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: s
         logger.exception("iTunes lookup crashed for %r", query)
 
     if not candidates:
+        # Bug F: when iTunes drew a blank, give the row a last chance via
+        # the filename. If the existing artist/title came from a
+        # low-confidence source (raw scanner tag or raw yt-dlp info.json,
+        # both of which can be garbage for non-music uploads) and the
+        # filename parses cleanly into "Artist - Title", re-seed the row
+        # with provenance ``scanner`` so any future iTunes/MusicBrainz
+        # signal still wins via the confidence ladder.
+        _try_filename_revalidation(db, song_id, song_path, row)
         db.stamp_enrichment_attempt(song_id, "not_found", now, language_at_enrich=expected_lang)
         _emit("Metadata enrichment finished", detail="iTunes: no match")
         return
 
     chosen_raw, reason = _pick_hit_for_language(candidates, expected_lang)
     if chosen_raw is None:
+        # ``language_mismatch`` is meaningful only when the row has
+        # artist/title that the iTunes verdict disagrees with. On a
+        # metadata-empty row (no info.json, no scanner-parseable filename)
+        # there is nothing to mismatch against — stamp ``not_found`` so
+        # the status name reflects reality and the row stays a candidate
+        # for re-validation when better metadata arrives.
+        db_artist = (row["artist"] or "").strip()
+        db_title = (row["title"] or "").strip()
+        if not db_artist and not db_title:
+            db.stamp_enrichment_attempt(song_id, "not_found", now, language_at_enrich=expected_lang)
+            _emit(
+                "Metadata enrichment finished",
+                detail=(
+                    f"not_found: audio={expected_lang}, top-{len(candidates)} "
+                    f"iTunes hits had no match (no prior metadata)"
+                ),
+            )
+            return
         db.stamp_enrichment_attempt(
             song_id, "language_mismatch", now, language_at_enrich=expected_lang
         )
@@ -293,11 +398,16 @@ def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: s
     if _itunes_adds_variant(query, itunes):
         logger.info(
             "iTunes canonical track %r adds a variant marker not in %r; "
-            "dropping title/artist override",
+            "dropping title override (artist still trusted)",
             itunes.get("track"),
             query,
         )
-        itunes = {**itunes, "track": None, "artist": None}
+        # Artist is variant-invariant: "I Want to Break Free (Remastered 2011)"
+        # is still by Queen, only the recording-specific title suffix is
+        # untrustworthy. Nulling the artist alongside the title leaves the
+        # row stamped ``enriched`` (because the side-fields applied) with
+        # no usable artist/title for the lyrics pipeline.
+        itunes = {**itunes, "track": None}
 
     applied = db.update_track_metadata_with_provenance(
         song_id,
