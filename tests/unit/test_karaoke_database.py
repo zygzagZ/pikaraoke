@@ -903,6 +903,28 @@ class TestSubtitleJobs:
         rows = db._conn.execute("SELECT COUNT(*) FROM subtitle_jobs").fetchone()[0]
         assert rows == 0
 
+    def test_delete_subtitle_jobs_removes_all_rows_for_song(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "success", tier="line")
+        db.upsert_subtitle_job(sid, "AI", "failed", error_code="boom")
+        deleted = db.delete_subtitle_jobs(sid)
+        assert deleted == 2
+        assert db.get_subtitle_jobs(sid) == []
+
+    def test_delete_subtitle_jobs_returns_zero_when_absent(self, db):
+        sid = self._insert_song(db)
+        assert db.delete_subtitle_jobs(sid) == 0
+
+    def test_delete_subtitle_jobs_only_targets_one_song(self, db):
+        sid_a = self._insert_song(db)
+        db.insert_songs([{"file_path": "/songs/y.mp4", "youtube_id": None, "format": "mp4"}])
+        sid_b = db.get_song_id_by_path("/songs/y.mp4")
+        db.upsert_subtitle_job(sid_a, "lrclib", "queued")
+        db.upsert_subtitle_job(sid_b, "lrclib", "queued")
+        db.delete_subtitle_jobs(sid_a)
+        assert db.get_subtitle_jobs(sid_a) == []
+        assert len(db.get_subtitle_jobs(sid_b)) == 1
+
 
 class TestSubtitleJobsBulk:
     """Bulk fetch path for the queue rosette / picker (Phase 2)."""
