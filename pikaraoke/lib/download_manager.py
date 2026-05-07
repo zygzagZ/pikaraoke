@@ -24,9 +24,16 @@ if TYPE_CHECKING:
 from pikaraoke.lib.youtube_dl import (
     build_ytdl_audio_only_command,
     build_ytdl_download_command,
+    build_ytdl_orig_autosubs_command,
     build_ytdl_video_only_command,
     get_youtube_id_from_url,
 )
+
+# Bound on the second-pass auto-caption fetch. The pass downloads a single
+# VTT (~10-30 KiB) so the dominant cost is yt-dlp's player init / JS
+# challenge, not bandwidth. Keep tight so a stalled YouTube response can't
+# delay `song_downloaded` for the lyrics pipeline.
+_ORIG_AUTOSUBS_TIMEOUT_S = 30.0
 
 # yt-dlp download progress line:
 # [download]   0.0% of    4.62MiB at  396.66KiB/s ETA 00:12
@@ -400,6 +407,7 @@ class DownloadManager:
             if song_path:
                 metadata_thread.join(timeout=_METADATA_LOOKUP_TIMEOUT_S)
                 _merge_metadata_into_info_json(song_path, metadata_holder.get("meta"))
+                self._fetch_orig_auto_captions(video_url)
                 self._emit_song_event(
                     phase="download",
                     message="Download completed",
@@ -607,6 +615,44 @@ class DownloadManager:
             return rc, combined_output
 
         return 0, combined_output
+
+    def _fetch_orig_auto_captions(self, video_url: str) -> None:
+        """Fetch the original-language YouTube auto-caption as a `.<lang>-orig.vtt`.
+
+        Best-effort: any failure is logged and swallowed so it can't block
+        the downstream `song_downloaded` event. The main download already
+        wrote manual subs; this only fills the gap for videos whose uploader
+        didn't publish a caption in the song's actual language (e.g. Polish
+        songs with English-only manual subs).
+        """
+        cmd = build_ytdl_orig_autosubs_command(
+            video_url,
+            self._download_path,
+            self._youtubedl_proxy,
+            self._additional_ytdl_args,
+        )
+        logging.debug("yt-dlp orig auto-subs: " + " ".join(cmd))
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=_ORIG_AUTOSUBS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            logging.warning("yt-dlp orig auto-subs fetch timed out for %s", video_url)
+            return
+        except Exception:
+            logging.exception("yt-dlp orig auto-subs fetch crashed for %s", video_url)
+            return
+        if result.returncode != 0:
+            # Common, non-fatal: video has no auto-captions at all.
+            logging.debug(
+                "yt-dlp orig auto-subs returned %s for %s: %s",
+                result.returncode,
+                video_url,
+                (result.stderr or result.stdout or "")[:500],
+            )
 
     def _prewarm_audio_sibling(self, video_id: str, displayed_title: str) -> None:
         """Fire Demucs prewarm on the just-downloaded `.m4a` for video_id."""

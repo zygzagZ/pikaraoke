@@ -161,10 +161,11 @@ def build_ytdl_download_command(
         "--postprocessor-args",
         "merger+ffmpeg_o:-movflags +faststart",
         "--write-info-json",
-        # Manual subs only. `--write-auto-subs` pulls YouTube's ~200
-        # machine-translated caption tracks (codes like `pl-en-<id>`), which
-        # trips HTTP 429 rate limits. Manual uploads are higher quality for
-        # lyrics anyway; LRCLib covers the gap when manual subs are missing.
+        # Manual subs only here. `--write-auto-subs` shares this selector,
+        # so enabling it with `all` would pull YouTube's ~200 machine-
+        # translated caption tracks and trip HTTP 429. The original-language
+        # auto-caption is fetched in a separate lightweight pass — see
+        # `build_ytdl_orig_autosubs_command`.
         "--write-subs",
         "--sub-langs",
         "all,-live_chat",
@@ -209,12 +210,55 @@ def build_ytdl_video_only_command(
         "--postprocessor-args",
         "ffmpeg:-movflags +faststart",
         "--write-info-json",
+        # Manual subs only; original-language auto-caption added later via
+        # `build_ytdl_orig_autosubs_command`. See that helper for rationale.
         "--write-subs",
         "--sub-langs",
         "all,-live_chat",
         "--convert-subs",
         "vtt",
         "--embed-metadata",
+    ]
+    cmd = yt_dlp_cmd + args + _js_runtime_args()
+    if youtubedl_proxy:
+        cmd += ["--proxy", youtubedl_proxy]
+    if additional_args:
+        cmd += shlex.split(additional_args)
+    cmd += [video_url]
+    return cmd
+
+
+def build_ytdl_orig_autosubs_command(
+    video_url: str,
+    download_path: str,
+    youtubedl_proxy: str | None = None,
+    additional_args: str | None = None,
+) -> list[str]:
+    """Build a lightweight yt-dlp command that fetches only the original-
+    language YouTube auto-caption (track tag ``*-orig``).
+
+    Run as a second pass after the main video download. Manual subs already
+    landed in pass one; this fills the gap when the uploader didn't publish
+    a caption in the song's actual language (e.g. a Polish song with only
+    English manual subs would otherwise silently fall back to English).
+
+    Selector ``.*-orig`` matches a single track per video, sidestepping the
+    HTTP 429 rate limit that ``--write-auto-subs --sub-langs all`` triggers
+    by pulling all ~200 machine translations.
+    """
+    dl_path = os.path.join(download_path, "%(title)s---%(id)s.%(ext)s")
+    args = [
+        "--skip-download",
+        "--no-playlist",
+        "-o",
+        dl_path,
+        "--compat-options",
+        "filename-sanitization",
+        "--write-auto-subs",
+        "--sub-langs",
+        ".*-orig",
+        "--convert-subs",
+        "vtt",
     ]
     cmd = yt_dlp_cmd + args + _js_runtime_args()
     if youtubedl_proxy:

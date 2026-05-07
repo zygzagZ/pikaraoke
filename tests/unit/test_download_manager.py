@@ -22,6 +22,21 @@ def _stub_metadata_lookup():
         yield stub
 
 
+@pytest.fixture(autouse=True)
+def _stub_orig_autosubs():
+    """Skip the second-pass yt-dlp orig auto-caption fetch in unit tests.
+
+    The pass spawns its own subprocess after the main download completes;
+    leaving it live would consume a slot from per-test ``Popen.side_effect``
+    sequences. Tests that specifically exercise the second pass can
+    re-patch this method on their case.
+    """
+    with patch.object(
+        DownloadManager, "_fetch_orig_auto_captions", return_value=None
+    ) as stub:
+        yield stub
+
+
 @pytest.fixture
 def events():
     """Create a real EventSystem instance for testing."""
@@ -328,6 +343,58 @@ class TestDownloadManagerExecuteDownload:
         queue_manager.enqueue.assert_called_once_with(
             "/songs/Song---abc.mp4", "TestUser", log_action=False
         )
+
+    @patch("flask_babel._", side_effect=lambda x: x)
+    @patch("subprocess.Popen")
+    @patch("pikaraoke.lib.download_manager.build_ytdl_download_command")
+    def test_orig_auto_captions_fetched_after_success(
+        self,
+        mock_build_cmd,
+        mock_popen,
+        mock_gettext,
+        download_manager,
+        song_manager,
+        _stub_orig_autosubs,
+    ):
+        """Successful download triggers the second-pass orig auto-caption fetch
+        before `song_downloaded` fires, so the lyrics pipeline sees the VTT."""
+        mock_build_cmd.return_value = ["yt-dlp", "url"]
+        mock_process = MagicMock()
+        mock_process.stdout.readline.side_effect = ["", ""]
+        mock_process.poll.return_value = 0
+        mock_popen.return_value = mock_process
+        song_manager.songs.find_by_id.return_value = "/songs/Song---abc.mp4"
+
+        download_manager._execute_download(
+            "https://youtube.com/watch?v=abc", False, "User", "Title"
+        )
+
+        _stub_orig_autosubs.assert_called_once_with(
+            "https://youtube.com/watch?v=abc"
+        )
+
+    @patch("flask_babel._", side_effect=lambda x: x)
+    @patch("subprocess.Popen")
+    @patch("pikaraoke.lib.download_manager.build_ytdl_download_command")
+    def test_orig_auto_captions_skipped_on_failure(
+        self,
+        mock_build_cmd,
+        mock_popen,
+        mock_gettext,
+        download_manager,
+        _stub_orig_autosubs,
+    ):
+        """If the main download fails, skip the second pass — there's no
+        video file to attach captions to."""
+        mock_build_cmd.return_value = ["yt-dlp", "url"]
+        mock_process = MagicMock()
+        mock_process.stdout.readline.return_value = ""
+        mock_process.poll.return_value = 1
+        mock_popen.return_value = mock_process
+
+        download_manager._execute_download("url", False, "User", "Title")
+
+        _stub_orig_autosubs.assert_not_called()
 
     @patch("flask_babel._", side_effect=lambda x: x)
     @patch("subprocess.run")
