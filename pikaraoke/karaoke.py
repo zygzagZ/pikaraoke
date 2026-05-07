@@ -481,6 +481,15 @@ class Karaoke:
         self._pending_subtitle_picks: dict[str, str] = {}
         self._pending_picks_lock = threading.Lock()
 
+        # Per-(song, subtitle_source) timing offset in seconds. Survives only
+        # for the lifetime of the running process — by design, "fresh song"
+        # means 0.00s. Same song re-played with the same source remembers
+        # the last value the operator dialled in. Kept in memory rather
+        # than persisted because the operator's preference is intrinsic
+        # to a particular file/source pairing, not a global config knob.
+        self._subtitle_offsets: dict[tuple[int, str], float] = {}
+        self._subtitle_offsets_lock = threading.Lock()
+
         self.generate_qr_code()
 
         # Clean up half-written Demucs stems from any previous run.
@@ -1573,6 +1582,13 @@ class Karaoke:
             else None
         )
 
+        # Subtitle timing offset is memoised per (song, effective source)
+        # for the lifetime of the process. A fresh song or a source switch
+        # to one the operator hasn't tweaked yet renders as 0.00s — the
+        # value is intrinsic to the file/source pairing, not a global pref.
+        effective_subtitle_source = override or playback_state.get("now_playing_lyrics_source")
+        subtitle_offset = self.get_subtitle_offset(song_id, effective_subtitle_source)
+
         return {
             **playback_state,
             "up_next": next_song["title"] if next_song else None,
@@ -1583,7 +1599,8 @@ class Karaoke:
             "instrumental_volume": float(self.instrumental_volume),
             "vocals_url": vocals_url,
             "instrumental_url": instrumental_url,
-            "subtitle_offset": float(self.preferences.get_or_default("subtitle_offset")),
+            "subtitle_offset": subtitle_offset,
+            "subtitle_offset_source": effective_subtitle_source,
             "subtitle_sources": subtitle_sources,
             "subtitle_source_override": override,
             # The user's deferred pick: source they tapped that hadn't
@@ -1846,6 +1863,37 @@ class Karaoke:
         """Drop any deferred picker selection for ``song_path`` (idempotent)."""
         with self._pending_picks_lock:
             self._pending_subtitle_picks.pop(song_path, None)
+
+    # Bounds for the per-song subtitle timing offset (seconds). Matches the
+    # ±2s envelope of the previous slider; out-of-range values are clamped
+    # at the API boundary so a buggy client cannot poison the state map.
+    SUBTITLE_OFFSET_MIN = -2.0
+    SUBTITLE_OFFSET_MAX = 2.0
+
+    def get_subtitle_offset(self, song_id: int | None, source: str | None) -> float:
+        """Return the stored offset for ``(song_id, source)`` or 0.0."""
+        if song_id is None or not source:
+            return 0.0
+        with self._subtitle_offsets_lock:
+            return self._subtitle_offsets.get((song_id, source), 0.0)
+
+    def set_subtitle_offset(
+        self, song_id: int | None, source: str | None, offset: float
+    ) -> float:
+        """Store an offset for ``(song_id, source)`` and return the clamped value."""
+        clamped = max(self.SUBTITLE_OFFSET_MIN, min(self.SUBTITLE_OFFSET_MAX, float(offset)))
+        # Round to 2 decimals so the stored value matches what the UI shows;
+        # avoids drift from floating-point input parsing.
+        clamped = round(clamped, 2)
+        if song_id is None or not source:
+            return clamped
+        key = (song_id, source)
+        with self._subtitle_offsets_lock:
+            if clamped == 0.0:
+                self._subtitle_offsets.pop(key, None)
+            else:
+                self._subtitle_offsets[key] = clamped
+        return clamped
 
     def _on_subtitle_variant_landed(self, payload: dict[str, Any]) -> None:
         """Commit a deferred picker selection when the matching variant lands.

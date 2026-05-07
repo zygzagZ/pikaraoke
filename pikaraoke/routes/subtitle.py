@@ -169,3 +169,46 @@ def set_subtitle_source():
             logger.exception("set_subtitle_source: now_playing emit failed")
 
     return json.dumps({"status": "ok"}), 200
+
+
+@subtitle_bp.route("/subtitle_offset", methods=["POST"])
+def set_subtitle_offset():
+    """Store a per-(song, source) subtitle timing offset.
+
+    Body (JSON or form): ``{song_id: int, source: str, offset: float}``.
+    The value is clamped to ``Karaoke.SUBTITLE_OFFSET_MIN..MAX`` and rounded
+    to two decimals. Memoisation lives in process memory only — restarting
+    the server resets every song's offset to 0.00s, matching the "default
+    for a fresh song" requirement.
+    """
+    if not is_admin():
+        return _json_error("Unauthorized", 403)
+
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    raw_song_id = payload.get("song_id")
+    source = payload.get("source")
+    raw_offset = payload.get("offset")
+
+    if source is None or not isinstance(source, str) or not source:
+        return _json_error("source is required", 400)
+    try:
+        song_id = int(raw_song_id)
+    except (TypeError, ValueError):
+        return _json_error("song_id must be an integer", 400)
+    try:
+        offset = float(raw_offset)
+    except (TypeError, ValueError):
+        return _json_error("offset must be a number", 400)
+
+    k = get_karaoke_instance()
+    stored = k.set_subtitle_offset(song_id, source, offset)
+
+    # Re-emit now_playing so every connected splash + control panel
+    # picks up the new value on the next render. Splash already maps
+    # ``np.subtitle_offset`` to ``octopusInstance.timeOffset`` live.
+    try:
+        k.update_now_playing_socket()
+    except Exception:
+        logger.exception("set_subtitle_offset: now_playing emit failed")
+
+    return json.dumps({"status": "ok", "offset": stored}), 200

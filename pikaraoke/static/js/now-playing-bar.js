@@ -66,8 +66,9 @@
     el.vocalVal = el.full.querySelector('[data-pk-vocal-val]');
     el.instVal = el.full.querySelector('[data-pk-inst-val]');
     el.subOffsetTool = el.full.querySelector('[data-pk-subtitle-offset-tool]');
-    el.subOffsetSlider = el.full.querySelector('[data-pk-subtitle-offset]');
-    el.subOffsetVal = el.full.querySelector('[data-pk-subtitle-offset-val]');
+    el.subOffsetInput = el.full.querySelector('[data-pk-subtitle-offset]');
+    el.subOffsetDec = el.full.querySelector('[data-pk-subtitle-offset-dec]');
+    el.subOffsetInc = el.full.querySelector('[data-pk-subtitle-offset-inc]');
     el.subSrcTool = el.full.querySelector('[data-pk-subtitle-src-tool]');
     el.subSrcSelect = el.full.querySelector('[data-pk-subtitle-src]');
     el.subSrcMount = el.full.querySelector('[data-pk-subtitle-src-mount]');
@@ -144,9 +145,6 @@
 
       window.socket.off('ffmpeg_progress', onFfmpegProgress);
       window.socket.on('ffmpeg_progress', onFfmpegProgress);
-
-      window.socket.off('preferences_update', onPreferencesUpdate);
-      window.socket.on('preferences_update', onPreferencesUpdate);
     }
 
     document.addEventListener('visibilitychange', () => {
@@ -332,12 +330,11 @@
 
     // Subtitle source picker (per-song operator override).
     updateSubtitleSourcePicker(data);
-    if (el.subOffsetSlider && typeof data.subtitle_offset === 'number'
-        && document.activeElement !== el.subOffsetSlider) {
-      el.subOffsetSlider.value = data.subtitle_offset;
-      if (el.subOffsetVal) {
-        el.subOffsetVal.textContent = data.subtitle_offset.toFixed(2) + 's';
-      }
+    // Don't stomp the input the operator is actively editing — they may be
+    // mid-keystroke. The blur/Enter commit path will catch the final value.
+    if (el.subOffsetInput && typeof data.subtitle_offset === 'number'
+        && document.activeElement !== el.subOffsetInput) {
+      el.subOffsetInput.value = data.subtitle_offset.toFixed(2);
     }
 
     updateLyrics(data);
@@ -574,19 +571,72 @@
       });
     }
 
-    // Subtitle offset — reuse the generic preferences route so the value
-    // persists in config.ini and broadcasts via 'preferences_update' to
-    // splash, which mutates octopusInstance.timeOffset live.
-    if (el.subOffsetSlider) {
-      const pushOffset = debounce(() => {
-        const v = parseFloat(el.subOffsetSlider.value) || 0;
-        fetch('/change_preferences?pref=subtitle_offset&val=' + v);
-      }, 150);
-      el.subOffsetSlider.addEventListener('input', () => {
-        const v = parseFloat(el.subOffsetSlider.value) || 0;
-        if (el.subOffsetVal) el.subOffsetVal.textContent = v.toFixed(2) + 's';
-        pushOffset();
+    // Subtitle offset — per-(song, source) value, stored in process memory
+    // server-side. POST commits the change; server re-emits now_playing so
+    // splash + every connected control surface picks up the new offset.
+    if (el.subOffsetInput) {
+      const STEP = 0.05;
+      const MIN = -2;
+      const MAX = 2;
+
+      const formatOffset = (v) => v.toFixed(2);
+      const clampOffset = (v) => Math.max(MIN, Math.min(MAX, v));
+      // Round to 2 decimals to keep stepper math + manual entry on the
+      // same grid; otherwise 0.05 + 0.05 + 0.05 drifts to 0.150000001s.
+      const round2 = (v) => Math.round(v * 100) / 100;
+
+      const currentOffset = () => {
+        const v = parseFloat(el.subOffsetInput.value);
+        return Number.isFinite(v) ? v : 0;
+      };
+
+      const commitOffset = (rawValue) => {
+        const next = round2(clampOffset(rawValue));
+        el.subOffsetInput.value = formatOffset(next);
+        const songId = state.data && state.data.now_playing_song_id;
+        const source = state.data && state.data.subtitle_offset_source;
+        if (state.data) state.data.subtitle_offset = next;
+        // Re-tick locally so the active line + word-fill snap to the new
+        // offset immediately rather than waiting up to 1s for the next
+        // playback_position event.
+        anchorWordFillClock();
+        tickLyrics(state.lyricsPosition);
+        if (songId == null || !source) return;
+        fetch('/subtitle_offset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ song_id: songId, source, offset: next }),
+        }).catch(() => { /* network errors surface on the next now_playing tick */ });
+      };
+
+      el.subOffsetInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          el.subOffsetInput.blur();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          commitOffset(currentOffset() + STEP);
+        } else if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          commitOffset(currentOffset() - STEP);
+        }
       });
+      el.subOffsetInput.addEventListener('change', () => {
+        commitOffset(currentOffset());
+      });
+      el.subOffsetInput.addEventListener('focus', () => {
+        el.subOffsetInput.select();
+      });
+      if (el.subOffsetDec) {
+        el.subOffsetDec.addEventListener('click', () => {
+          commitOffset(currentOffset() - STEP);
+        });
+      }
+      if (el.subOffsetInc) {
+        el.subOffsetInc.addEventListener('click', () => {
+          commitOffset(currentOffset() + STEP);
+        });
+      }
     }
 
     // Subtitle source picker — the smart popover wires its own click /
@@ -987,16 +1037,6 @@
     if (!node) return;
     e.preventDefault();
     onLyricLineActivate(e);
-  }
-
-  // preferences_update fires when any pilot drags the subtitle-offset
-  // slider. Re-tick immediately so the highlight re-aligns without
-  // waiting for the next playback_position event (~1 Hz away).
-  function onPreferencesUpdate(data) {
-    if (!data || typeof data.subtitle_offset !== 'number') return;
-    if (state.data) state.data.subtitle_offset = data.subtitle_offset;
-    anchorWordFillClock();
-    tickLyrics(state.lyricsPosition);
   }
 
   // ===== Word-level fill (rAF interpolation) =====

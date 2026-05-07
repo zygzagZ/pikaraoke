@@ -1254,11 +1254,6 @@ const PREFERENCE_EFFECTS = {
     screensaverTimeoutSeconds = v;
     PikaraokeConfig.screensaverTimeout = v;
   },
-  subtitle_offset: (v) => {
-    const offset = Number(v) || 0;
-    PikaraokeConfig.subtitleOffset = offset;
-    if (octopusInstance) octopusInstance.timeOffset = offset;
-  },
 };
 
 const parsePreferenceValue = (value) => {

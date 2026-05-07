@@ -106,6 +106,8 @@ class MockKaraoke:
     """
 
     def __init__(self, tmp_path):
+        import threading
+
         self.song_manager = MockSongManager()
         self._socketio = None
         self.events = EventSystem()
@@ -118,6 +120,8 @@ class MockKaraoke:
         self.instrumental_volume = 1.0
         self.running = True
         self.now_playing_notification = None
+        self._subtitle_offsets: dict[tuple[int, str], float] = {}
+        self._subtitle_offsets_lock = threading.Lock()
 
         # Set preferences that differ from defaults
         self.preferences.set("enable_fair_queue", True)
@@ -156,6 +160,10 @@ class MockKaraoke:
     # Bind the real methods to our mock class
     get_now_playing = Karaoke.get_now_playing
     _get_subtitle_sources_for_now_playing = Karaoke._get_subtitle_sources_for_now_playing
+    get_subtitle_offset = Karaoke.get_subtitle_offset
+    set_subtitle_offset = Karaoke.set_subtitle_offset
+    SUBTITLE_OFFSET_MIN = Karaoke.SUBTITLE_OFFSET_MIN
+    SUBTITLE_OFFSET_MAX = Karaoke.SUBTITLE_OFFSET_MAX
     _has_local_vtt_file = Karaoke._has_local_vtt_file
     _SUBTITLE_STATUS_READY = Karaoke._SUBTITLE_STATUS_READY
     _SUBTITLE_STATUS_DOWNLOAD = Karaoke._SUBTITLE_STATUS_DOWNLOAD
