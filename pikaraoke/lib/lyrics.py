@@ -82,7 +82,10 @@ from pikaraoke.lib.whisper_transcript_cache import (
 logger = logging.getLogger(__name__)
 
 LRCLIB_BASE = "https://lrclib.net"
-LRCLIB_TIMEOUT = 5.0
+# (connect, read) — server is consistently slow; legitimate /api/get
+# responses regularly take 8-10s, and a too-aggressive read timeout
+# masquerades as a miss. Connect stays short to fail fast on outages.
+LRCLIB_TIMEOUT: tuple[float, float] = (5.0, 15.0)
 
 # Tolerance (seconds) when filtering ``/api/search`` results by duration.
 # LRCLib's ``/api/search`` doesn't accept a duration query parameter, so
@@ -1703,10 +1706,11 @@ class LyricsService:
             if isrc:
                 track_id = items[0].get("id")
             else:
-                artist_key = remove_accents(artist.strip().lower())
                 for item in items:
-                    primary = ((item.get("artists") or [{}])[0]).get("name", "")
-                    if remove_accents(primary.strip().lower()) == artist_key:
+                    artists = item.get("artists") or []
+                    primary = (artists[0] if artists else {}).get("name", "")
+                    others = [a.get("name", "") for a in artists[1:]]
+                    if _artist_matches(artist, primary, others):
                         track_id = item.get("id")
                         break
         # Cache the result (including misses) to avoid retrying the rate-
@@ -3496,8 +3500,87 @@ def _strip_variant_markers(title: str) -> str:
     return stripped or title
 
 
+# Letters that Unicode NFKD won't decompose because they aren't accented
+# base letters: Polish ``ł``/``Ł`` (slashed L) and Scandinavian ``ø``/``Ø``
+# (slashed O). ``remove_accents`` leaves them alone, so a query like
+# ``Kielas`` would never substring-match ``Kiełas`` even after folding
+# both sides. Apply this fold *after* ``remove_accents``.
+_LATIN_FOLD = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O"})
+
+
+def _fold_for_match(text: str) -> str:
+    """Accent-strip + Latin extension flatten + lowercase. Comparison-only key."""
+    return remove_accents(text).translate(_LATIN_FOLD).lower()
+
+
+# Delimiters that split a multi-artist credit. ``&`` and ``,`` always
+# split because they're never part of an artist name; the others
+# (``/``, ``x``, ``feat``, ``ft``, ``vs``, ``with``) require surrounding
+# whitespace to preserve names like ``AC/DC``, ``Malcolm X``,
+# ``X Ambassadors``, and ``Living With Lions``.
+_ARTIST_SPLIT_RE = re.compile(
+    r"""
+        \s*&\s*                              # &
+      | \s*,\s*                              # ,
+      | \s+/\s+                              # /  (only with surrounding ws)
+      | \s+(?:feat\.?|ft\.?|vs\.?|with)\s+   # word delimiters
+      | \s+x\s+                              # x  (only with surrounding ws)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _artist_tokens(artist: str) -> list[str]:
+    """Folded lowercase tokens from a multi-artist credit string.
+
+    ``"Gibbs & Kiełas"`` -> ``["gibbs", "kielas"]``;
+    ``"Eminem feat. Rihanna"`` -> ``["eminem", "rihanna"]``.
+    Tokens shorter than two chars are dropped to avoid spurious matches
+    against single-letter aliases.
+    """
+    if not artist:
+        return []
+    parts = _ARTIST_SPLIT_RE.split(artist.strip())
+    return [t for t in (_fold_for_match(p.strip()) for p in parts if p) if len(t) >= 2]
+
+
+def _artist_matches(artist: str, primary: str, others: list[str] | None = None) -> bool:
+    """True when ``artist`` plausibly matches a result's credit list.
+
+    Accepts on (a) folded equality with ``primary``, or (b) any token of
+    ``artist`` matching ``primary`` or any name in ``others``. Token
+    splitting on ``&``/``,``/``/``/``feat``/``ft``/``vs``/``x``/``with``
+    means a query for ``"Gibbs & Kiełas"`` matches a hit credited as
+    primary=``"Gibbs"`` with ``"Kiełas"`` featured -- the common shape on
+    Genius and Spotify when collaborator metadata is split between
+    primary and featured arrays.
+    """
+    primary_key = _fold_for_match((primary or "").strip())
+    if not primary_key:
+        return False
+    artist_key = _fold_for_match((artist or "").strip())
+    if artist_key and artist_key == primary_key:
+        return True
+    tokens = set(_artist_tokens(artist))
+    if not tokens:
+        return False
+    candidates = {primary_key}
+    for other in others or ():
+        other_key = _fold_for_match((other or "").strip())
+        if other_key:
+            candidates.add(other_key)
+    return bool(tokens & candidates)
+
+
 def _fetch_lrclib(track: str, artist: str, duration: int | float | None) -> str | None:
-    """Query LRCLib for syncedLyrics; None when none found or request failed."""
+    """Query LRCLib for syncedLyrics; None when none found or request failed.
+
+    Tries ``/api/get`` first (exact match) and falls back to ``/api/search``
+    when /get misses, errors, *or* times out. The timeout fallback matters:
+    when the artist tag drifts (yt-dlp's "Gibbs & Kiełas" vs LRCLib's
+    "Gibbs"), /api/get hangs rather than returning a fast 404, so isolating
+    the call lets /search rescue an otherwise-pinned-as-miss song.
+    """
     track = _strip_variant_markers(track)
     get_params: dict[str, str | int] = {"track_name": track, "artist_name": artist}
     if duration:
@@ -3515,6 +3598,9 @@ def _fetch_lrclib(track: str, artist: str, duration: int | float | None) -> str 
                     duration,
                 )
                 return synced
+    except (requests.RequestException, ValueError) as e:
+        logger.info("LRCLib /api/get failed (%s); trying /api/search", e)
+    try:
         r = requests.get(
             f"{LRCLIB_BASE}/api/search",
             params={"track_name": track, "artist_name": artist},
@@ -3542,7 +3628,7 @@ def _fetch_lrclib(track: str, artist: str, duration: int | float | None) -> str 
                 logger.info("LRCLib: hit /api/search track=%r artist=%r", track, artist)
                 return synced
     except (requests.RequestException, ValueError) as e:
-        logger.warning("LRCLib request failed: %s", e)
+        logger.warning("LRCLib /api/search failed: %s", e)
         return None
     logger.info("LRCLib: miss track=%r artist=%r duration=%s", track, artist, duration)
     return None
@@ -3639,14 +3725,16 @@ def _fetch_genius(track: str, artist: str) -> str | None:
         logger.warning("Genius search failed: %s", e)
         return None
     # Accent-fold both sides so yt-dlp metadata like "Edyta Gorniak"
-    # matches Genius's "Edyta Górniak". Pure .lower() keeps diacritics,
-    # so the exact-match drops legitimate hits for non-ASCII artists.
-    artist_key = remove_accents(artist.strip().lower())
+    # matches Genius's "Edyta Górniak". ``_artist_matches`` also tokenizes
+    # the query on "&"/"feat"/"ft"/etc. so a search for "Gibbs & Kiełas"
+    # matches a hit credited primary="Gibbs" with featured=["Kiełas"] --
+    # the standard shape for Polish rap collabs on Genius.
     url = None
     for hit in hits:
         result = hit.get("result") or {}
         primary = (result.get("primary_artist") or {}).get("name", "")
-        if remove_accents(primary.strip().lower()) == artist_key:
+        featured = [a.get("name", "") for a in (result.get("featured_artists") or [])]
+        if _artist_matches(artist, primary, featured):
             url = result.get("url")
             break
     if not url:
@@ -3788,17 +3876,9 @@ def _extract_genius_lyrics(html: str) -> str | None:
 # ----- Tekstowo client -----
 
 
-# Polish has two letters that Unicode NFKD won't decompose because they
-# aren't accented base letters: ``ł``/``Ł`` (slashed L) and ``ø``-style
-# variants. ``remove_accents`` leaves them alone, so a query like
-# ``Malgoska`` would never substring-match the search-result label
-# ``Małgośka`` even after accent folding both sides. Apply this fold
-# *after* ``remove_accents`` to canonicalise everything to ASCII.
-_TEKSTOWO_LATIN_FOLD = str.maketrans({"ł": "l", "Ł": "L"})
-
-
-def _tekstowo_fold(text: str) -> str:
-    return remove_accents(text).translate(_TEKSTOWO_LATIN_FOLD).lower()
+# Tekstowo uses the same Polish-ł-aware folding as the artist matcher;
+# keep the alias for callers below.
+_tekstowo_fold = _fold_for_match
 
 
 def _fetch_tekstowo(track: str, artist: str) -> str | None:
@@ -3836,9 +3916,8 @@ def _fetch_tekstowo(track: str, artist: str) -> str | None:
         logger.warning("Tekstowo search failed: %s", e)
         return None
 
-    artist_key = _tekstowo_fold(artist.strip())
     track_key = _tekstowo_fold(track_clean.strip())
-    parser = _TekstowoSearchParser(artist_key, track_key)
+    parser = _TekstowoSearchParser(artist, track_key)
     try:
         parser.feed(r.text)
     except Exception:
@@ -3879,9 +3958,9 @@ class _TekstowoSearchParser(HTMLParser):
     the page even when "Halo" doesn't appear in any result.
     """
 
-    def __init__(self, artist_key: str, track_key: str) -> None:
+    def __init__(self, artist: str, track_key: str) -> None:
         super().__init__()
-        self._artist_key = artist_key
+        self._artist = artist
         self._track_key = track_key
         self._capturing = False
         self._text_buf: list[str] = []
@@ -3917,7 +3996,7 @@ class _TekstowoSearchParser(HTMLParser):
         if " - " not in text:
             return
         result_artist, result_track = text.split(" - ", 1)
-        if _tekstowo_fold(result_artist.strip()) != self._artist_key:
+        if not _artist_matches(self._artist, result_artist.strip()):
             return
         if self._track_key and self._track_key not in _tekstowo_fold(result_track.strip()):
             return

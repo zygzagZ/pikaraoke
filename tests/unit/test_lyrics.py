@@ -71,6 +71,8 @@ from pikaraoke.lib.lyrics import (
     LyricsService,
     Word,
     WordPart,
+    _artist_matches,
+    _artist_tokens,
     _ass_header,
     _ass_path,
     _cleanup_yt_vtt,
@@ -535,10 +537,34 @@ class TestFetchLrclib:
         with patch("pikaraoke.lib.lyrics.requests.get", side_effect=[get_resp, search_resp]):
             assert _fetch_lrclib("T", "A", None) is None
 
-    def test_network_error_returns_none(self):
+    def test_get_connection_error_falls_back_to_search(self):
+        # Companion to the timeout case: any RequestException on /get must
+        # let /search rescue, not abort the function.
+        search_resp = MagicMock(status_code=200)
+        search_resp.json.return_value = [{"syncedLyrics": "[00:01.00]rescued"}]
         with patch(
             "pikaraoke.lib.lyrics.requests.get",
-            side_effect=requests.ConnectionError(),
+            side_effect=[requests.ConnectionError(), search_resp],
+        ):
+            assert _fetch_lrclib("T", "A", None) == "[00:01.00]rescued"
+
+    def test_get_timeout_falls_back_to_search(self):
+        # /api/get hangs forever when the artist tag drifts from LRCLib's
+        # canonical name (e.g. yt-dlp "Gibbs & Kiełas" vs LRCLib "Gibbs"),
+        # so the read-timeout must NOT abort the whole function -- /search
+        # is the rescue path.
+        search_resp = MagicMock(status_code=200)
+        search_resp.json.return_value = [{"syncedLyrics": "[00:01.00]rescued"}]
+        with patch(
+            "pikaraoke.lib.lyrics.requests.get",
+            side_effect=[requests.ReadTimeout(), search_resp],
+        ):
+            assert _fetch_lrclib("T", "Gibbs & Kielas", None) == "[00:01.00]rescued"
+
+    def test_both_endpoints_failing_returns_none(self):
+        with patch(
+            "pikaraoke.lib.lyrics.requests.get",
+            side_effect=[requests.ReadTimeout(), requests.ReadTimeout()],
         ):
             assert _fetch_lrclib("T", "A", 180) is None
 
@@ -622,6 +648,81 @@ class TestStripVariantMarkers:
         assert _strip_variant_markers("(Instrumental)") == "(Instrumental)"
 
 
+# ----- Artist token matching -----
+
+
+class TestArtistTokens:
+    def test_splits_on_ampersand(self):
+        assert _artist_tokens("Gibbs & Kiełas") == ["gibbs", "kielas"]
+
+    def test_splits_on_feat_and_ft(self):
+        assert _artist_tokens("Eminem feat. Rihanna") == ["eminem", "rihanna"]
+        assert _artist_tokens("Eminem ft. Rihanna") == ["eminem", "rihanna"]
+
+    def test_splits_on_comma_and_x(self):
+        assert _artist_tokens("Drake, Future") == ["drake", "future"]
+        assert _artist_tokens("Doja Cat x SZA") == ["doja cat", "sza"]
+
+    def test_single_artist_yields_one_token(self):
+        assert _artist_tokens("Adele") == ["adele"]
+
+    def test_drops_short_tokens(self):
+        # Single-letter aliases like "X" alone would match too liberally.
+        assert _artist_tokens("X & Adele") == ["adele"]
+
+    def test_preserves_slash_in_band_names(self):
+        # AC/DC must NOT split on the slash (no surrounding whitespace).
+        assert _artist_tokens("AC/DC") == ["ac/dc"]
+
+    def test_preserves_x_in_band_names(self):
+        # ``Malcolm X`` and ``X Ambassadors`` -- ``x`` only splits when
+        # surrounded by whitespace, so these stay intact.
+        assert _artist_tokens("Malcolm X") == ["malcolm x"]
+        assert _artist_tokens("X Ambassadors") == ["x ambassadors"]
+
+    def test_splits_x_only_with_surrounding_whitespace(self):
+        # The real "x" delimiter case: " x " between two artists.
+        assert _artist_tokens("Doja Cat x SZA") == ["doja cat", "sza"]
+
+    def test_folds_scandinavian_o_slash(self):
+        # remove_accents leaves ø alone; the LATIN_FOLD must catch it.
+        assert _artist_tokens("Bjørk") == ["bjork"]
+
+    def test_empty_input_returns_empty_list(self):
+        assert _artist_tokens("") == []
+        assert _artist_tokens("   ") == []
+
+
+class TestArtistMatches:
+    def test_exact_match_passes(self):
+        assert _artist_matches("Adele", "Adele") is True
+
+    def test_accent_folded_match_passes(self):
+        # yt-dlp strips diacritics; result keeps them.
+        assert _artist_matches("Edyta Gorniak", "Edyta Górniak") is True
+
+    def test_token_match_against_primary(self):
+        # The Gibbs case: query has "&", primary has just one of the names.
+        assert _artist_matches("Gibbs & Kiełas", "Gibbs") is True
+
+    def test_token_match_against_featured(self):
+        assert _artist_matches("Macklemore & Ryan Lewis", "Ryan Lewis", ["Macklemore"]) is True
+
+    def test_no_overlap_rejected(self):
+        # Aggregator-credited rap: nothing overlaps with the searched artist.
+        assert _artist_matches("Gibbs & Kielas", "Popkiller", []) is False
+
+    def test_empty_primary_rejected(self):
+        assert _artist_matches("Adele", "") is False
+
+    def test_empty_query_with_empty_primary_rejected(self):
+        assert _artist_matches("", "") is False
+
+    def test_empty_query_with_real_primary_rejected(self):
+        # Empty artist key + real primary: no overlap, must reject.
+        assert _artist_matches("", "Foo") is False
+
+
 # ----- Genius client -----
 
 
@@ -681,28 +782,75 @@ class TestFetchGenius:
             assert _fetch_genius("Track", "Artist") is None
 
     def test_logs_seen_primaries_on_artist_mismatch(self, caplog):
-        # Diagnostic: when search returns hits but no primary_artist matches,
-        # log the queried artist + a sample of seen primaries so the operator
-        # can spot featured-artist mismatches like "Macklemore & Ryan Lewis"
-        # vs Genius's "Macklemore".
+        # Diagnostic: when search returns hits but no credit matches the
+        # query (primary OR featured), log the queried artist + a sample
+        # of seen primaries so the operator can debug aggregator-credited
+        # tracks (e.g. Polish rap on Genius filed under "Popkiller").
         search_resp = MagicMock(status_code=200)
         search_resp.json.return_value = {
             "response": {
                 "hits": [
-                    {"result": {"primary_artist": {"name": "Macklemore"}, "url": "u"}},
-                    {"result": {"primary_artist": {"name": "Ryan Lewis"}, "url": "u"}},
+                    {"result": {"primary_artist": {"name": "Popkiller"}, "url": "u"}},
+                    {"result": {"primary_artist": {"name": "Rap Genius Polska"}, "url": "u"}},
                 ]
             }
         }
         with patch("pikaraoke.lib.lyrics.GENIUS_ACCESS_TOKEN", "token"), patch(
             "pikaraoke.lib.lyrics.requests.get", return_value=search_resp
         ), caplog.at_level("INFO", logger="pikaraoke.lib.lyrics"):
-            assert _fetch_genius("Track", "Macklemore & Ryan Lewis") is None
+            assert _fetch_genius("Track", "Gibbs & Kielas") is None
         msgs = [r.getMessage() for r in caplog.records]
         assert any(
-            "no artist match" in m and "Macklemore & Ryan Lewis" in m and "Macklemore" in m
-            for m in msgs
+            "no artist match" in m and "Gibbs & Kielas" in m and "Popkiller" in m for m in msgs
         ), msgs
+
+    def test_matches_when_primary_is_one_of_query_tokens(self):
+        # Fix for the "Gibbs & Kiełas / Piękny Świat" case: Genius credits
+        # the song to primary="Gibbs" with featured=["Kiełas"], so a query
+        # for "Gibbs & Kiełas" must token-split and match the primary.
+        search_resp = MagicMock(status_code=200)
+        search_resp.json.return_value = {
+            "response": {
+                "hits": [
+                    {
+                        "result": {
+                            "primary_artist": {"name": "Gibbs"},
+                            "featured_artists": [{"name": "Kiełas"}],
+                            "url": "https://genius.com/gibbs-piekny-swiat-lyrics",
+                        }
+                    }
+                ]
+            }
+        }
+        page_resp = MagicMock(status_code=200, text="")
+        with patch("pikaraoke.lib.lyrics.GENIUS_ACCESS_TOKEN", "token"), patch(
+            "pikaraoke.lib.lyrics.requests.get", side_effect=[search_resp, page_resp]
+        ), patch("pikaraoke.lib.lyrics._extract_genius_lyrics", return_value="lyrics"):
+            assert _fetch_genius("Piekny Swiat", "Gibbs & Kielas") == "lyrics"
+
+    def test_matches_when_featured_is_one_of_query_tokens(self):
+        # The complementary shape: Genius credits primary="Ryan Lewis" with
+        # featured=["Macklemore"], query is "Macklemore & Ryan Lewis".
+        # Matcher must scan featured_artists, not just primary.
+        search_resp = MagicMock(status_code=200)
+        search_resp.json.return_value = {
+            "response": {
+                "hits": [
+                    {
+                        "result": {
+                            "primary_artist": {"name": "Ryan Lewis"},
+                            "featured_artists": [{"name": "Macklemore"}],
+                            "url": "https://genius.com/x",
+                        }
+                    }
+                ]
+            }
+        }
+        page_resp = MagicMock(status_code=200, text="")
+        with patch("pikaraoke.lib.lyrics.GENIUS_ACCESS_TOKEN", "token"), patch(
+            "pikaraoke.lib.lyrics.requests.get", side_effect=[search_resp, page_resp]
+        ), patch("pikaraoke.lib.lyrics._extract_genius_lyrics", return_value="hi"):
+            assert _fetch_genius("Track", "Macklemore & Ryan Lewis") == "hi"
 
     def test_returns_none_on_network_error(self):
         with patch("pikaraoke.lib.lyrics.GENIUS_ACCESS_TOKEN", "token"), patch(
@@ -858,6 +1006,25 @@ class TestFetchTekstowo:
             _fetch_tekstowo("X", "Y")
             ua = mock_get.call_args.kwargs["headers"]["User-Agent"]
             assert "Mozilla" in ua
+
+    def test_token_match_accepts_subset_artist_credit(self):
+        # The same artist-tag-drift the LRCLib/Genius fix targets: query
+        # is "Gibbs & Kiełas" but Tekstowo files the song under one of
+        # the names. Token-aware matching must accept this; pre-fix the
+        # parser did exact-equality and silently missed.
+        html = (
+            "<html><body>"
+            '<a href="/gibbs/piekny-swiat" class="title">'
+            "Gibbs - Piękny Świat</a>"
+            "</body></html>"
+        )
+        page = MagicMock(status_code=200, text=self.LYRICS_HTML)
+        with patch(
+            "pikaraoke.lib.lyrics.requests.get",
+            side_effect=[MagicMock(status_code=200, text=html), page],
+        ) as mock_get:
+            _fetch_tekstowo("Piękny Świat", "Gibbs & Kiełas")
+            assert "gibbs/piekny-swiat" in mock_get.call_args_list[1].args[0]
 
 
 class TestExtractTekstowoLyrics:
