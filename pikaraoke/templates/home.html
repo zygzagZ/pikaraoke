@@ -729,13 +729,22 @@
     window.PK = window.PK || {};
     window.PK.queueRefresh = refreshQueue;
 
-    window.socket.off('queue_update');
+    // SPA navigation re-runs this script on every mount, creating fresh
+    // refreshQueue / pollDownloads closures. We must remove the *previous*
+    // mount's handlers (not all listeners for the event) — `now_playing`
+    // is also listened to by now-playing-bar.js and base.html's warning
+    // icon, so a broad off() would wipe them and freeze the mini-player.
+    const sockBindings = window.PK._homeSockBindings;
+    if (sockBindings) {
+      window.socket.off('queue_update', sockBindings.refreshQueue);
+      window.socket.off('now_playing', sockBindings.refreshQueue);
+      window.socket.off('download_started', sockBindings.pollDownloads);
+      window.socket.off('download_stopped', sockBindings.pollDownloads);
+    }
+    window.PK._homeSockBindings = { refreshQueue, pollDownloads };
     window.socket.on('queue_update', refreshQueue);
-    window.socket.off('now_playing');
     window.socket.on('now_playing', refreshQueue);
-    window.socket.off('download_started');
     window.socket.on('download_started', pollDownloads);
-    window.socket.off('download_stopped');
     window.socket.on('download_stopped', pollDownloads);
 
     document.addEventListener('visibilitychange', () => {
