@@ -44,8 +44,12 @@ try {
     foreach ($path in $endpoints) {
         Write-Host "Checking http://localhost:5555$path ..."
         try {
-            # Use curl.exe to avoid PowerShell's Invoke-WebRequest alias issues
-            $result = curl.exe -s http://localhost:5555$path | Select-String "DOCTYPE"
+            # Use curl.exe to avoid PowerShell's Invoke-WebRequest alias issues.
+            # -L follows redirects (e.g. /queue -> /); -f fails on HTTP error.
+            # Werkzeug's redirect body uses lowercase "<!doctype html>" while
+            # base.html uses uppercase — Select-String is case-insensitive by
+            # default, so either matches.
+            $result = curl.exe -sLf http://localhost:5555$path | Select-String "doctype"
             if (-not $result) {
                 Write-Host "Error: Failed to verify $path (DOCTYPE not found)"
                 $failed = $true

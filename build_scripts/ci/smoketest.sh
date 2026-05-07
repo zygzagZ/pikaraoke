@@ -50,7 +50,10 @@ ENDPOINTS=(
 FAILED=false
 for path in "${ENDPOINTS[@]}"; do
     echo "Checking http://localhost:5555$path ..."
-    if ! curl -s http://localhost:5555"$path" | grep -q "DOCTYPE"; then
+    # -L: follow redirects (e.g. /queue -> /); -f: fail on HTTP error.
+    # grep -i: Werkzeug emits lowercase "<!doctype html>" on its redirect
+    # body, while base.html uses uppercase — accept either.
+    if ! curl -sLf http://localhost:5555"$path" | grep -qi "doctype"; then
         echo "Error: Failed to verify $path"
         FAILED=true
     fi
