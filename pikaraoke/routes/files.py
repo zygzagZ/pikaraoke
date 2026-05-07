@@ -51,6 +51,15 @@ class EditFileForm(Schema):
         required=True, metadata={"description": "Current full path of the song file"}
     )
     referrer = fields.String(metadata={"description": "URL to redirect back to after editing"})
+    language = fields.String(
+        load_default="",
+        metadata={
+            "description": (
+                "Optional ISO-639-1 lower-case language code (e.g. 'pl'). Empty keeps "
+                "the existing value; non-empty writes with manual provenance."
+            )
+        },
+    )
 
 
 @files_bp.route("/browse", methods=["GET"])
@@ -229,11 +238,27 @@ def edit_file(query):
     # row the chip stays hidden.
     metadata_status = None
     metadata_language = None
+    db_artist = ""
+    db_title = ""
     if song_id is not None and k.db is not None:
         row = k.db.get_song_by_id(song_id)
         if row is not None:
             metadata_status = row["metadata_status"]
             metadata_language = row["language"]
+            db_artist = (row["artist"] or "").strip()
+            db_title = (row["title"] or "").strip()
+
+    # Prefer DB values (canonical after manual edit / iTunes enrichment) and
+    # fall back to filename split when the row isn't ingested yet or fields
+    # are empty — keeps scanner-discovered songs editable before enrichment
+    # has a chance to populate the columns.
+    parts = raw_stem.split(" - ", 1)
+    if len(parts) == 2:
+        fallback_artist, fallback_title = parts[0].strip(), parts[1].strip()
+    else:
+        fallback_artist, fallback_title = "", raw_stem
+    initial_artist = db_artist or fallback_artist
+    initial_title = db_title or fallback_title
 
     return render_template(
         "edit.html",
@@ -249,6 +274,8 @@ def edit_file(query):
         song_id=song_id,
         metadata_status=metadata_status,
         metadata_language=metadata_language,
+        initial_artist=initial_artist,
+        initial_title=initial_title,
     )
 
 
@@ -274,6 +301,7 @@ def rename_file(form):
     referrer = form.get("referrer") or url_for("files.browse")
     new_name = form["new_file_name"]
     old_name = form["old_file_name"]
+    language = (form.get("language") or "").strip().lower()
     if not is_admin():
         flash(_("You don't have permission to edit songs"), "is-danger")
     yt_suffix = youtube_id_suffix(old_name)
@@ -298,7 +326,7 @@ def rename_file(form):
             )
         else:
             try:
-                k.song_manager.rename(old_name, new_name_full)
+                new_path = k.song_manager.rename(old_name, new_name_full)
             except OSError as e:
                 logging.error(f"Error renaming file: {e}")
                 flash(
@@ -306,9 +334,45 @@ def rename_file(form):
                     "is-danger",
                 )
             else:
+                _apply_metadata_edit(k, new_path, new_name, language)
                 flash(
                     # MSG: Message shown after renaming a file.
                     _("Renamed file: %s to %s") % (old_name, new_name_full),
                     "is-warning",
                 )
     return redirect(referrer)
+
+
+def _apply_metadata_edit(k, new_path: str, new_name: str, language: str) -> None:
+    """Persist artist/title/language to the songs row and re-fetch lyrics.
+
+    The lyrics pipeline reads ``songs.artist`` / ``songs.title`` /
+    ``songs.language`` directly — the on-disk filename is not consulted.
+    Without writing the DB the user's edit changes the display name only;
+    LRCLib, Genius and Spotify keep getting queried with the original
+    metadata and the cached ``.ass`` files are never refreshed.
+    """
+    if k.db is None:
+        return
+    song_id = k.db.get_song_id_by_path(new_path)
+    if song_id is None:
+        return
+
+    artist, sep, title = new_name.partition(" - ")
+    artist, title = artist.strip(), title.strip()
+    fields_to_write: dict[str, str] = {}
+    if sep and title:
+        fields_to_write["artist"] = artist
+        fields_to_write["title"] = title
+    elif artist:
+        # User entered only a title (no " - " separator); keep the existing
+        # artist rather than blanking it.
+        fields_to_write["title"] = artist
+    if language:
+        fields_to_write["language"] = language
+    if fields_to_write:
+        k.db.update_track_metadata_with_provenance(song_id, "manual", fields_to_write)
+
+    k.lyrics_service.invalidate_for_metadata_change(new_path)
+    k._dispatch_lyrics_fetch_async(new_path)
+    k.subtitle_orchestrator.kickoff(new_path, force=True)

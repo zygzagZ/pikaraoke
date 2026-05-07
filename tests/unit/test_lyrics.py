@@ -4192,3 +4192,70 @@ class TestSpotifyVariantConstants:
         # ``spotify`` (native) is line-level — same tier as lrclib raw.
         # ``spotify-sync`` (wav2vec2) is word-level.
         assert _tier_for_variant_source(SUBTITLE_SOURCE_SPOTIFY) == "line"
+
+
+class TestInvalidateForMetadataChange:
+    """Manual artist/title/language edit → wipe every cached subtitle artifact.
+
+    Without this the orchestrator short-circuits to ``success`` on the next
+    kickoff (it sees the old variant file on disk) and the canonical .ass
+    keeps showing the wrong-metadata lyrics.
+    """
+
+    def _setup(self, tmp_path):
+        from pikaraoke.lib.karaoke_database import KaraokeDatabase
+        from pikaraoke.lib.lyrics import variant_ass_path
+
+        song = tmp_path / "Foo---abcdefghijk.mp4"
+        song.write_text("fake")
+        db = KaraokeDatabase(str(tmp_path / "inv.db"))
+        db.insert_songs([{"file_path": str(song), "youtube_id": "abcdefghijk", "format": "mp4"}])
+        sid = db.get_song_id_by_path(str(song))
+        service = LyricsService(str(tmp_path), EventSystem(), db=db)
+        return str(song), db, sid, service, variant_ass_path
+
+    def test_deletes_canonical_and_variant_ass_files(self, tmp_path):
+        song, db, sid, service, variant_ass_path = self._setup(tmp_path)
+        ass = tmp_path / "Foo---abcdefghijk.ass"
+        ass.write_text("[Script Info]")
+        v_lrclib = variant_ass_path(song, "lrclib")
+        v_spotify = variant_ass_path(song, "spotify-sync")
+        for path in (v_lrclib, v_spotify):
+            with open(path, "w") as f:
+                f.write("[Script Info]")
+        db.upsert_subtitle_job(sid, "lrclib", "success", tier="line")
+        db.upsert_subtitle_job(sid, "AI", "failed", error_code="boom")
+
+        service.invalidate_for_metadata_change(song)
+
+        assert not ass.exists()
+        import os as _os
+
+        assert not _os.path.exists(v_lrclib)
+        assert not _os.path.exists(v_spotify)
+        assert db.get_subtitle_jobs(sid) == []
+        db.close()
+
+    def test_handles_missing_files_gracefully(self, tmp_path):
+        song, db, _sid, service, _variant_ass_path = self._setup(tmp_path)
+        # Nothing on disk besides the .mp4. Method must not raise.
+        service.invalidate_for_metadata_change(song)
+        db.close()
+
+    def test_no_op_when_song_not_in_db(self, tmp_path):
+        from pikaraoke.lib.karaoke_database import KaraokeDatabase
+
+        song = tmp_path / "Bar---abcdefghijk.mp4"
+        song.write_text("fake")
+        ass = tmp_path / "Bar---abcdefghijk.ass"
+        ass.write_text("[Script Info]")
+        db = KaraokeDatabase(str(tmp_path / "inv.db"))
+        # Note: song not inserted into DB.
+        service = LyricsService(str(tmp_path), EventSystem(), db=db)
+
+        service.invalidate_for_metadata_change(str(song))
+
+        # Files still get cleaned even when no DB row exists for the song —
+        # the cache is filesystem-keyed, not DB-keyed.
+        assert not ass.exists()
+        db.close()

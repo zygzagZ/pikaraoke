@@ -10,8 +10,13 @@ from flask import Flask
 if not hasattr(werkzeug, "__version__"):
     werkzeug.__version__ = "3.0.0"
 
+from pikaraoke.lib.karaoke_database import KaraokeDatabase
 from pikaraoke.routes.admin import admin_bp
-from pikaraoke.routes.files import _decorate_event, _youtube_id_from_path
+from pikaraoke.routes.files import (
+    _apply_metadata_edit,
+    _decorate_event,
+    _youtube_id_from_path,
+)
 
 
 class TestYoutubeIdFromPath:
@@ -90,3 +95,82 @@ class TestSongEventsRoute:
 # reads ``subtitle_sources`` straight from the ``now_playing`` payload, and
 # bulk lookups go through POST /api/songs/subtitles/bulk (see
 # tests/unit/test_subtitle_jobs_routes.py).
+
+
+@pytest.fixture
+def edit_ctx(tmp_path):
+    """Karaoke MagicMock with a real DB and one song row pre-inserted."""
+    db = KaraokeDatabase(str(tmp_path / "test.db"))
+    db.insert_songs([{"file_path": "/songs/x.mp4", "youtube_id": "abc12345678", "format": "mp4"}])
+    song_id = db.get_song_id_by_path("/songs/x.mp4")
+    k = MagicMock()
+    k.db = db
+    yield k, db, song_id
+    db.close()
+
+
+class TestApplyMetadataEdit:
+    """The seam that turns a rename into a DB write + lyrics re-fetch."""
+
+    def test_writes_artist_title_with_manual_provenance(self, edit_ctx):
+        k, db, song_id = edit_ctx
+        _apply_metadata_edit(k, "/songs/x.mp4", "Perfect - Autobiografia", "")
+        row = db.get_song_by_id(song_id)
+        assert row["artist"] == "Perfect"
+        assert row["title"] == "Autobiografia"
+        sources = json.loads(row["metadata_sources"])
+        assert sources["artist"] == "manual"
+        assert sources["title"] == "manual"
+
+    def test_writes_language_when_provided(self, edit_ctx):
+        k, db, song_id = edit_ctx
+        _apply_metadata_edit(k, "/songs/x.mp4", "Perfect - Autobiografia", "pl")
+        row = db.get_song_by_id(song_id)
+        assert row["language"] == "pl"
+        sources = json.loads(row["metadata_sources"])
+        assert sources["language"] == "manual"
+
+    def test_empty_language_keeps_existing_value(self, edit_ctx):
+        k, db, song_id = edit_ctx
+        # Seed an enricher-written language; an empty manual edit must not clear it.
+        db.update_track_metadata_with_provenance(song_id, "scanner", {"language": "en"})
+        _apply_metadata_edit(k, "/songs/x.mp4", "Perfect - Autobiografia", "")
+        row = db.get_song_by_id(song_id)
+        assert row["language"] == "en"
+
+    def test_title_only_preserves_existing_artist(self, edit_ctx):
+        k, db, song_id = edit_ctx
+        db.update_track_metadata_with_provenance(
+            song_id, "scanner", {"artist": "Original", "title": "OldTitle"}
+        )
+        _apply_metadata_edit(k, "/songs/x.mp4", "JustATitle", "")
+        row = db.get_song_by_id(song_id)
+        assert row["artist"] == "Original"
+        assert row["title"] == "JustATitle"
+
+    def test_manual_write_beats_subsequent_enrichment(self, edit_ctx):
+        k, db, song_id = edit_ctx
+        _apply_metadata_edit(k, "/songs/x.mp4", "Perfect - Autobiografia", "pl")
+        # Simulate an iTunes enrichment trying to overwrite later — manual
+        # provenance (confidence 100) must shut it out.
+        db.update_track_metadata_with_provenance(
+            song_id, "itunes", {"artist": "Wrong", "title": "Wrong", "language": "en"}
+        )
+        row = db.get_song_by_id(song_id)
+        assert row["artist"] == "Perfect"
+        assert row["title"] == "Autobiografia"
+        assert row["language"] == "pl"
+
+    def test_invalidates_lyrics_cache_and_kicks_off_refetch(self, edit_ctx):
+        k, _db, _sid = edit_ctx
+        _apply_metadata_edit(k, "/songs/x.mp4", "Perfect - Autobiografia", "")
+        k.lyrics_service.invalidate_for_metadata_change.assert_called_once_with("/songs/x.mp4")
+        k._dispatch_lyrics_fetch_async.assert_called_once_with("/songs/x.mp4")
+        k.subtitle_orchestrator.kickoff.assert_called_once_with("/songs/x.mp4", force=True)
+
+    def test_no_op_when_song_not_in_db(self, edit_ctx):
+        k, _db, _sid = edit_ctx
+        _apply_metadata_edit(k, "/songs/missing.mp4", "Perfect - Autobiografia", "pl")
+        k.lyrics_service.invalidate_for_metadata_change.assert_not_called()
+        k._dispatch_lyrics_fetch_async.assert_not_called()
+        k.subtitle_orchestrator.kickoff.assert_not_called()

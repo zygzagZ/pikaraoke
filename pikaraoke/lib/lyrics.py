@@ -1054,6 +1054,44 @@ class LyricsService:
             current_lyrics_sha=lyrics_sha,
         )
 
+    def invalidate_for_metadata_change(self, song_path: str) -> None:
+        """Drop every cached subtitle artifact + job state for a song.
+
+        A manual artist/title/language edit changes the inputs to LRCLib,
+        Genius, Spotify and Tekstowo lookups, so every prior variant is a
+        stale answer to a different question. Deleting the on-disk .ass
+        files lets ``SubtitleOrchestrator.kickoff`` re-queue each source
+        (its cache-hit branch checks for the variant file), and clearing
+        ``subtitle_jobs`` resets the failure-backoff gate so previously
+        failed sources retry immediately.
+        """
+        ass_files = [_ass_path(song_path)]
+        ass_files.extend(variant_ass_path(song_path, src) for src in VARIANT_FILE_SOURCES)
+        for path in ass_files:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception("invalidate_for_metadata_change: unlink failed for %s", path)
+        if self._db is None:
+            return
+        try:
+            song_id = self._db.get_song_id_by_path(song_path)
+        except Exception:
+            logger.exception(
+                "invalidate_for_metadata_change: get_song_id_by_path failed for %s", song_path
+            )
+            return
+        if song_id is None:
+            return
+        try:
+            self._db.delete_subtitle_jobs(song_id)
+        except Exception:
+            logger.exception(
+                "invalidate_for_metadata_change: delete_subtitle_jobs failed for %s", song_path
+            )
+
     def fetch_and_convert(self, song_path: str) -> None:
         """Entry point - event listener for `song_downloaded`."""
         try:

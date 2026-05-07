@@ -1162,6 +1162,17 @@ class KaraokeDatabase:
                 params,
             )
 
+    def delete_subtitle_jobs(self, song_id: int) -> int:
+        """Drop every subtitle_jobs row for a song; returns the rowcount.
+
+        Manual metadata edits invalidate every variant's prior outcome —
+        without clearing the rows the chip UI keeps showing stale state and
+        the orchestrator's failure-backoff gate may suppress retries.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM subtitle_jobs WHERE song_id = ?", (song_id,))
+            return cur.rowcount
+
     # ------------------------------------------------------------------
     # Metadata (app-level key-value store)
     # ------------------------------------------------------------------

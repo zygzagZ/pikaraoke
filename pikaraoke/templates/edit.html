@@ -471,15 +471,6 @@
 
 <h1 class="pk-view-title">Edycja utworu</h1>
 
-{% set _parts = raw_stem.split(' - ', 1) %}
-{% if _parts|length == 2 %}
-  {% set _artist = _parts[0]|trim %}
-  {% set _title = _parts[1]|trim %}
-{% else %}
-  {% set _artist = '' %}
-  {% set _title = raw_stem %}
-{% endif %}
-
 <form action="{{ url_for('files.edit_file') }}" method="post" class="pk-edit">
 
   <div class="pk-edit-original">
@@ -494,7 +485,7 @@
     <div class="pk-edit-label">Wykonawca</div>
     <div style="position: relative;">
       <input id="pk-edit-artist" class="pk-edit-input" type="text" autocomplete="off"
-             value="{{ _artist }}" placeholder="np. Perfect">
+             value="{{ initial_artist }}" placeholder="np. Perfect">
       <div id="pk-artist-suggest" class="pk-ac-dropdown" hidden></div>
     </div>
   </div>
@@ -502,7 +493,27 @@
   <div>
     <div class="pk-edit-label">Tytuł</div>
     <input id="pk-edit-title" class="pk-edit-input" type="text" autocomplete="off"
-           value="{{ _title }}" placeholder="np. Autobiografia">
+           value="{{ initial_title }}" placeholder="np. Autobiografia">
+  </div>
+
+  <div>
+    <div class="pk-edit-label">Język (ISO 639-1)</div>
+    <input id="pk-edit-language" class="pk-edit-input" type="text" name="language"
+           autocomplete="off" maxlength="5" list="pk-edit-language-list"
+           value="{{ metadata_language or '' }}" placeholder="np. pl">
+    <datalist id="pk-edit-language-list">
+      <option value="pl">polski</option>
+      <option value="en">angielski</option>
+      <option value="de">niemiecki</option>
+      <option value="es">hiszpański</option>
+      <option value="fr">francuski</option>
+      <option value="it">włoski</option>
+      <option value="cs">czeski</option>
+      <option value="ru">rosyjski</option>
+      <option value="uk">ukraiński</option>
+      <option value="ja">japoński</option>
+      <option value="ko">koreański</option>
+    </datalist>
   </div>
 
   <div class="pk-edit-actions">
