@@ -73,6 +73,43 @@ def _row_with(**fields):
     return fields
 
 
+class TestSignificantWords:
+    def test_drops_stopwords_and_short_tokens(self):
+        out = song_enricher._significant_words("The Official Music Video of A Song")
+        # "the", "of", "a", "official", "video" are dropped; "music",
+        # "song" survive.
+        assert out == {"music", "song"}
+
+    def test_ascii_folds_diacritics(self):
+        # "Małgośka" should fold to "malgoska" so it can match an
+        # iTunes hit indexed without diacritics.
+        assert "malgoska" in song_enricher._significant_words("Małgośka")
+
+    def test_returns_empty_for_empty_input(self):
+        assert song_enricher._significant_words("") == set()
+        assert song_enricher._significant_words(None) == set()
+
+
+class TestItunesHitUnrelatedToQuery:
+    def test_disjoint_tokens_are_unrelated(self):
+        hit = {"artist": "Daniel Liebt", "track": "Fireflies (feat. JAYNIE)"}
+        assert song_enricher._itunes_hit_unrelated_to_query("FAYNIE", hit) is True
+
+    def test_shared_token_is_related(self):
+        hit = {"artist": "Queen", "track": "Bohemian Rhapsody"}
+        assert song_enricher._itunes_hit_unrelated_to_query("Bohemian Rhapsody", hit) is False
+
+    def test_only_stopword_overlap_is_unrelated(self):
+        hit = {"artist": "Some Other", "track": "Official Video"}
+        # "official"/"video" are low-info; the actual tokens are disjoint.
+        assert song_enricher._itunes_hit_unrelated_to_query("Official Video", hit) is True
+
+    def test_diacritic_overlap_counts_as_related(self):
+        hit = {"artist": "Maryla Rodowicz", "track": "Małgośka"}
+        # ASCII-folded query token "malgoska" matches the hit token.
+        assert song_enricher._itunes_hit_unrelated_to_query("Malgoska", hit) is False
+
+
 class TestQueryFromSong:
     def test_prefers_db_artist_and_title(self, tmp_path):
         row = _row_with(artist="Eminem", title="Stan")
@@ -371,7 +408,10 @@ class TestEnrichSong:
         assert row["language_at_enrich"] == "pl"
 
     def test_manual_edits_beat_itunes(self, db, tmp_path):
-        song_path = str(tmp_path / "Foo---abc12345678.mp4")
+        # Filename has the Artist-Title separator so the low-key force-
+        # match guard does not fire — the test is about the manual /
+        # iTunes confidence ladder, not the new force-match rejection.
+        song_path = str(tmp_path / "Manual - Preset---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "en")
         # Pre-existing manual artist/title/album — provenance "manual" is
@@ -432,7 +472,10 @@ class TestEnrichSong:
         assert sources["title"] == "itunes"
 
     def test_writes_musicbrainz_ids_when_available(self, db, tmp_path):
-        song_path = str(tmp_path / "Foo---abc12345678.mp4")
+        # Filename has separator so the low-key force-match guard doesn't
+        # fire; "A"/"T" are sub-langdetect-threshold so the country
+        # fallback (USA -> en) wins the language gate.
+        song_path = str(tmp_path / "A - T---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "en")
         hit = _raw_hit(artist="A", track="T", track_id=1, country="USA")
@@ -473,7 +516,10 @@ class TestEnrichSong:
         assert row["metadata_status"] == "awaiting_language"
 
     def test_downloads_cover_and_registers_artifact(self, db, tmp_path):
-        song_path = str(tmp_path / "Foo---abc12345678.mp4")
+        # Filename has separator so the low-key force-match guard doesn't
+        # fire; short labels keep langdetect under threshold so country
+        # mapping (USA -> en) wins the language gate.
+        song_path = str(tmp_path / "A - T---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "en")
         hit = _raw_hit(
@@ -483,7 +529,7 @@ class TestEnrichSong:
             artwork="https://fake/100x100bb.jpg",
             country="USA",
         )
-        expected_cover = str(tmp_path / "Foo---abc12345678.cover.jpg")
+        expected_cover = str(tmp_path / "A - T---abc12345678.cover.jpg")
 
         def fake_download(url, dest):
             assert dest == expected_cover
@@ -636,6 +682,93 @@ class TestEnrichSong:
         assert row["artist"] == "Artist Canonical"
         assert row["title"] == "Song (Instrumental)"
 
+    def test_low_key_upload_rejects_token_disjoint_itunes_match(self, db, tmp_path):
+        """Bug H: filename has no Artist-Title separator AND iTunes top hit
+        shares no tokens with the query. iTunes loves to fuzzy-match a
+        one-word query like "FAYNIE" to "Fireflies (feat. JAYNIE)" by
+        Daniel Liebt — the trailing ``YNIE`` substring is enough to land
+        the row even though the recording is unrelated. We refuse the
+        match and stamp not_found instead of force-writing garbage.
+        """
+        song_path = str(tmp_path / "FAYNIE---5w5a67phVdM.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
+        # No prior artist/title -> query falls back to the filename stem
+        # ("FAYNIE"), iTunes returns a token-disjoint fuzzy match.
+        hit = _raw_hit(
+            artist="Daniel Liebt",
+            track="Fireflies (feat. JAYNIE)",
+            track_id=42,
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        # Force-match rejected: row stays not_found with no iTunes fields.
+        assert row["metadata_status"] == "not_found"
+        assert row["artist"] in (None, "")
+        assert row["title"] in (None, "")
+        assert row["itunes_id"] is None
+
+    def test_low_key_upload_accepts_token_overlapping_itunes_match(self, db, tmp_path):
+        """The gate must NOT fire when the iTunes hit shares at least one
+        significant token with the query — that's a plausible match even
+        on a low-key upload. ``"Bohemian Rhapsody"`` -> Queen's
+        ``"Bohemian Rhapsody"`` shares ``bohemian`` and ``rhapsody`` tokens.
+        """
+        song_path = str(tmp_path / "Bohemian Rhapsody---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
+        hit = _raw_hit(
+            artist="Queen",
+            track="Bohemian Rhapsody",
+            track_id=7,
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        assert row["metadata_status"] == "enriched"
+        assert row["artist"] == "Queen"
+        assert row["title"] == "Bohemian Rhapsody"
+
+    def test_separator_filename_bypasses_force_match_guard(self, db, tmp_path):
+        """When the filename has an ``Artist - Title`` separator the upload
+        is labelled and the gate must not fire — even if the iTunes hit
+        adds canonical tokens not in the query (the variant guard handles
+        that orthogonally). The user-typed structure is enough evidence
+        that this is a real music release, not a low-key fan upload.
+        """
+        # Filename has " - "; query is "Eminem - Stan". iTunes returns
+        # the canonical "Stan (feat. Dido)" — token overlap is fine, but
+        # the point of this test is that even *if* it weren't, the
+        # separator alone disables the low-key gate.
+        song_path = str(tmp_path / "Eminem - Stan---abc12345678.mp4")
+        sid = _insert_song(db, song_path)
+        _seed_language(db, sid, "en")
+        hit = _raw_hit(
+            artist="Eminem",
+            track="Stan (feat. Dido)",
+            track_id=1,
+            country="USA",
+        )
+        with patch.object(song_enricher, "search_itunes_full", return_value=[hit]), patch.object(
+            song_enricher, "fetch_musicbrainz_ids", return_value=None
+        ):
+            song_enricher.enrich_song(db, sid, song_path)
+
+        row = db.get_song_by_id(sid)
+        # Variant guard fires (canonical track adds "(feat. Dido)" not in query),
+        # so title is dropped — but artist still flows through; row is enriched.
+        assert row["metadata_status"] == "enriched"
+        assert row["artist"] == "Eminem"
+
     def test_survives_provider_crashes(self, db, tmp_path):
         song_path = str(tmp_path / "Foo---abc12345678.mp4")
         sid = _insert_song(db, song_path)
@@ -752,7 +885,10 @@ class TestEnrichSong:
         must still bump enrichment_attempts and stamp ``error`` so the row
         doesn't get stuck on ``pending`` with attempts=0 — that's the
         signal we use to spot enrichment that silently dropped."""
-        song_path = str(tmp_path / "Foo---abc12345678.mp4")
+        # Filename has separator so the low-key force-match guard does
+        # not short-circuit before the DB write that we're trying to
+        # crash; short labels keep langdetect under threshold.
+        song_path = str(tmp_path / "A - T---abc12345678.mp4")
         sid = _insert_song(db, song_path)
         _seed_language(db, sid, "en")
 

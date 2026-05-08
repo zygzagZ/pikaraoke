@@ -38,7 +38,7 @@ from typing import Any
 import requests
 
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
-from pikaraoke.lib.lyrics import _VARIANT_RE, _artist_tokens
+from pikaraoke.lib.lyrics import _VARIANT_RE, _artist_tokens, _fold_for_match
 from pikaraoke.lib.lyrics_language_classifier import COUNTRY_TO_LANG, signal_itunes_text
 from pikaraoke.lib.metadata_parser import (
     has_artist_title_separator,
@@ -136,6 +136,77 @@ def _download_cover(url: str, dest: str) -> bool:
 
 SOURCE_ITUNES = "itunes"
 SOURCE_MUSICBRAINZ = "musicbrainz"
+
+# Words too common to count as evidence of a real match. Kept tiny on
+# purpose — anything domain-specific (artist names, song titles) is
+# fair game as a shared token.
+_LOW_INFO_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "on",
+        "feat",
+        "ft",
+        "featuring",
+        "with",
+        "vs",
+        "versus",
+        "remix",
+        "version",
+        "official",
+        "video",
+        "audio",
+        "lyrics",
+        "mv",
+        "hd",
+        "4k",
+    }
+)
+
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _significant_words(text: str) -> set[str]:
+    """ASCII-folded, lowercased word tokens with stop-words removed.
+
+    Used to compare an iTunes hit against its source query token-wise.
+    Tokens shorter than 2 chars and the small ``_LOW_INFO_WORDS`` set
+    are dropped so two strings sharing only ``"the"`` aren't counted as
+    related.
+    """
+    if not text:
+        return set()
+    folded = _fold_for_match(text)
+    return {w for w in _WORD_RE.findall(folded) if len(w) >= 2 and w not in _LOW_INFO_WORDS}
+
+
+def _itunes_hit_unrelated_to_query(query: str, itunes: dict) -> bool:
+    """True when the iTunes hit's artist+track share zero significant
+    tokens with ``query``.
+
+    iTunes' search will gladly return *something* for any one-word query
+    (e.g. ``"FAYNIE"`` -> ``"Fireflies (feat. JAYNIE)"`` by Daniel
+    Liebt) — the matcher latches onto a partial substring even when the
+    hit is by an unrelated artist about an unrelated song. For low-key
+    uploads (no ``Artist - Title`` separator in the filename, no
+    info.json artist), accepting that hit poisons the row with metadata
+    that has nothing to do with the audio.
+
+    Returns True conservatively when the query has no significant
+    tokens — in that case we have nothing to verify against, and a
+    fuzzy match is more likely garbage than truth.
+    """
+    q_words = _significant_words(query)
+    hit_words = _significant_words(f"{itunes.get('artist') or ''} {itunes.get('track') or ''}")
+    if not q_words or not hit_words:
+        return True
+    return q_words.isdisjoint(hit_words)
 
 
 def _itunes_adds_variant(query: str, itunes: dict) -> bool:
@@ -420,6 +491,39 @@ def _enrich_song_inner(db: KaraokeDatabase, song_id: int, song_path: str, now: s
         return
 
     itunes = project_full_hit(chosen_raw)
+
+    # Bug H: low-key-upload force-match guard. When the filename has no
+    # ``Artist - Title`` separator (the upload looks like a fan/mashup
+    # rather than a labelled music release) and the iTunes top hit
+    # shares no tokens with the query, treat it as a fuzzy false-match
+    # rather than truth. Without this gate, a file like
+    # ``FAYNIE---<id>.mp4`` enriches into ``Daniel Liebt - Fireflies``
+    # (iTunes latched onto the trailing ``YNIE`` substring), and every
+    # downstream lyrics fetch then queries the wrong song.
+    stem = os.path.splitext(os.path.basename(song_path))[0]
+    suffix = youtube_id_suffix(song_path)
+    if suffix:
+        stem = stem[: -len(suffix)]
+    if not has_artist_title_separator(stem) and _itunes_hit_unrelated_to_query(query, itunes):
+        logger.info(
+            "iTunes hit %r / %r shares no tokens with query %r on a low-key "
+            "upload (filename has no Artist-Title separator); rejecting "
+            "force-match",
+            itunes.get("artist"),
+            itunes.get("track"),
+            query,
+        )
+        _try_filename_revalidation(db, song_id, song_path, row)
+        db.stamp_enrichment_attempt(song_id, "not_found", now, language_at_enrich=expected_lang)
+        _emit(
+            "Metadata enrichment finished",
+            severity="warning",
+            detail=(
+                f"not_found: iTunes top hit unrelated to query "
+                f"({itunes.get('artist')!r} / {itunes.get('track')!r} vs {query!r})"
+            ),
+        )
+        return
 
     if _itunes_adds_variant(query, itunes):
         # Artist is *usually* variant-invariant: "I Want to Break Free

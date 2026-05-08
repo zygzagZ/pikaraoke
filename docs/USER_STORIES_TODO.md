@@ -458,6 +458,30 @@ ______________________________________________________________________
   DBs for media-specific fields (`duration_seconds`, `source_url`).
   All callers (`song_enricher`, `library_scanner`, `song_manager`,
   `lyrics`) now go through the provenance-aware method.
+- \[x\] ~~**P1** Reject iTunes force-matches on low-key uploads.~~ Done —
+  `song_enricher._itunes_hit_unrelated_to_query` token-compares an
+  iTunes top hit against the query (`_significant_words` does
+  ASCII-fold + lowercase + drops 1-char tokens and a small
+  `_LOW_INFO_WORDS` stop-list of `the/feat/official/video/...`).
+  `_enrich_song_inner` short-circuits to `not_found` when the
+  filename stem lacks an `Artist - Title` separator AND the gate's
+  hit-vs-query token set is disjoint. Catches the
+  `FAYNIE---<id>.mp4` → `Daniel Liebt — Fireflies (feat. JAYNIE)`
+  class of fuzzy false-positives so the lyrics ladder doesn't fetch
+  for the wrong song. Repaired one already-poisoned row (id=119).
+  Locked in by `TestSignificantWords`,
+  `TestItunesHitUnrelatedToQuery`, and 3 integration tests on
+  `enrich_song`.
+- \[x\] ~~**P1** Filename fallback when DB artist/title are blank.~~
+  Done — `LyricsService._metadata_candidates` (lyrics.py:2055)
+  re-seeds candidates from `regex_tidy(_title_from_filename(path))`
+  when both DB fields are empty, so a metadata-empty row still
+  feeds the candidate ladder. Locked in by
+  `TestMetadataCandidates::test_blank_db_falls_back_to_filename`
+  and the negative case for filenames without an Artist-Title
+  separator. Coverage report on the live library: 29/30 songs now
+  have ≥1 synced or Genius lyrics source via the candidate ladder
+  (was 25/26 pre-fix because 4 rows were unreachable).
 - \[ \] **P2** Populate `year` and `variant` columns in the enricher.
   Currently in schema but never written.
 
@@ -994,9 +1018,9 @@ ______________________________________________________________________
 (sync contract, server-side registry, drift loop) — these are
 new-feature architectural decisions rather than regressions.
 
-**P1 (significant gaps):** US-7 and US-41 closed. US-40 owns the bulk
-of the remaining P1 scope (per-pilot mix, shared-queue transport,
-stems sync, splash refactor, satellite guardrails).
+**P1 (significant gaps):** US-7, US-28, and US-41 closed. US-40 owns
+the bulk of the remaining P1 scope (per-pilot mix, shared-queue
+transport, stems sync, splash refactor, satellite guardrails).
 
 **P2 (polish/robustness):** ASS pulse `librosa` warning, ffprobe caching,
 queue-blocks-delete documentation, settings-panel validation + route
