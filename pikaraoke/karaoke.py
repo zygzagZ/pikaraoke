@@ -536,6 +536,13 @@ class Karaoke:
         )
         self.subtitle_orchestrator.attach()
 
+        # Auto-invalidate cached subtitles whenever artist/title changes in
+        # the DB, regardless of which writer triggered the change (manual
+        # edit, enricher, scanner backfill, consensus rerun, lyrics
+        # pipeline writeback). The DB layer fires this only on a real
+        # value change, so a same-value source upgrade is a no-op.
+        self.db.set_track_metadata_change_listener(self._on_track_metadata_change)
+
         # Prewarm silero VAD once per process so the first song's per-line
         # LRC->audio anchor probe doesn't pay the model-load latency. The
         # thread is daemon: a server shutdown during prewarm exits cleanly.
@@ -1866,6 +1873,48 @@ class Karaoke:
             name=f"lyrics-fetch-{os.path.basename(song_path)}",
             daemon=True,
         ).start()
+
+    def _on_track_metadata_change(self, song_id: int, changed: frozenset[str]) -> None:
+        """Invalidate cached subtitles + restart pipeline on artist/title change.
+
+        Wired to ``KaraokeDatabase.set_track_metadata_change_listener``;
+        fires whenever ``update_track_metadata_with_provenance`` commits a
+        real value change for any field in ``_INVALIDATING_FIELDS``
+        (currently ``{"artist", "title"}``). The same three steps as
+        ``_apply_metadata_edit`` happen here so every metadata writer
+        (manual edit, enricher, scanner, consensus rerun) refreshes the
+        downstream lyrics state automatically — without each call-site
+        needing to remember to invalidate.
+
+        ``changed`` is currently informational; the response is identical
+        for any subset of invalidating fields. The argument exists so a
+        future signal (e.g. language) can be threaded through without
+        another listener slot.
+        """
+        del changed  # all invalidating fields trigger the same response
+        row = self.db.get_song_by_id(song_id)
+        if row is None:
+            return
+        song_path = row["file_path"]
+        if not song_path:
+            return
+        try:
+            self.lyrics_service.invalidate_for_metadata_change(song_path)
+        except Exception:
+            logging.exception(
+                "invalidate_for_metadata_change failed for song_id=%s path=%s",
+                song_id,
+                song_path,
+            )
+        self._dispatch_lyrics_fetch_async(song_path)
+        try:
+            self.subtitle_orchestrator.kickoff(song_path, force=True)
+        except Exception:
+            logging.exception(
+                "subtitle_orchestrator.kickoff failed for song_id=%s path=%s",
+                song_id,
+                song_path,
+            )
 
     def _ensure_fingerprint_on_download(self, song_path: str) -> None:
         """Stamp the audio sha256 right after download so cache invalidation

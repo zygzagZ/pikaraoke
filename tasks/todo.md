@@ -1,94 +1,102 @@
-# Consensus jako osobne źródło — line-level merge
+# Invalidate subs on artist/title metadata change
 
 ## Cel
-Przepisać consensus z token-voting (psuje "Mam tę moc") na **line-merge**:
-wybiera per-linia która z dostępnych tekstowych wersji najlepiej pasuje do
-okna whispera. Brak wycinania słów. Consensus staje się normalnym wariantem
-napisów (`<stem>.consensus.ass`, label "Auto") widocznym w pickerze.
+Cache napisów (auto `.ass` + variant `.ass` + `subtitle_jobs`) ma być
+invalidowany za KAŻDYM razem gdy `artist` lub `title` faktycznie zmienia
+wartość w `songs`, niezależnie od źródła zmiany (manual edit, auto-enricher,
+scanner backfill, consensus rerun, lyrics pipeline writeback).
+
+## Dlaczego
+Tylko `_apply_metadata_edit` (manual UI) wywołuje
+`invalidate_for_metadata_change`. Wszystkie inne writy do
+`update_track_metadata_with_provenance` (14+ call-sites) zostawiają stary
+.ass na dysku — napisy odpowiadają poprzednim wartościom artist/title, a
+kolejne lookupy LRCLib/Genius i tak nie startują, bo `subtitle_jobs` mówi
+"już próbowałem".
 
 ## Plan
 
-### A. Line-merge engine (rdzeń)
-- [ ] `lyrics_consensus.py`: dodać `Word`-aware audio reference z timestampami
-- [ ] `lyrics_consensus.py`: nowa funkcja `merge_lines_per_window` —
-  iteruje po liniach scaffolda timing-owego, dla każdej linii oblicza
-  `score_S` przeciw oknu whispera, wybiera tekst całą linią z najwyższego
-  score'u (no token vote)
-- [ ] Logika "extra zwrotek": linia obecna tylko w 1 źródle + okno whispera
-  puste → drop; ≥2 źródła → keep
-- [ ] Linie z innych źródeł nieobecne w scaffoldzie — wstaw między linie
-  scaffolda gdy ≥2 źródła + whisper potwierdza
-- [ ] Usunąć `vote_tokens`, stary `build_consensus_lrc`, `_index_voted_text`
+- [x] **Detekcja value-change w `update_track_metadata_with_provenance`**
+      (`pikaraoke/lib/karaoke_database.py:1010`).
+      Czytać stare wartości pól razem z `metadata_sources`. Po commitcie
+      zwracać dwa zbiory: `applied` (jak dziś — zapisane pola) oraz fire
+      hooka jeśli `{"artist","title"} & changed_values != ∅`. Hook woła
+      się PO zwolnieniu locka, w tym samym wątku.
 
-### B. Gating + re-run
-- [ ] Consensus run iff ≥1 external source AND whisper dostępny
-  (cache hit liczy się jako "dostępny")
-- [ ] Whisper cache weryfikacja — jest, sprawdzam że jest used przed model load
-- [ ] Re-run trigger: po `_write_and_register_variant` wywołać
-  `_recompute_consensus_if_changed(song_path)` z hash-em zestawu źródeł
-  zapamiętanym w `metadata` (`consensus_sources_hash:<sha>`)
+- [x] **Listener slot na `KaraokeDatabase`.**
+      `set_track_metadata_change_listener(callback)` — pojedynczy callback,
+      sygnatura `(song_id: int, changed: frozenset[str])`. Wyjątki w
+      callbacku łapane i logowane, nigdy nie zwalają writeu DB.
 
-### C. Picker / DB
-- [ ] `karaoke_database.py`: `SUBTITLE_SOURCE_CONSENSUS = "consensus"`,
-  dodać do `VALID_SUBTITLE_SOURCES`, `VARIANT_FILE_SOURCES`,
-  `SUBTITLE_SOURCE_LABELS["consensus"] = "Auto"`
-- [ ] `karaoke.py`: dodać `SUBTITLE_SOURCE_CONSENSUS` do
-  `_SUBTITLE_SOURCE_ORDER` (po `user`, przed `lrclib`),
-  capability gate (≥1 external survived consensus + whisper dostępny)
-- [ ] `subtitle-source-picker.js`: dodać `'consensus'` do `canonicalOrder`
-  i (NIE do `ALARM_SOURCES_DEFAULT` — to nie surowe źródło, to mix)
+- [x] **Wpięcie w `Karaoke.__init__`** (`pikaraoke/karaoke.py:519`).
+      Po stworzeniu `lyrics_service`, `subtitle_orchestrator` rejestrujemy
+      `self._on_track_metadata_change`:
+      1. `song_path = self.db.get_song_by_id(song_id)["file_path"]`
+      2. `self.lyrics_service.invalidate_for_metadata_change(path)`
+      3. `self._dispatch_lyrics_fetch_async(path)`
+      4. `self.subtitle_orchestrator.kickoff(path, force=True)`
 
-### D. Variant write
-- [ ] `_try_write_ass_tiered`: gdy `lyrics_source == "consensus"`, pisz też
-  variant `<stem>.consensus.ass` (przedtem był wykluczony)
+- [x] **Sprzątanie `_apply_metadata_edit`** (`pikaraoke/routes/files.py:346`).
+      Hook robi już invalidate+dispatch+kickoff dla artist/title. Zostawiamy
+      ścieżkę manualną tylko dla zmian `language` (do których hook celowo
+      nie strzela, żeby nie pętlić auto-detekcji języka z lyrics pipeline).
 
-### E. Verify
-- [ ] Lokalnie: usunąć cached canonical .ass dla "Mam Tę Moc", odpalić
-  pipeline, sprawdzić że tekst per-linia zgadza się z lrclib variant
-  i że nie ma "lat coś objęcia chłodu mnie" tylko pełne
-  "Od lat coś w objęcia chłodu mnie pcha"
-- [ ] Picker pokazuje "Auto" jako aktywne źródło (nie em-dash)
+- [x] **Testy:**
+  - listener fires gdy artist się zmienia
+  - listener fires gdy title się zmienia
+  - listener NIE fires gdy tylko source upgrade (ta sama wartość)
+  - listener NIE fires gdy zmieniają się pola spoza setu (np. itunes_id)
+  - integracja: `_apply_metadata_edit` → DB write → listener → invalidate
+  - integracja: enricher write → listener → invalidate
 
-## Decyzje
+- [x] Uruchomić cały test suite (`pytest tests/unit/test_karaoke_database.py
+      tests/unit/test_files_routes.py`).
 
-- Próg confirmation per-linia: 0.55 (odziedziczone z `_DEFAULT_THRESHOLD`)
-- Chunking unit: linia LRC
-- Default canonical: dalej consensus (gdy się powiedzie); fallback do
-  najlepszego pojedynczego źródła gdy nie
-- Label PL: "Auto"
-- Pozycja w pickerze: 3 (po off, user; przed lrclib)
+## Tradeoffs
+- Wybrałem callback DB-level zamiast threadowania per-call-site, bo:
+  - 14+ call-sites (lyrics pipeline, scanner, enricher, consensus, manual)
+  - Zero ryzyka że nowy call-site zapomni invalidować
+  - Pojedynczy punkt do testowania
+- Zawężam set invalidujący do `{artist, title}` (nie `language`), żeby
+  uniknąć potencjalnej pętli z auto-detekcji języka. Manual edit dalej
+  invaliduje na język explicit.
 
-## Decyzje porzucone
+## Nie w scope
+- Filtr similarity na iTunes/MB candidates (osobny PR — patrz
+  poprzednia rozmowa o "Mam moc Trzyha").
+- Spotify rate-limit handling.
 
-- Token-level voting — usunięte całkowicie, było źródłem regresji
-- Whisper dorzucany do tekstu — Whisper TYLKO scoring window i k-tag timing
+## Review
+**Pliki zmienione:**
+- `pikaraoke/lib/karaoke_database.py` — `_INVALIDATING_FIELDS`, slot
+  listenera, `set_track_metadata_change_listener()`, value-change detection
+  w `update_track_metadata_with_provenance` (pre-read starych wartości,
+  fire listenera po lock release z try/except).
+- `pikaraoke/karaoke.py` — `_on_track_metadata_change(song_id, changed)` +
+  rejestracja w `__init__` po stworzeniu `lyrics_service` /
+  `subtitle_orchestrator`.
+- `pikaraoke/routes/files.py` — `_apply_metadata_edit` bez zmian
+  funkcjonalnych (idempotentny z listenerem); dopisany docstring.
 
-## Review (2026-05-08)
+**Testy:**
+- `tests/unit/test_karaoke_database.py::TestTrackMetadataChangeListener`
+  — 9 testów (first write, value change, no-fire on same-value upgrade,
+  no-fire when lower confidence blocked, non-invalidating fields, mixed
+  write reports tylko changed, exception swallowed, clear listener,
+  reentrancy bez deadlocka).
+- `tests/unit/test_karaoke.py::TestOnTrackMetadataChange` — 5 testów
+  (full cascade, missing song id no-op, invalidate exception nie blokuje
+  reszty, end-to-end DB write -> listener -> cascade, same-value rewrite
+  nie fires).
 
-**Co działa:**
-- "Auto" jako osobne źródło w pickerze; em-dash bug zniknął przy okazji
-  bo `consensus` wszedł do `_SUBTITLE_SOURCE_ORDER`
-- Line-merge zamiast token-vote: każda linia bierze CAŁY tekst z
-  najlepszego (vs whisper window) źródła. Żadnego cięcia słów.
-- "Mam Tę Moc" weryfikacja: wszystkie 47 linii LRClib zachowane
-  poprawnie, włącznie z "Co tam burzy gniew?", "Od lat coś **w** objęcia
-  chłodu mnie **pcha**", "Wszystkim wbrew", "Wreszcie ja, zostawię ślad".
-- Whisper transcript czytany z metadata cache (key
-  `whisper_transcript:<sha>:<model>`); nigdy nie odpala modelu drugi raz.
-- Re-run trigger: nowy variant landuje → hash inputs + porównanie z
-  `consensus_input_hash:<sha>` → dispatch jeśli różny. Self-write
-  guarded.
-- Drop reguła scaffold-only line tylko gdy ≥2 synced sources (inaczej
-  każda linia byłaby scaffold-only i traciliśmy quiet bridges).
-- 1883 testów zielonych.
+**Wynik suite:** `1875 passed, 1 skipped` (cały tests/unit).
 
-**Iteracja w trakcie:**
-- Pierwsza wersja drop reguły była za agresywna — gubiła "Wszystkim
-  wbrew" gdy whisper nie usłyszał quiet sekcji. Naprawione: drop
-  aktywny tylko gdy ≥2 synced sources dają baseline porównania.
-
-**Co dalej (poza scope):**
-- Genius (plain_text) jako voter per linia — wymaga line-mappingu z
-  scaffold tokens; obecnie dolicza tylko do source-rejection scoringu.
-- Persisting consensus output do DB jako "lyrics_provenance=consensus"
-  zamiast `auto_word` — drobiazg, kosmetyka.
+**Behaviour delta:**
+- *Przed:* Tylko manual edit (`_apply_metadata_edit`) wywoływał
+  `invalidate_for_metadata_change`. Auto-enricher / scanner / consensus
+  rerun zostawiały stare `.ass` i `subtitle_jobs`.
+- *Po:* Każdy zapis do `update_track_metadata_with_provenance` z
+  zmieniającą się wartością `artist` lub `title` automatycznie:
+  1) usuwa cached `.ass` (auto + variants), 2) czyści `subtitle_jobs`,
+  3) dispatchuje świeży lyrics fetch, 4) `kickoff(force=True)` na
+  orchestratorze. Same-value source upgrade nie fires (no work).

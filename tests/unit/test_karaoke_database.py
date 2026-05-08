@@ -502,6 +502,105 @@ class TestMetadataProvenance:
         assert db.get_metadata_sources(sid) == {}
 
 
+class TestTrackMetadataChangeListener:
+    """Hook fires on artist/title VALUE change (any source) so subtitle
+    cache invalidation runs centrally regardless of writer."""
+
+    def test_listener_fires_on_first_artist_write(self, db):
+        sid = _insert_song(db)
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "A", "title": "T"})
+        assert calls == [(sid, frozenset({"artist", "title"}))]
+
+    def test_listener_fires_on_artist_value_change(self, db):
+        sid = _insert_song(db)
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "Old"})
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        db.update_track_metadata_with_provenance(sid, "musicbrainz", {"artist": "New"})
+        assert calls == [(sid, frozenset({"artist"}))]
+
+    def test_listener_does_not_fire_when_value_unchanged(self, db):
+        """Source upgrade with same value (e.g. itunes -> mb, both 'A') is silent."""
+        sid = _insert_song(db)
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "A"})
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        db.update_track_metadata_with_provenance(sid, "musicbrainz", {"artist": "A"})
+        assert calls == []
+
+    def test_listener_does_not_fire_when_lower_confidence_blocks_write(self, db):
+        sid = _insert_song(db)
+        db.update_track_metadata_with_provenance(sid, "musicbrainz", {"artist": "MB"})
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        # itunes can't override musicbrainz; no row update -> no fire.
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "iT"})
+        assert calls == []
+
+    def test_listener_does_not_fire_for_non_invalidating_fields(self, db):
+        """Year, album, language etc. don't drop subtitle cache."""
+        sid = _insert_song(db)
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        db.update_track_metadata_with_provenance(
+            sid,
+            "itunes",
+            {"language": "en", "year": "2020", "album": "X", "itunes_id": "12345"},
+        )
+        assert calls == []
+
+    def test_listener_reports_only_changed_invalidating_fields(self, db):
+        """Mixed write: artist changes, title stays, language changes -> only 'artist'."""
+        sid = _insert_song(db)
+        db.update_track_metadata_with_provenance(
+            sid, "itunes", {"artist": "Old", "title": "T", "language": "en"}
+        )
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        db.update_track_metadata_with_provenance(
+            sid,
+            "musicbrainz",
+            {"artist": "New", "title": "T", "language": "pl"},
+        )
+        assert calls == [(sid, frozenset({"artist"}))]
+
+    def test_listener_exception_does_not_corrupt_write(self, db):
+        """A faulty listener gets logged + swallowed; the row update stands."""
+        sid = _insert_song(db)
+
+        def boom(_sid, _fields):
+            raise RuntimeError("listener exploded")
+
+        db.set_track_metadata_change_listener(boom)
+        # Should not raise.
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "A"})
+        assert db.get_song_by_id(sid)["artist"] == "A"
+
+    def test_listener_can_be_cleared(self, db):
+        sid = _insert_song(db)
+        calls: list[tuple[int, frozenset[str]]] = []
+        db.set_track_metadata_change_listener(lambda sid_, fields: calls.append((sid_, fields)))
+        db.set_track_metadata_change_listener(None)
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "A"})
+        assert calls == []
+
+    def test_listener_can_reenter_db_after_lock_released(self, db):
+        """Listener may need to call back into the DB (e.g. delete_subtitle_jobs).
+        Must not deadlock on the connection lock."""
+        sid = _insert_song(db)
+        seen: list[object] = []
+
+        def reentrant(sid_, _fields):
+            # Re-enter DB while inside listener.
+            seen.append(db.get_song_by_id(sid_)["artist"])
+
+        db.set_track_metadata_change_listener(reentrant)
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "Reentered"})
+        assert seen == ["Reentered"]
+
+
 class TestLanguageProvenanceLadder:
     """US-43 language-signal rungs layered on top of the generic ladder."""
 

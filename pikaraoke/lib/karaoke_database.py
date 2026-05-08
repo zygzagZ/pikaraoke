@@ -1,11 +1,25 @@
 """SQLite database layer for persistent song library storage."""
 
 import json
+import logging
 import os
 import sqlite3
 import threading
+from typing import Callable
 
 from pikaraoke.lib.get_platform import get_data_directory
+
+logger = logging.getLogger(__name__)
+
+# Fields whose VALUE change must drop every cached subtitle artifact for the
+# song. Lyrics providers (LRCLib, Musixmatch, Genius, Tekstowo, Spotify) key
+# their lookups on artist+title; once either rotates to a new value, every
+# previously-rendered .ass is a stale answer to a different question. The
+# auto-detected ``language`` field is intentionally excluded — the lyrics
+# pipeline writes it itself, and including it here would make a same-audio
+# rerun loop on language-flip detection. Manual edits invalidate language
+# explicitly via ``_apply_metadata_edit``.
+_INVALIDATING_FIELDS = frozenset({"artist", "title"})
 
 # Confidence ladder for canonical music metadata (US-28). Higher number =
 # higher trust. The enricher uses this to decide whether a newly-arrived
@@ -417,6 +431,26 @@ class KaraokeDatabase:
         self._lock = threading.Lock()
         self._conn = self._connect()
         self._create_schema()
+        # Optional callback fired after ``update_track_metadata_with_provenance``
+        # commits a value change for any field in ``_INVALIDATING_FIELDS``.
+        # Karaoke wires it to lyrics_service.invalidate_for_metadata_change
+        # so every metadata writer (manual edit, enricher, scanner backfill,
+        # consensus rerun) drops cached subtitles automatically.
+        self._track_metadata_change_listener: (
+            Callable[[int, frozenset[str]], None] | None
+        ) = None
+
+    def set_track_metadata_change_listener(
+        self, callback: Callable[[int, frozenset[str]], None] | None
+    ) -> None:
+        """Register a single listener for invalidation-worthy metadata writes.
+
+        The callback fires AFTER the UPDATE commits and AFTER the lock is
+        released, with ``(song_id, changed_fields)``. Only fields whose
+        VALUE actually changed are reported (a same-value source upgrade
+        does not fire). Pass ``None`` to clear.
+        """
+        self._track_metadata_change_listener = callback
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -1035,14 +1069,23 @@ class KaraokeDatabase:
             )
         if not clean:
             return {}
+        # Pre-read the columns we may be writing so we can detect a real
+        # value change vs. a same-value source upgrade. The cost is one
+        # extra row read; cheap because the row is already in the page
+        # cache (we read metadata_sources on the same row right after).
+        select_cols = list(clean.keys()) + ["metadata_sources"]
+        select_clause = ", ".join(select_cols)
+        invalidating_changed: set[str] = set()
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT metadata_sources FROM songs WHERE id = ?", (song_id,)
+                f"SELECT {select_clause} FROM songs WHERE id = ?", (song_id,)
             ).fetchone()
             if row is None:
                 return {}
+            old_values = {f: row[f] for f in clean}
+            sources_raw = row["metadata_sources"]
             try:
-                sources = json.loads(row[0]) if row[0] else {}
+                sources = json.loads(sources_raw) if sources_raw else {}
             except (TypeError, ValueError):
                 sources = {}
             if not isinstance(sources, dict):
@@ -1055,11 +1098,15 @@ class KaraokeDatabase:
                 if cached_source is None:
                     applied[field] = value
                     sources[field] = source
+                    if field in _INVALIDATING_FIELDS and value != old_values[field]:
+                        invalidating_changed.add(field)
                     continue
                 cached_conf = _confidence_for(field, cached_source)
                 if new_source_conf[field] >= cached_conf:
                     applied[field] = value
                     sources[field] = source
+                    if field in _INVALIDATING_FIELDS and value != old_values[field]:
+                        invalidating_changed.add(field)
             if not applied:
                 return {}
             cols = list(applied.keys())
@@ -1072,6 +1119,21 @@ class KaraokeDatabase:
                 f"updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 params,
             )
+        # Listener fires after lock release so it can re-enter the DB
+        # (e.g. lyrics_service.invalidate_for_metadata_change calls
+        # delete_subtitle_jobs) without deadlocking. Exceptions are
+        # swallowed so a faulty listener can never corrupt a successful
+        # metadata write.
+        listener = self._track_metadata_change_listener
+        if listener is not None and invalidating_changed:
+            try:
+                listener(song_id, frozenset(invalidating_changed))
+            except Exception:
+                logger.exception(
+                    "track_metadata_change_listener crashed for song_id=%s changed=%s",
+                    song_id,
+                    sorted(invalidating_changed),
+                )
         return {f: source for f in applied}
 
     # ------------------------------------------------------------------

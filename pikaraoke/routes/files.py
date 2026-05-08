@@ -351,6 +351,16 @@ def _apply_metadata_edit(k, new_path: str, new_name: str, language: str) -> None
     Without writing the DB the user's edit changes the display name only;
     LRCLib, Genius and Spotify keep getting queried with the original
     metadata and the cached ``.ass`` files are never refreshed.
+
+    Note: ``Karaoke._on_track_metadata_change`` (DB listener) also fires
+    when artist/title actually change value, so the invalidation calls
+    below run twice in the artist/title-edit case. They are idempotent —
+    deleting an already-deleted .ass is a no-op, ``kickoff(force=True)``
+    is a no-op once the orchestrator has the latest pick — so the
+    redundancy is cheap. Keeping the explicit calls here means the
+    manual path also covers ``language``-only edits, which the listener
+    skips on purpose (to avoid a loop with the lyrics pipeline's own
+    language-detection writes).
     """
     if k.db is None:
         return

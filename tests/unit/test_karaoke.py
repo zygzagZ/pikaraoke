@@ -318,3 +318,86 @@ class TestOnSubtitleVariantMiss:
         assert stub._picks == {"/songs/foo.mp4": "genius-sync"}
         assert emitted == []
         assert sockets == []
+
+
+class TestOnTrackMetadataChange:
+    """Listener invoked by KaraokeDatabase when artist/title value changes.
+
+    The listener invalidates the lyrics cache + restarts the pipeline
+    regardless of which writer triggered the change (manual edit,
+    enricher, scanner, consensus rerun). Tested against a real DB +
+    SimpleNamespace stub so the wiring contract (path lookup,
+    invalidate, dispatch, kickoff) is verified end-to-end.
+    """
+
+    def _stub(self, db):
+        invalidated: list[str] = []
+        dispatched: list[str] = []
+        kicked: list[tuple[str, dict]] = []
+
+        stub = SimpleNamespace(
+            db=db,
+            lyrics_service=SimpleNamespace(
+                invalidate_for_metadata_change=lambda p: invalidated.append(p),
+            ),
+            _dispatch_lyrics_fetch_async=lambda p: dispatched.append(p),
+            subtitle_orchestrator=SimpleNamespace(
+                kickoff=lambda p, **kw: kicked.append((p, kw)),
+            ),
+        )
+        return stub, invalidated, dispatched, kicked
+
+    def test_invalidates_dispatches_and_kicks_off(self, db):
+        sid = _make_song(db, "/songs/x.mp4", provenance="auto_line")
+        stub, invalidated, dispatched, kicked = self._stub(db)
+        Karaoke._on_track_metadata_change(stub, sid, frozenset({"artist", "title"}))
+        assert invalidated == ["/songs/x.mp4"]
+        assert dispatched == ["/songs/x.mp4"]
+        assert kicked == [("/songs/x.mp4", {"force": True})]
+
+    def test_no_op_when_song_id_missing(self, db):
+        stub, invalidated, dispatched, kicked = self._stub(db)
+        Karaoke._on_track_metadata_change(stub, 9999, frozenset({"artist"}))
+        assert invalidated == []
+        assert dispatched == []
+        assert kicked == []
+
+    def test_invalidate_failure_does_not_block_dispatch(self, db):
+        """An exception in invalidate is logged and swallowed; the rest still runs."""
+        sid = _make_song(db, "/songs/x.mp4", provenance="auto_line")
+        stub, invalidated, dispatched, kicked = self._stub(db)
+
+        def raising_invalidate(_path):
+            raise OSError("disk full")
+
+        stub.lyrics_service.invalidate_for_metadata_change = raising_invalidate
+        Karaoke._on_track_metadata_change(stub, sid, frozenset({"artist"}))
+        assert dispatched == ["/songs/x.mp4"]
+        assert kicked == [("/songs/x.mp4", {"force": True})]
+
+    def test_db_write_triggers_listener_end_to_end(self, db):
+        """update_track_metadata_with_provenance fires the wired listener."""
+        sid = _make_song(db, "/songs/x.mp4", provenance="auto_line")
+        stub, invalidated, dispatched, kicked = self._stub(db)
+        db.set_track_metadata_change_listener(
+            lambda song_id, fields: Karaoke._on_track_metadata_change(stub, song_id, fields)
+        )
+        # Any writer (here: 'itunes', simulating enricher) triggers the cascade.
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "A", "title": "T"})
+        assert invalidated == ["/songs/x.mp4"]
+        assert dispatched == ["/songs/x.mp4"]
+        assert kicked == [("/songs/x.mp4", {"force": True})]
+
+    def test_same_value_rewrite_does_not_trigger_listener(self, db):
+        """Source upgrade with same value does not invalidate cache."""
+        sid = _make_song(db, "/songs/x.mp4", provenance="auto_line")
+        db.update_track_metadata_with_provenance(sid, "itunes", {"artist": "A"})
+        stub, invalidated, dispatched, kicked = self._stub(db)
+        db.set_track_metadata_change_listener(
+            lambda song_id, fields: Karaoke._on_track_metadata_change(stub, song_id, fields)
+        )
+        # MusicBrainz upgrades the source rung but keeps the same value.
+        db.update_track_metadata_with_provenance(sid, "musicbrainz", {"artist": "A"})
+        assert invalidated == []
+        assert dispatched == []
+        assert kicked == []
