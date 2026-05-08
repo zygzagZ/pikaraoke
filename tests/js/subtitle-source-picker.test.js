@@ -228,8 +228,30 @@ describe('deriveCornerBadgeState', () => {
     expect(deriveCornerBadgeState('genius-sync', sources).cssClass).toBe('error');
   });
 
-  it('error state when activeSource is set but not in sources list', () => {
+  it('error state when activeSource is set but not in sources list AND no row is ready', () => {
     expect(deriveCornerBadgeState('phantom', []).cssClass).toBe('error');
+    // Also: active maps to nothing AND no row is ready — still error.
+    const sources = [row('lrclib', 'download')];
+    expect(deriveCornerBadgeState('phantom', sources).cssClass).toBe('error');
+  });
+
+  it('ready state when activeSource is non-picker (e.g. ``consensus``) but a row is ready', () => {
+    // ``songs.lyrics_source`` carries pipeline-internal tags
+    // (``consensus``, ``whisper``, ``whisperx``, ``user_ass``) that
+    // never appear as picker variants. When one of those is the active
+    // tag (override unset, lyrics_source non-picker) AND a real picker
+    // row reports ready/success, the badge must reflect "subtitles are
+    // rendering" rather than misleadingly claim "brak napisów" — the
+    // splash IS displaying captions in this state.
+    const sources = [
+      { ...row('genius-sync', 'ready', { state: 'success' }), label: 'Genius + sync' },
+      row('lrclib', 'na'),
+    ];
+    expect(deriveCornerBadgeState('consensus', sources)).toEqual({
+      glyph: '●', cssClass: 'ready', label: '—', status: 'OK',
+    });
+    expect(deriveCornerBadgeState('whisper', sources).cssClass).toBe('ready');
+    expect(deriveCornerBadgeState('user_ass', sources).cssClass).toBe('ready');
   });
 
   it('pending state when active source has no resolved state and is not ready', () => {

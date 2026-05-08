@@ -156,6 +156,20 @@ export function deriveCornerBadgeState(activeSource, sources) {
   }
   const row = (sources || []).find((s) => s && s.source === activeSource);
   if (!row) {
+    // Active source isn't in the picker's known list. This is normal:
+    // ``songs.lyrics_source`` carries pipeline-internal tags
+    // (``consensus`` from the consensus engine, ``whisper`` / ``whisperx``
+    // from the aligner, ``user_ass`` for user-authored .ass) that don't
+    // appear in ``_SUBTITLE_SOURCE_ORDER``. The splash IS rendering
+    // those — falling back to "brak napisów" was a false alarm. When at
+    // least one source row reports ready/success, reflect that. Only
+    // genuine empty-source / unknown-active cases keep the error badge.
+    const anyReady = (sources || []).some(
+      (s) => s && (s.state === 'success' || s.status === 'ready'),
+    );
+    if (anyReady) {
+      return { glyph: '●', cssClass: 'ready', label: '—', status: 'OK' };
+    }
     return { glyph: '✕', cssClass: 'error', label: '—', status: 'brak napisów' };
   }
   const label = row.label || activeSource;
