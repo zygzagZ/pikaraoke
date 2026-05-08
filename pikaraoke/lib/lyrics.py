@@ -4453,13 +4453,24 @@ class _TekstowoSearchParser(HTMLParser):
 
 
 class _TekstowoLyricsParser(HTMLParser):
-    """Capture every ``<div class="inner-text">`` block.
+    """Capture every ``<div class="inner-text">`` block, **skipping the
+    translation panel**.
 
     Same depth-counted approach as ``_GeniusLyricsParser`` because tekstowo
     nests inline annotations (translation toggles, advert blocks) inside
     the lyrics container. ``<br>`` becomes ``\\n``; nested tags are
     flattened to their text content. The container only closes when its
     matching ``</div>`` arrives.
+
+    Translation skip: tekstowo song pages render the lyrics original under
+    ``<div class="song-text">`` and (for many songs) an English translation
+    under ``<div class="tlumaczenie">``. Both inner contents reuse the
+    ``inner-text`` class. Without scoping, a ``<langdetect>`` over the
+    concatenated output sees a Polish-then-English mix and the
+    ``_is_lyrics_language_mismatch`` guard discards the result on every
+    Polish song that happens to have a translation — see Kolorowy wiatr.
+    Tracking ``_in_translation`` and ignoring ``inner-text`` while inside
+    keeps just the original lyrics text.
     """
 
     def __init__(self) -> None:
@@ -4467,11 +4478,28 @@ class _TekstowoLyricsParser(HTMLParser):
         self._depth = 0
         self._in_container = False
         self._chunks: list[str] = []
+        # Tekstowo wraps the (optional) translation block in a div with
+        # ``class="tlumaczenie"`` (id ``songTranslation``). We track depth
+        # so a stray nested div inside the translation panel doesn't
+        # accidentally close the outer guard.
+        self._in_translation = False
+        self._translation_depth = 0
         self.containers: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "div":
-            cls = (dict(attrs).get("class") or "").split()
+            attr_dict = dict(attrs)
+            cls = (attr_dict.get("class") or "").split()
+            attr_id = attr_dict.get("id") or ""
+            # Enter translation scope: any inner-text below us is a
+            # translation, not the original lyrics.
+            if not self._in_translation and ("tlumaczenie" in cls or attr_id == "songTranslation"):
+                self._in_translation = True
+                self._translation_depth = 1
+                return
+            if self._in_translation:
+                self._translation_depth += 1
+                return
             if not self._in_container and "inner-text" in cls:
                 self._in_container = True
                 self._depth = 1
@@ -4497,6 +4525,11 @@ class _TekstowoLyricsParser(HTMLParser):
         self._chunks.append(self.get_starttag_text() or "")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "div" and self._in_translation:
+            self._translation_depth -= 1
+            if self._translation_depth == 0:
+                self._in_translation = False
+            return
         if not self._in_container:
             return
         if tag == "div":

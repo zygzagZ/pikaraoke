@@ -1316,6 +1316,67 @@ class TestExtractTekstowoLyrics:
         assert result is not None
         assert "a" in result and "b" in result
 
+    def test_skips_translation_panel_class(self):
+        # Kolorowy wiatr regression: tekstowo serves the original lyrics
+        # inside <div class="song-text"> and the English translation inside
+        # <div class="tlumaczenie">. Both contain a <div class="inner-text">.
+        # Without scoping the translation div, langdetect sees PL+EN mixed
+        # and ``_is_lyrics_language_mismatch`` rejects the whole record on
+        # every Polish song with a translation. Only the original must
+        # survive the scrape.
+        html = (
+            "<html><body>"
+            '<div class="song-text" id="songText">'
+            "<h2>Tekst piosenki: Edyta Górniak - Kolorowy wiatr</h2>"
+            '<div class="inner-text">Ty masz mnie za głupią dzikuskę<br />'
+            "Lecz choć cały świat zwiedziłeś</div>"
+            "</div>"
+            '<div class="tlumaczenie" id="songTranslation">'
+            "<h2>Tłumaczenie: Edyta Górniak - Kolorowy wiatr</h2>"
+            '<div id="translation" class="id-433175">'
+            '<div class="inner-text">You think I am a stupid savage<br />'
+            "Even though you visited the whole world</div>"
+            "</div>"
+            "</div>"
+            "</body></html>"
+        )
+        result = _extract_tekstowo_lyrics(html)
+        assert result is not None
+        assert "głupią dzikuskę" in result
+        assert "stupid savage" not in result
+
+    def test_skips_translation_panel_via_id(self):
+        # Defense-in-depth: if tekstowo ever drops the ``tlumaczenie``
+        # class but keeps ``id="songTranslation"`` (or vice versa) we still
+        # discard the translation block.
+        html = (
+            "<html><body>"
+            '<div class="inner-text">original line</div>'
+            '<div id="songTranslation">'
+            '<div class="inner-text">translation line</div>'
+            "</div>"
+            "</body></html>"
+        )
+        result = _extract_tekstowo_lyrics(html)
+        assert result == "original line"
+
+    def test_translation_followed_by_more_original_still_kept(self):
+        # Layout drift hedge: if tekstowo ever puts another inner-text
+        # block AFTER the translation panel, it should be picked up too.
+        # The translation skip must not become a "stop after first" gate.
+        html = (
+            "<html><body>"
+            '<div class="inner-text">first half</div>'
+            '<div class="tlumaczenie"><div class="inner-text">SKIP ME</div></div>'
+            '<div class="inner-text">second half</div>'
+            "</body></html>"
+        )
+        result = _extract_tekstowo_lyrics(html)
+        assert result is not None
+        assert "first half" in result
+        assert "second half" in result
+        assert "SKIP ME" not in result
+
 
 # ----- Spotify Color Lyrics -----
 
