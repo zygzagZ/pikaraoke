@@ -474,6 +474,7 @@ export function mountSmartPicker(container, getSongId, opts) {
     const now = Date.now();
     for (const s of sorted) {
       const opt = deriveOptionState(s, active);
+      const tier = coverageTier(s.coverage, s.order_uncertain);
       const row = el('button', {
         className: 'pk-row',
         attrs: {
@@ -484,6 +485,9 @@ export function mountSmartPicker(container, getSongId, opts) {
           'aria-selected': opt.state === 'active' ? 'true' : 'false',
         },
       });
+      if (tier) {
+        setAttr(row, 'data-coverage-tier', tier);
+      }
       if (opt.state.startsWith('disabled-')) {
         row.disabled = true;
         row.tabIndex = -1;
@@ -494,6 +498,20 @@ export function mountSmartPicker(container, getSongId, opts) {
         text: glyphForOption(opt.state),
       });
       const rowLabel = el('span', { className: 'pk-row-label', text: s.label || s.source });
+      if (tier && s.coverage != null) {
+        const pct = Math.round(s.coverage * 100);
+        const cov = el('span', {
+          className: 'pk-row-coverage',
+          attrs: {
+            'data-tier': tier,
+            title: s.order_uncertain
+              ? `Pokrycie ${pct}% (kolejność słów niepewna)`
+              : `Pokrycie ${pct}%`,
+          },
+          text: `${pct}%`,
+        });
+        rowLabel.appendChild(cov);
+      }
       const rowStatus = el('span', { className: 'pk-row-status' });
       const suffix = statusSuffix(opt, now);
       setText(rowStatus, suffix);

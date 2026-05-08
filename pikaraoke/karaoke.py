@@ -1713,12 +1713,26 @@ class Karaoke:
         if song_id is not None and self.db is not None:
             try:
                 for row in self.db.get_subtitle_jobs(song_id):
+                    # Defensive column reads — pre-v11 DBs (or a SELECT
+                    # executed against a cursor description still missing
+                    # ``coverage`` / ``order_uncertain``) would IndexError.
+                    # Treat any miss as ``None`` so the picker still renders.
+                    try:
+                        coverage = row["coverage"]
+                    except (KeyError, IndexError):
+                        coverage = None
+                    try:
+                        order_uncertain = bool(row["order_uncertain"])
+                    except (KeyError, IndexError):
+                        order_uncertain = False
                     jobs_by_source[row["source"]] = {
                         "state": row["state"],
                         "tier": row["tier"],
                         "error_code": row["error_code"],
                         "error_message": row["error_message"],
                         "next_retry_at": row["next_retry_at"],
+                        "coverage": float(coverage) if coverage is not None else None,
+                        "order_uncertain": order_uncertain,
                     }
             except Exception:
                 logging.exception("subtitle_sources: get_subtitle_jobs failed for %s", song_id)
@@ -1790,6 +1804,8 @@ class Karaoke:
                     "error_code": job.get("error_code"),
                     "error_message": job.get("error_message"),
                     "next_retry_at": job.get("next_retry_at"),
+                    "coverage": job.get("coverage"),
+                    "order_uncertain": bool(job.get("order_uncertain", False)),
                 }
             )
 

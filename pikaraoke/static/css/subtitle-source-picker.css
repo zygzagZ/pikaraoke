@@ -275,6 +275,31 @@
 .pk-row[data-state="disabled-error"] .pk-row-status { color: var(--pk-danger); }
 .pk-row[data-state="disabled-rate-limited"] .pk-row-status { color: var(--pk-sun-deep, var(--pk-amber)); }
 
+/* Coverage badge inside the dropdown row label — same three tiers as
+   the chip-row badge (good/warn/bad), persisted to subtitle_jobs.coverage
+   by the consensus engine. Renders inline next to the source name so
+   the operator sees "Genius+sync 84%" while picking. */
+.pk-row-coverage {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  vertical-align: middle;
+  line-height: 1.4;
+}
+.pk-row-coverage[data-tier="good"] { color: var(--pk-success); }
+.pk-row-coverage[data-tier="warn"] { color: var(--pk-sun-deep, var(--pk-amber)); }
+.pk-row-coverage[data-tier="bad"]  { color: var(--pk-danger); }
+/* Below the consensus rejection threshold → variant gate will soft-miss
+   if pinned. Dim the row to flag that the click won't actually swap subs. */
+.pk-row[data-coverage-tier="bad"]:not([data-state="active"]) {
+  opacity: 0.65;
+}
+
 /* ============================================================
    T4=A: alarm pulse on the slot when the badge enters error or
    downloading. Cross-references the splash badge state for the
