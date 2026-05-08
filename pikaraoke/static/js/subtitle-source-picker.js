@@ -410,7 +410,7 @@ const ALARM_DURATION_MS = 3000;
 export function mountSmartPicker(container, getSongId, opts) {
   const options = opts || {};
   const canonicalOrder = options.canonicalOrder || [
-    'off', 'user', 'lrclib', 'lrclib-sync', 'genius-sync',
+    'off', 'user', 'consensus', 'lrclib', 'lrclib-sync', 'genius-sync',
     'spotify-sync', 'tekstowo-sync', 'AI', 'youtube-vtt',
   ];
   const onSelect = options.onSelect || (() => Promise.resolve({ ok: true }));

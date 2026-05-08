@@ -2389,8 +2389,8 @@ class TestVariantWriteOnTieredPath:
         assert "ass_lrclib-sync" in roles
         db.close()
 
-    def test_no_variant_for_user_or_consensus(self, tmp_path):
-        """Sources outside VARIANT_FILE_SOURCES never write a variant file."""
+    def test_consensus_writes_canonical_and_variant(self, tmp_path):
+        """Consensus is now a pinnable variant — writes <stem>.consensus.ass too."""
         from pikaraoke.lib.lyrics import _TIER_WORD
 
         song, db, service = self._service(tmp_path)
@@ -2402,12 +2402,13 @@ class TestVariantWriteOnTieredPath:
             aligner_model="m",
             lyrics_sha="x",
         )
-        # Canonical landed; no consensus variant file.
-        assert (tmp_path / "Foo---abc.ass").exists()
-        assert not (tmp_path / "Foo---abc.consensus.ass").exists()
+        # Canonical AND consensus variant landed; picker can pin "Auto".
+        assert (tmp_path / "Foo---abc.ass").read_text() == "consensus-content"
+        assert (tmp_path / "Foo---abc.consensus.ass").read_text() == "consensus-content"
         sid = db.get_song_id_by_path(song)
         roles = {r["role"] for r in db.get_artifacts(sid)}
-        assert "ass_consensus" not in roles
+        assert "ass_consensus" in roles
+        assert "ass_auto" in roles
         db.close()
 
 

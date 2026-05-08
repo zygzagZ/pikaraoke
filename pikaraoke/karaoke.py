@@ -30,6 +30,7 @@ from pikaraoke.lib.get_platform import (
 from pikaraoke.lib.karaoke_database import (
     LYRICS_PROVENANCE_USER,
     SUBTITLE_SOURCE_AI,
+    SUBTITLE_SOURCE_CONSENSUS,
     SUBTITLE_SOURCE_GENIUS_SYNC,
     SUBTITLE_SOURCE_LABELS,
     SUBTITLE_SOURCE_LRCLIB,
@@ -1623,10 +1624,15 @@ class Karaoke:
     _SUBTITLE_STATUS_DOWNLOADING = "downloading"
     _SUBTITLE_STATUS_NA = "na"
 
-    # Fixed display order for the source-picker dropdown.
+    # Fixed display order for the source-picker dropdown. ``consensus`` sits
+    # between ``user`` and the raw external sources because it's the default
+    # canonical pick when ≥1 external + Whisper land — operators reaching
+    # for a manual override usually want one of the explicit single-source
+    # variants below it.
     _SUBTITLE_SOURCE_ORDER = (
         SUBTITLE_SOURCE_OFF,
         SUBTITLE_SOURCE_USER,
+        SUBTITLE_SOURCE_CONSENSUS,
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
         SUBTITLE_SOURCE_SPOTIFY,
@@ -1780,6 +1786,14 @@ class Karaoke:
                     has_youtube_id or self._has_local_vtt_file(file_path)
                 ):
                     na_reason = "no YouTube ID and no local VTT"
+                elif source == SUBTITLE_SOURCE_CONSENSUS and not (
+                    has_whisper and has_aligner
+                ):
+                    # Consensus needs Whisper (audio reference) + aligner (k-tag
+                    # word timing). Without either, the line-merge has nothing
+                    # to align lines against. Operator can still pick raw
+                    # variants below.
+                    na_reason = "no Whisper / aligner — Auto unavailable"
 
                 variant_path = variant_ass_path(file_path, source)
                 if os.path.exists(variant_path):
@@ -1788,6 +1802,15 @@ class Karaoke:
                     status = self._SUBTITLE_STATUS_DOWNLOADING
                 elif na_reason is not None:
                     status = self._SUBTITLE_STATUS_NA
+                elif source == SUBTITLE_SOURCE_CONSENSUS:
+                    # Consensus is computed automatically from whatever the
+                    # other variants produced. Operator never "downloads" it
+                    # directly — they just wait. Show ``downloading`` while
+                    # any contributor is still in flight, otherwise ``na``.
+                    if in_flight:
+                        status = self._SUBTITLE_STATUS_DOWNLOADING
+                    else:
+                        status = self._SUBTITLE_STATUS_NA
                 else:
                     status = self._SUBTITLE_STATUS_DOWNLOAD
                 downloadable = status == self._SUBTITLE_STATUS_DOWNLOAD

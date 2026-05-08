@@ -36,6 +36,7 @@ import requests
 from pikaraoke.lib.events import EventSystem
 from pikaraoke.lib.karaoke_database import (
     SUBTITLE_SOURCE_AI,
+    SUBTITLE_SOURCE_CONSENSUS,
     SUBTITLE_SOURCE_GENIUS_SYNC,
     SUBTITLE_SOURCE_LRCLIB,
     SUBTITLE_SOURCE_LRCLIB_SYNC,
@@ -336,6 +337,7 @@ _VARIANT_SOURCE_TIERS: dict[str, str] = {
     SUBTITLE_SOURCE_SPOTIFY_SYNC: "word",
     SUBTITLE_SOURCE_TEKSTOWO_SYNC: "word",
     SUBTITLE_SOURCE_AI: "word",
+    SUBTITLE_SOURCE_CONSENSUS: "word",
 }
 
 
@@ -557,9 +559,10 @@ class LyricsService:
         # Variant write is unconditional — every successful source render
         # leaves a per-source ``<stem>.<source>.ass`` so the operator can
         # later pin that source via the picker even when a higher tier
-        # already won the canonical ``<stem>.ass``. ``user`` / ``off`` /
-        # ``consensus`` skip the variant file (no entry in
-        # ``VARIANT_FILE_SOURCES``).
+        # already won the canonical ``<stem>.ass``. ``user`` / ``off``
+        # skip the variant file (no entry in ``VARIANT_FILE_SOURCES``);
+        # ``consensus`` writes both canonical and ``<stem>.consensus.ass``
+        # so the picker exposes "Auto" as a pinnable variant.
         write_variant = lyrics_source in VARIANT_FILE_SOURCES
         with self._tier_lock:
             current = self._tier_state.get(song_path, _TIER_NONE)
@@ -701,6 +704,115 @@ class LyricsService:
             song_id,
             [{"role": f"ass_{source}", "path": _variant_ass_path(song_path, source)}],
         )
+        self._maybe_recompute_consensus(song_path, source)
+
+    def _maybe_recompute_consensus(self, song_path: str, just_landed_source: str) -> None:
+        """Re-run consensus when the available source set changed.
+
+        Computes a hash of on-disk variant files + Whisper cache state,
+        compares against the hash from the last consensus run, and
+        dispatches a rerun if different. Whisper transcript reads from
+        cache so a rerun never re-invokes the ASR model. The consensus
+        engine's own semaphore serializes concurrent dispatches.
+
+        Skips when:
+          * the just-landed source IS consensus (avoid feedback loop),
+          * no audio fingerprint to key the hash off,
+          * the hash is unchanged (no new input vs last run).
+        """
+        from pikaraoke.lib.karaoke_database import SUBTITLE_SOURCE_CONSENSUS as _CONSENSUS
+
+        if just_landed_source == _CONSENSUS:
+            return
+        if self._db is None:
+            return
+        if not _consensus_enabled() or self._aligner is None:
+            return
+        try:
+            new_hash = self._compute_consensus_input_hash(song_path)
+        except Exception:
+            logger.exception(
+                "consensus rerun: hash compute failed for %s", os.path.basename(song_path)
+            )
+            return
+        if not new_hash:
+            return
+        audio_sha = self._audio_sha_for_song(song_path)
+        if not audio_sha:
+            return
+        cache_key = f"consensus_input_hash:{audio_sha}"
+        try:
+            prev = self._db.get_metadata(cache_key)
+        except Exception:
+            prev = None
+        if prev == new_hash:
+            return
+        try:
+            self._db.set_metadata(cache_key, new_hash)
+        except Exception:
+            logger.exception(
+                "consensus rerun: failed to persist hash for %s", os.path.basename(song_path)
+            )
+        info = self._read_metadata_for_lrclib(song_path)
+        # Don't re-fetch lrclib here — _upgrade_via_consensus_locked will
+        # only include lrclib in its source pool when ``lrclib_lrc`` is
+        # passed in. The first run of the pipeline already wrote
+        # ``<stem>.lrclib.ass`` (variant); LRCLib's network call is HTTP-
+        # cached so we let the consensus engine re-fetch via its own path.
+        # ``lyrics_sha`` is derived inside the engine when needed.
+        threading.Thread(
+            target=self._upgrade_via_consensus,
+            args=(song_path, info, None, None),
+            name=f"consensus-rerun-{os.path.basename(song_path)}",
+            daemon=True,
+        ).start()
+        logger.info(
+            "consensus rerun: dispatched for %s (trigger=%s, hash=%s)",
+            os.path.basename(song_path),
+            just_landed_source,
+            new_hash,
+        )
+
+    def _compute_consensus_input_hash(self, song_path: str) -> str:
+        """Stable digest of which variant inputs are currently available.
+
+        Includes every on-disk ``<stem>.<source>.ass`` (excluding consensus
+        itself, which is the output) keyed by mtime+size, plus a marker
+        when a Whisper transcript is cached for this audio sha. The hash
+        flips whenever a new fetch lands or Whisper finally transcribes,
+        which is the signal to re-run consensus.
+        """
+        import hashlib
+
+        from pikaraoke.lib.karaoke_database import SUBTITLE_SOURCE_CONSENSUS as _CONSENSUS
+
+        parts: list[str] = []
+        for source in VARIANT_FILE_SOURCES:
+            if source == _CONSENSUS:
+                continue
+            path = _variant_ass_path(song_path, source)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            parts.append(f"{source}:{int(st.st_mtime)}:{st.st_size}")
+        audio_sha = self._audio_sha_for_song(song_path)
+        if audio_sha and self._db is not None:
+            try:
+                model_name = _resolve_whisper_model()
+                cached = _read_cached_whisper_transcript(
+                    self._db.get_metadata, audio_sha, model_name
+                )
+                if cached is not None:
+                    parts.append(f"whisper:{model_name}")
+            except Exception:
+                logger.exception(
+                    "consensus rerun: whisper cache probe failed for %s",
+                    os.path.basename(song_path),
+                )
+        if not parts:
+            return ""
+        return hashlib.sha256(":".join(sorted(parts)).encode()).hexdigest()[:16]
 
     def _write_and_register_variant(
         self,
@@ -748,6 +860,7 @@ class LyricsService:
             message="Lyrics variant fetched",
             detail=f"source={source}",
         )
+        self._maybe_recompute_consensus(song_path, source)
 
     def is_fetch_in_flight(self, song_path: str, source: str) -> bool:
         """Public read-only probe for the (song, source) in-flight slot."""
@@ -3697,12 +3810,24 @@ class LyricsService:
             song_path,
             _TIER_WORD,
             ass,
-            lyrics_source="consensus",
+            lyrics_source=SUBTITLE_SOURCE_CONSENSUS,
             aligner_model=aligner_model,
             lyrics_sha=consensus_sha,
         )
         if not wrote:
             return
+        # Persist the input-set hash so subsequent variant landings can
+        # short-circuit the rerun trigger when no new input has arrived.
+        try:
+            audio_sha_persist = self._audio_sha_for_song(song_path)
+            if audio_sha_persist and self._db is not None:
+                final_hash = self._compute_consensus_input_hash(song_path)
+                if final_hash:
+                    self._db.set_metadata(
+                        f"consensus_input_hash:{audio_sha_persist}", final_hash
+                    )
+        except Exception:
+            logger.exception("consensus: failed to persist input hash for %s", basename)
         logger.info(
             "consensus: wrote T3 for %s (sources=%s, confidence=%.2f, rejected=%s)",
             basename,

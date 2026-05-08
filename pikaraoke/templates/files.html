@@ -290,16 +290,22 @@ $(function() {
 
 {# Maps songs.lyrics_source values to a compact label + colour variant.
    Variants match the splash badge: user-authored is vibrant (curated),
-   LRCLib/Genius/YouTube/whisperx are slate (trusted auto), Whisper ASR
+   LRCLib/Genius/YouTube/consensus are slate (trusted auto), Whisper ASR
    is amber (may hallucinate). No entry means no .ass yet — Whisper
    fallback hasn't run, which is useful operator signal. #}
 {% set lyrics_source_meta = {
+  'user':        ('Twoje',           'user'),
   'user_ass':    ('Twoje',           'user'),
+  'consensus':   ('Auto',            'trust'),
   'lrclib':      ('LRCLib',          'trust'),
+  'lrclib-sync': ('LRCLib + sync',   'trust'),
   'whisperx':    ('LRCLib + sync',   'trust'),
+  'genius-sync': ('Genius',          'trust'),
   'genius':      ('Genius',          'trust'),
+  'youtube-vtt': ('YouTube',         'trust'),
   'youtube_vtt': ('YouTube',         'trust'),
-  'whisper':     ('Auto (Whisper)',  'auto'),
+  'AI':          ('AI',              'auto'),
+  'whisper':     ('AI',              'auto'),
 } %}
 {% macro lyrics_badge(song) %}
   {% set _src = lyrics_sources.get(song) %}

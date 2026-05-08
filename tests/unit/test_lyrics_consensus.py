@@ -7,14 +7,14 @@ from pikaraoke.lib.lyrics_consensus import (
     _CONFIDENCE_MIN,
     ConsensusResult,
     SourceResult,
+    TimedLine,
     build_audio_reference,
     build_consensus,
-    build_consensus_lrc,
+    merge_lines_per_window,
     normalize_tokens,
     score_against_reference,
     score_sources_against_reference,
     select_scaffold,
-    vote_tokens,
 )
 
 
@@ -164,34 +164,147 @@ class TestContiguityFlag:
         assert uncertain is True
 
 
-# ---------------- T6 vote_tokens ----------------
+# ---------------- T6 merge_lines_per_window ----------------
 
 
-class TestVoteTokens:
-    def test_majority_wins(self):
-        ref = ["the", "last"]
-        a = SourceResult(name="a", kind="title_matched")
-        b = SourceResult(name="b", kind="title_matched")
-        c = SourceResult(name="c", kind="title_matched")
-        votes = vote_tokens(
-            ref,
-            [(a, ["the", "last"]), (b, ["the", "last"]), (c, ["the", "best"])],
+class TestMergeLinesPerWindow:
+    """Line-level merge that replaced token-level voting.
+
+    Picks the *whole* phrasing of each line from whichever source best
+    matches the Whisper time window for that line. No surgery inside lines.
+    """
+
+    def _ws(self, *triples: tuple[str, float, float]) -> list[Word]:
+        return [Word(text=t, start=s, end=e) for t, s, e in triples]
+
+    def test_lrclib_full_line_wins_over_truncated_whisper(self):
+        # Real bug pattern: Whisper drops a function word ("w") and a final
+        # word ("pcha"); LRCLib has the full line. Old token-vote produced
+        # "lat coś objęcia chłodu mnie"; new line-merge keeps the LRCLib
+        # phrasing whole.
+        lrclib = _lrclib(
+            "[00:00.00]od lat coś w objęcia chłodu mnie pcha"
         )
-        assert votes[0] == "the"
-        assert votes[1] == "last"
+        whisper_words = self._ws(
+            ("od", 0.0, 0.2),
+            ("lat", 0.2, 0.4),
+            ("coś", 0.4, 0.6),
+            ("objęcia", 0.6, 1.0),
+            ("chłodu", 1.0, 1.4),
+            ("mnie", 1.4, 1.6),
+        )
+        merged = merge_lines_per_window([lrclib], whisper_words)
+        assert len(merged) == 1
+        # Full LRCLib line preserved verbatim — "w" and "pcha" survive.
+        assert merged[0].text == "od lat coś w objęcia chłodu mnie pcha"
 
-    def test_no_candidate_falls_back_to_audio_ref(self):
-        ref = ["solo"]
-        votes = vote_tokens(ref, [])
-        assert votes[0] == "solo"
+    def test_better_phrasing_wins_against_scaffold(self):
+        # Scaffold (LRCLib) has a slightly off line; Genius/MXM has the
+        # phrasing that actually matches Whisper. Tie-broken by score.
+        # Use musixmatch (synced) since merge_lines only consumes synced.
+        lrclib = _lrclib("[00:00.00]hello strange world here")
+        mxm = _musixmatch("[00:00.00]hello dear world friend")
+        whisper_words = self._ws(
+            ("hello", 0.0, 0.2),
+            ("dear", 0.2, 0.4),
+            ("world", 0.4, 0.6),
+            ("friend", 0.6, 0.8),
+        )
+        merged = merge_lines_per_window([lrclib, mxm], whisper_words)
+        assert len(merged) == 1
+        assert merged[0].text == "hello dear world friend"
 
-    def test_tie_break_source_matched_wins(self):
-        ref = ["x"]
-        title = SourceResult(name="lrclib", kind="title_matched")
-        source = SourceResult(name="vtt", kind="source_matched")
-        votes = vote_tokens(ref, [(title, ["alpha"]), (source, ["beta"])])
-        # 1-1 tie -> source_matched wins.
-        assert votes[0] == "beta"
+    def test_drops_scaffold_only_line_when_whisper_silent(self):
+        # Two synced sources agree on the first line; the second line is
+        # unique to LRClib and Whisper hears nothing. Drop fires because
+        # multi-source baseline lets us trust the disagreement signal.
+        lrclib = _lrclib(
+            "[00:00.00]hello world\n"
+            "[00:10.00]ghost line nobody sings"
+        )
+        mxm = _musixmatch("[00:00.00]hello world")
+        whisper_words = self._ws(
+            ("hello", 0.0, 0.3),
+            ("world", 0.3, 0.6),
+        )
+        merged = merge_lines_per_window([lrclib, mxm], whisper_words)
+        assert len(merged) == 1
+        assert merged[0].text == "hello world"
+
+    def test_single_source_keeps_lines_even_when_whisper_silent(self):
+        # With only one synced source, "scaffold-only line" is every line
+        # by construction. Drop rule disabled — keep the LRClib content
+        # so quiet bridges aren't silently deleted.
+        lrclib = _lrclib(
+            "[00:00.00]hello world\n[00:10.00]quiet bridge here"
+        )
+        whisper_words = self._ws(
+            ("hello", 0.0, 0.3),
+            ("world", 0.3, 0.6),
+        )
+        merged = merge_lines_per_window([lrclib], whisper_words)
+        assert len(merged) == 2
+        assert merged[1].text == "quiet bridge here"
+
+    def test_keeps_scaffold_only_line_when_two_sources_agree(self):
+        # Both LRCLib and MXM agree the second line exists, even though
+        # Whisper missed it. No drop — multi-source agreement wins over
+        # silent window.
+        lrclib = _lrclib(
+            "[00:00.00]hello world\n[00:10.00]quiet refrain we keep"
+        )
+        mxm = _musixmatch(
+            "[00:00.00]hello world\n[00:10.00]quiet refrain we keep"
+        )
+        whisper_words = self._ws(
+            ("hello", 0.0, 0.3),
+            ("world", 0.3, 0.6),
+        )
+        merged = merge_lines_per_window([lrclib, mxm], whisper_words)
+        assert len(merged) == 2
+        assert merged[1].text == "quiet refrain we keep"
+
+    def test_extra_line_inserted_when_two_sources_agree_and_whisper_supports(self):
+        # Scaffold (LRCLib) skips a line; both MXM and Megalobiz have it
+        # at the same timestamp; Whisper hears its tokens. Insert the
+        # extra line into the merged output.
+        lrclib = _lrclib("[00:00.00]first line\n[00:10.00]third line")
+        mxm = _musixmatch(
+            "[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line"
+        )
+        meg = _megalobiz(
+            "[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line"
+        )
+        whisper_words = self._ws(
+            ("first", 0.0, 0.3),
+            ("line", 0.3, 0.6),
+            ("middle", 5.0, 5.2),
+            ("extra", 5.2, 5.4),
+            ("line", 5.4, 5.6),
+            ("third", 10.0, 10.3),
+            ("line", 10.3, 10.6),
+        )
+        merged = merge_lines_per_window([lrclib, mxm, meg], whisper_words)
+        texts = [tl.text for tl in merged]
+        assert "middle extra line" in texts
+
+    def test_extra_line_dropped_when_only_one_source_has_it(self):
+        # Only MXM has the extra; Megalobiz doesn't. No multi-source
+        # support → drop even if Whisper hears something close.
+        lrclib = _lrclib("[00:00.00]first line\n[00:10.00]third line")
+        mxm = _musixmatch(
+            "[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line"
+        )
+        whisper_words = self._ws(
+            ("first", 0.0, 0.3),
+            ("middle", 5.0, 5.3),
+            ("extra", 5.3, 5.6),
+            ("line", 5.6, 5.9),
+            ("third", 10.0, 10.3),
+        )
+        merged = merge_lines_per_window([lrclib, mxm], whisper_words)
+        texts = [tl.text for tl in merged]
+        assert "middle extra line" not in texts
 
 
 # ---------------- T7 select_scaffold ----------------
@@ -248,39 +361,6 @@ class TestSelectScaffold:
 
     def test_returns_none_when_empty(self):
         assert select_scaffold([], order_uncertain=set()) is None
-
-
-# ---------------- T8 build_consensus_lrc ----------------
-
-
-class TestBuildConsensusLrc:
-    def test_emits_valid_lrc_format(self):
-        scaffold = _lrclib("[00:13.50]hello world\n[00:18.20]foo bar")
-        voted = {0: "hello", 1: "world", 2: "foo", 3: "bar"}
-        out = build_consensus_lrc(scaffold, voted)
-        assert "[00:13.50]hello world" in out
-        assert "[00:18.20]foo bar" in out
-
-    def test_empty_scaffold_line_falls_back_to_original(self):
-        # Scaffold has 2 lines (4 tokens) but only 2 voted tokens cover line 0.
-        scaffold = _lrclib("[00:00.00]hello world\n[00:01.00]extra line")
-        voted = {0: "hello", 1: "world"}  # nothing for line 2
-        out = build_consensus_lrc(scaffold, voted)
-        assert "[00:00.00]hello world" in out
-        # Line 2 reuses scaffold's original text rather than empty.
-        assert "extra line" in out
-
-    def test_whisper_scaffold_emits_per_word_lines(self):
-        words = [
-            Word(text="alpha", start=0.0, end=0.5),
-            Word(text="beta", start=0.5, end=1.0),
-        ]
-        scaffold = _whisper(words)
-        voted = {0: "alpha", 1: "beta"}
-        out = build_consensus_lrc(scaffold, voted)
-        assert "alpha" in out
-        assert "beta" in out
-        assert out.startswith("[00:00.00]")
 
 
 # ---------------- T1 Moonlight Shadow regression (CRITICAL) ----------------
@@ -402,18 +482,6 @@ class TestConfidenceGate:
         assert result is None
 
 
-# ---------------- T24 scaffold beyond audio_ref ----------------
-
-
-class TestScaffoldBeyondAudioRef:
-    def test_scaffold_lines_past_audio_ref_use_original_text(self):
-        scaffold = _lrclib("[00:00.00]hello world\n[00:05.00]foo bar\n[00:10.00]extra padding")
-        # voted only covers first 4 tokens.
-        voted = {0: "hello", 1: "world", 2: "foo", 3: "bar"}
-        out = build_consensus_lrc(scaffold, voted)
-        assert "[00:10.00]extra padding" in out
-
-
 # ---------------- T25 group failure mode ----------------
 
 
@@ -441,62 +509,6 @@ class TestGroupFailureMode:
         rejected_names = [name for name, _ in result.sources_rejected]
         assert {"lrclib", "musixmatch", "megalobiz"} <= set(rejected_names)
         assert result.text.startswith("the last")
-
-
-# ---------------- T26 vote whisper demotion (AI demotion) ----------------
-
-
-class TestVoteWhisperDemotion:
-    """Whisper text loses to title-matched lyrics on disagreement.
-
-    Audio_ref still uses Whisper for structure, but at any token position
-    where a title-matched source has a different opinion, Whisper's vote
-    is dropped from the pool entirely. When NO title-matched source
-    survives, Whisper text wins by default — that's the "tylko gdy nic
-    innego" rule.
-    """
-
-    def test_title_matched_present_drops_whisper_from_voting(self):
-        # Audio_ref says "alpha bravo charlie"; whisper agrees on
-        # "alpha bravo charlie"; lrclib says "alpha bravo delta".
-        # Without demotion: whisper would tie-break-win at index 2.
-        # With demotion: whisper is dropped → lrclib's "delta" wins.
-        ref = ["alpha", "bravo", "charlie"]
-        whisper = SourceResult(
-            name="whisper",
-            kind="source_matched",
-            words=[
-                Word(text="alpha", start=0.0, end=0.5),
-                Word(text="bravo", start=0.5, end=1.0),
-                Word(text="charlie", start=1.0, end=1.5),
-            ],
-            is_synced=False,
-        )
-        lrclib = _lrclib("[00:00.00]alpha bravo delta")
-        votes = vote_tokens(
-            ref,
-            [
-                (whisper, ["alpha", "bravo", "charlie"]),
-                (lrclib, ["alpha", "bravo", "delta"]),
-            ],
-        )
-        assert votes[2] == "delta"
-
-    def test_no_title_matched_leaves_whisper_voting(self):
-        # No lyric source survived; whisper text remains the only signal.
-        ref = ["alpha", "bravo"]
-        whisper = SourceResult(
-            name="whisper",
-            kind="source_matched",
-            words=[
-                Word(text="alpha", start=0.0, end=0.5),
-                Word(text="bravo", start=0.5, end=1.0),
-            ],
-            is_synced=False,
-        )
-        votes = vote_tokens(ref, [(whisper, ["alpha", "bravo"])])
-        assert votes[0] == "alpha"
-        assert votes[1] == "bravo"
 
 
 # ---------------- T27 source scores attached + score_sources helper ----------------

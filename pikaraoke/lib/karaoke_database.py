@@ -281,11 +281,17 @@ SUBTITLE_SOURCE_SPOTIFY_SYNC = "spotify-sync"
 SUBTITLE_SOURCE_TEKSTOWO_SYNC = "tekstowo-sync"
 SUBTITLE_SOURCE_AI = "AI"
 SUBTITLE_SOURCE_YOUTUBE_VTT = "youtube-vtt"
+# Auto-mix across the other variants: pick the best line-by-line text from
+# external sources (LRCLib/Genius/Spotify/Tekstowo/MXM/Megalobiz) using
+# Whisper as the audio reference. Surfaces in the picker as "Auto" and
+# is the default canonical .ass when ≥1 external + Whisper land.
+SUBTITLE_SOURCE_CONSENSUS = "consensus"
 
 VALID_SUBTITLE_SOURCES = frozenset(
     {
         SUBTITLE_SOURCE_OFF,
         SUBTITLE_SOURCE_USER,
+        SUBTITLE_SOURCE_CONSENSUS,
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
         SUBTITLE_SOURCE_SPOTIFY,
@@ -302,6 +308,7 @@ VALID_SUBTITLE_SOURCES = frozenset(
 # live at ``<stem>.ass`` (canonical), not at ``<stem>.user.ass``.
 VARIANT_FILE_SOURCES = frozenset(
     {
+        SUBTITLE_SOURCE_CONSENSUS,
         SUBTITLE_SOURCE_LRCLIB,
         SUBTITLE_SOURCE_LRCLIB_SYNC,
         SUBTITLE_SOURCE_SPOTIFY,
@@ -330,6 +337,7 @@ SUBTITLE_JOB_SKIPPED = "skipped"
 SUBTITLE_SOURCE_LABELS: dict[str, str] = {
     SUBTITLE_SOURCE_OFF: "wyłącz",
     SUBTITLE_SOURCE_USER: "Twoje napisy",
+    SUBTITLE_SOURCE_CONSENSUS: "Auto",
     SUBTITLE_SOURCE_LRCLIB: "LRCLib",
     SUBTITLE_SOURCE_LRCLIB_SYNC: "LRCLib + sync",
     SUBTITLE_SOURCE_SPOTIFY: "Spotify",

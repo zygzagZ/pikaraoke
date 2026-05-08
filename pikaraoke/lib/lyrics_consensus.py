@@ -1,21 +1,27 @@
-"""Multi-source lyrics consensus.
+"""Multi-source lyrics consensus — line-merge edition.
 
-Cross-validates 6 lyrics sources (VTT, Whisper, LRCLib, Musixmatch, Megalobiz,
-Genius) against an audio reference (VTT + Whisper tokens) before allowing the
-T3 word-level ASS overwrite. Defends against the wrong-version overwrite class
-of bug, where one fetcher silently returns a different song's lyrics that
-survive the existing tier gate (which validates only sync quality, not content).
+Cross-validates lyrics sources (LRCLib, Genius, Musixmatch, Megalobiz, VTT)
+against an audio reference (Whisper transcript) and emits a per-line merge:
+each line of the output picks the *whole* phrasing from whichever source
+best matches the corresponding Whisper time window. No token-level voting,
+no surgery inside lines — words from a chosen line are kept verbatim.
 
-Pattern mirrors :mod:`pikaraoke.lib.lyrics_language_classifier` — collect ->
-score -> consensus -> persist. No literal code reuse: tokens vs language codes
-are different domains.
+Drop / keep rules for lines:
+  * scaffold-only line + Whisper hears nothing in its window → drop
+    (handles "extra zwrotka" present in only one fetcher).
+  * non-scaffold synced source has a line at a timestamp the scaffold
+    skips → keep iff ≥1 other source agrees on that timestamp AND
+    Whisper's window contains a matching token block (≥0.55 ratio).
+  * everything else → keep, picking the candidate with the highest
+    SequenceMatcher ratio against the Whisper window.
 
 State machine::
 
-    IDLE -> COLLECTING -> DECIDING ----> ALIGNING -> WRITE T3
-                            |
-                            +-- confidence < 0.5 -> SKIP (T1/T2 stay on screen)
-                            +-- empty consensus  -> SKIP (emit song_warning)
+    IDLE -> SCORE_SOURCES -> MERGE_LINES ----> WRITE T3
+                                |
+                                +-- no synced + no whisper -> FALLBACK
+                                +-- empty audio_ref -> SINGLE_BEST_TITLE
+                                +-- confidence < 0.5 -> SKIP
 
 Pure Python, zero I/O. Threading and aligner orchestration live in
 :mod:`pikaraoke.lib.lyrics`; this module only computes the consensus.
@@ -41,13 +47,14 @@ _REJECT_THRESHOLDS: dict[str, float] = {
 }
 _DEFAULT_THRESHOLD = 0.55
 
+# Ranking used to pick the timing scaffold (which source's line timestamps
+# drive the consensus output) and to break "no audio reference" ties.
+# Lower is better. ``vtt`` ranks above whisper because human-curated YouTube
+# captions are almost always cleaner than ASR. ``whisper`` is last-resort.
 _SCAFFOLD_RANK: dict[str, int] = {
     "lrclib": 0,
     "musixmatch": 1,
     "megalobiz": 2,
-    # Human-curated captions outrank ASR. Whisper text is rough — typos,
-    # hallucinated tokens, missed lines — and only earns the scaffold seat
-    # when nothing else survives the rejection thresholds.
     "vtt": 3,
     "whisper": 99,
 }
@@ -56,9 +63,22 @@ _CONFIDENCE_MIN = 0.5
 _CONFIDENCE_PENALTY_NO_AUDIO_REF = 0.7
 _CONTIGUITY_MIN = 0.4
 
+# Two synced lines from different sources are considered "the same line" when
+# their timestamps are within this many seconds. LRCLib and Musixmatch often
+# disagree by 0.5–1.5s on the same line; 2.5s gives slack without merging
+# adjacent lines of fast verses.
+_LINE_MATCH_WINDOW_S = 2.5
+
+# Threshold for inserting an "extra" line (one present in non-scaffold sources
+# but not the scaffold) — Whisper window must score at least this against the
+# candidate text. Lower than the source-rejection threshold because we already
+# require multi-source agreement on top.
+_EXTRA_LINE_WHISPER_GATE = 0.55
+
 _SECTION_HEADER_RE = re.compile(r"\[[^\]]+\]")
 _PAREN_RE = re.compile(r"\([^)]*\)")
 _PUNCT_RE = re.compile(r"[^\w'\s]", re.UNICODE)
+_LRC_TAG_RE = re.compile(r"^\[(\d+):(\d+)(?:\.(\d+))?\](.*)$")
 
 
 @dataclass
@@ -71,6 +91,15 @@ class SourceResult:
     plain_text: str | None = None
     words: "list[Word] | None" = None
     is_synced: bool = False
+
+
+@dataclass
+class TimedLine:
+    """A line of lyrics with its starting timestamp (seconds)."""
+
+    start: float
+    text: str
+    source_name: str = ""
 
 
 @dataclass
@@ -91,7 +120,7 @@ class ConsensusResult:
     source_scores: dict[str, tuple[float, bool]] = field(default_factory=dict)
 
 
-# ---------- Step 1: tokenize ----------
+# ---------- Tokenization ----------
 
 
 def normalize_tokens(text: str | None) -> list[str]:
@@ -110,11 +139,14 @@ def normalize_tokens(text: str | None) -> list[str]:
     return [t for t in s.split() if len(t) >= 2]
 
 
+def _strip_lrc_tags(line: str) -> str:
+    return re.sub(r"\[\d+:\d+(?:\.\d+)?\]", " ", line)
+
+
 def _source_tokens(source: SourceResult) -> list[str]:
     """Pull a token list from whichever field a source populated."""
     if source.lrc:
-        # Strip LRC timestamps before tokenizing.
-        body = re.sub(r"\[\d+:\d+(?:\.\d+)?\]", " ", source.lrc)
+        body = _strip_lrc_tags(source.lrc)
         return normalize_tokens(body)
     if source.plain_text:
         return normalize_tokens(source.plain_text)
@@ -123,7 +155,7 @@ def _source_tokens(source: SourceResult) -> list[str]:
     return []
 
 
-# ---------- Step 2: audio reference ----------
+# ---------- Audio reference ----------
 
 
 def build_audio_reference(vtt: SourceResult | None, whisper: SourceResult | None) -> list[str]:
@@ -146,7 +178,7 @@ def build_audio_reference(vtt: SourceResult | None, whisper: SourceResult | None
     return out
 
 
-# ---------- Step 3+4: score + contiguity ----------
+# ---------- Per-source coverage scoring ----------
 
 
 def score_against_reference(tokens: list[str], ref: list[str]) -> tuple[float, bool]:
@@ -179,15 +211,10 @@ def score_sources_against_reference(
     """Compute ``(coverage, order_uncertain)`` for every non-audio-ref source.
 
     Pure helper extracted so the consensus persister can record scores
-    even when ``build_consensus`` decides to abort (every title-matched
-    source rejected, scaffold missing, confidence below the gate). The
-    Kolorowy wiatr regression hinges on this: the LRCLib variant must
-    learn its own coverage was 0.05 BEFORE the variant fetch path is
-    asked to render it again from a picker pin.
-
-    Audio-reference owners (``vtt``, ``whisper``) are skipped — they
-    define the reference, scoring them against themselves is meaningless.
-    Returns ``{}`` when ``audio_ref`` is empty (no signal to score against).
+    even when ``build_consensus`` decides to abort. Audio-reference owners
+    (``vtt``, ``whisper``) are skipped — they define the reference, scoring
+    them against themselves is meaningless. Returns ``{}`` when ``audio_ref``
+    is empty (no signal to score against).
     """
     if not audio_ref:
         return {}
@@ -201,72 +228,7 @@ def score_sources_against_reference(
     return out
 
 
-# ---------- Step 5: vote ----------
-
-
-def vote_tokens(
-    audio_ref: list[str], survivors: list[tuple[SourceResult, list[str]]]
-) -> dict[int, str]:
-    """Majority-vote a token at each audio_ref index.
-
-    Use SequenceMatcher opcodes (not just matching blocks) so sources can
-    propose alternative tokens at positions where they disagree with the
-    audio reference. ``equal`` opcodes contribute the matched token,
-    ``replace`` opcodes align 1:1 within the block so a source can vote
-    for its own version of the lyric. ``delete``/``insert`` ranges are
-    skipped (one side has no slot to map to).
-
-    Ties broken by source kind: ``source_matched`` (VTT/Whisper, audio
-    truth) beats ``title_matched`` (curated lyrics text) on presence —
-    better to keep an audio-confirmed token with a minor typo than swap
-    in a confident-but-absent word.
-
-    AI demotion: Whisper text is rough ASR (typos, hallucinations); when
-    any title-matched lyric source survives, drop Whisper from the voting
-    pool so its tokens don't outvote real lyrics on disagreements. Whisper
-    still drives ``audio_ref`` upstream; it just stops competing for the
-    text content.
-    """
-    has_title_matched = any(s.kind == "title_matched" for s, _ in survivors)
-    if has_title_matched:
-        survivors = [(s, t) for s, t in survivors if s.name != "whisper"]
-    candidates: list[list[tuple[str, str]]] = [[] for _ in audio_ref]
-    for source, tokens in survivors:
-        if not tokens:
-            continue
-        matcher = SequenceMatcher(None, audio_ref, tokens, autojunk=False)
-        for op, i1, i2, j1, j2 in matcher.get_opcodes():
-            if op == "equal":
-                for k in range(i2 - i1):
-                    candidates[i1 + k].append((tokens[j1 + k], source.kind))
-            elif op == "replace":
-                n = min(i2 - i1, j2 - j1)
-                for k in range(n):
-                    candidates[i1 + k].append((tokens[j1 + k], source.kind))
-
-    result: dict[int, str] = {}
-    for ref_idx, votes in enumerate(candidates):
-        if not votes:
-            result[ref_idx] = audio_ref[ref_idx]
-            continue
-        counts: dict[str, int] = {}
-        for tok, _kind in votes:
-            counts[tok] = counts.get(tok, 0) + 1
-        best_count = max(counts.values())
-        winners = [t for t, c in counts.items() if c == best_count]
-        if len(winners) == 1:
-            result[ref_idx] = winners[0]
-            continue
-        ranked = []
-        for tok in winners:
-            kind_rank = min((0 if k == "source_matched" else 1) for t, k in votes if t == tok)
-            ranked.append((kind_rank, tok))
-        ranked.sort()
-        result[ref_idx] = ranked[0][1]
-    return result
-
-
-# ---------- Step 6: scaffold ----------
+# ---------- Scaffold (timing source) ----------
 
 
 def select_scaffold(
@@ -277,7 +239,7 @@ def select_scaffold(
     Title-matched lyric sources rank highest (LRCLib > MXM > Megalobiz),
     then human-curated VTT captions, with Whisper ASR sitting at the
     bottom of the rank table — its words only earn the scaffold seat
-    when no other survivor is eligible (the "tylko gdy nic innego" rule).
+    when no other survivor is eligible.
     Order-uncertain sources are excluded — their tokens still vote, but
     their timestamps would mis-place lines.
     """
@@ -288,7 +250,6 @@ def select_scaffold(
         if s.is_synced or s.words:
             eligible.append(s)
     if not eligible:
-        # Last resort: VTT line-level scaffold.
         for s in survivors:
             if s.name == "vtt" and s.is_synced:
                 return s
@@ -297,161 +258,402 @@ def select_scaffold(
     return eligible[0]
 
 
-# ---------- Step 7: build LRC ----------
+# ---------- Line extraction ----------
 
 
-def _parse_lrc_lines(lrc: str) -> list[tuple[str, str]]:
-    """Split LRC into (timestamp_prefix, text) tuples preserving order."""
-    out: list[tuple[str, str]] = []
-    tag_re = re.compile(r"^(\[\d+:\d+(?:\.\d+)?\])(.*)$")
-    for raw in lrc.splitlines():
-        m = tag_re.match(raw.strip())
+def _extract_timed_lines(source: SourceResult) -> list[TimedLine]:
+    """Return ``[(start_sec, line_text), ...]`` for synced sources, else ``[]``.
+
+    Skips empty / metadata-only lines so an LRC with stray ``[ti:]`` or
+    blank ``[mm:ss]`` placeholders doesn't pollute the merge with empty
+    candidates.
+    """
+    if not source.lrc:
+        return []
+    out: list[TimedLine] = []
+    for raw in source.lrc.splitlines():
+        m = _LRC_TAG_RE.match(raw.strip())
         if not m:
             continue
-        prefix, text = m.group(1), m.group(2).strip()
-        out.append((prefix, text))
+        mm_s, ss_s, frac_s, text = m.group(1), m.group(2), m.group(3), m.group(4)
+        try:
+            t = int(mm_s) * 60 + int(ss_s)
+            if frac_s:
+                t += float("0." + frac_s)
+        except ValueError:
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        out.append(TimedLine(start=float(t), text=text, source_name=source.name))
+    out.sort(key=lambda x: x.start)
     return out
 
 
-def _index_voted_text(scaffold_text: str, voted: dict[int, str]) -> str:
-    """Map a scaffold line's tokens to their voted replacements.
-
-    Returns the joined voted tokens for the line, falling back to the
-    scaffold's original line text if the voted slice is empty (e.g. when
-    the scaffold has more lines than audio_ref tokens).
-    """
-    line_tokens = normalize_tokens(scaffold_text)
-    if not line_tokens:
-        return scaffold_text
-    return scaffold_text  # placeholder; real mapping happens in build_consensus_lrc
-
-
-def build_consensus_lrc(scaffold: SourceResult, voted: dict[int, str]) -> str:
-    """Emit a standard LRC string using scaffold timestamps and voted text.
-
-    Empty voted slice for a scaffold line -> fall back to scaffold's own
-    line text (Eng review Q3) so we never emit empty Dialogue events.
-    """
-    if scaffold.lrc:
-        lines = _parse_lrc_lines(scaffold.lrc)
-    elif scaffold.words:
-        lines = []
-        for w in scaffold.words:
-            mm = int(w.start // 60)
-            ss = w.start - mm * 60
-            lines.append((f"[{mm:02d}:{ss:05.2f}]", w.text))
-    else:
-        return ""
-
-    voted_seq = [voted[i] for i in sorted(voted.keys())]
-    cursor = 0
-    out_lines: list[str] = []
-    for prefix, original_text in lines:
-        n_tokens = len(normalize_tokens(original_text))
-        if n_tokens == 0:
-            out_lines.append(f"{prefix}{original_text}")
+def _whisper_window_tokens(
+    whisper_words: "list[Word]", t_start: float, t_end: float
+) -> list[str]:
+    """Return normalized whisper tokens whose start time is in [t_start, t_end)."""
+    out: list[str] = []
+    for w in whisper_words:
+        ws = getattr(w, "start", None)
+        if ws is None:
             continue
-        slice_end = min(cursor + n_tokens, len(voted_seq))
-        chosen = voted_seq[cursor:slice_end]
-        cursor = slice_end
-        if not chosen:
-            logger.warning(
-                "consensus: scaffold line beyond audio_ref end, using original text: %r",
-                original_text[:80],
-            )
-            out_lines.append(f"{prefix}{original_text}")
+        if t_start <= ws < t_end:
+            out.extend(normalize_tokens(getattr(w, "text", "")))
+    return out
+
+
+def _line_score(audio_window: list[str], line_text: str) -> float:
+    """SequenceMatcher ratio of normalized line tokens against an audio window."""
+    line_tokens = normalize_tokens(line_text)
+    if not line_tokens or not audio_window:
+        return 0.0
+    return SequenceMatcher(None, audio_window, line_tokens, autojunk=False).ratio()
+
+
+# ---------- Line merge ----------
+
+
+def merge_lines_per_window(
+    synced_sources: list[SourceResult],
+    whisper_words: "list[Word]",
+) -> list[TimedLine]:
+    """Build a per-line consensus by picking the best phrasing per scaffold line.
+
+    Two passes:
+
+    1. Walk scaffold lines. For each line, compute the Whisper window
+       ``[scaffold[i].start, scaffold[i+1].start)``. Collect candidate
+       texts: the scaffold line + the closest line (within
+       ``_LINE_MATCH_WINDOW_S``) from every other synced source. Pick the
+       candidate with the highest score against the window. Drop the line
+       when only the scaffold has it AND the window is empty.
+
+    2. Walk every non-scaffold synced source. For each line whose start
+       isn't within the match-window of any scaffold line ("extra"
+       candidate), keep it iff ≥1 other non-scaffold source has a
+       co-located line AND Whisper supports it (window score ≥
+       ``_EXTRA_LINE_WHISPER_GATE``).
+
+    Returns sorted-by-time ``TimedLine`` list. Empty list when no scaffold
+    can be selected or scaffold has no usable lines.
+    """
+    if not synced_sources:
+        return []
+
+    by_source: dict[str, list[TimedLine]] = {}
+    rank_order: list[SourceResult] = sorted(
+        synced_sources, key=lambda s: _SCAFFOLD_RANK.get(s.name, 99)
+    )
+    for s in rank_order:
+        lines = _extract_timed_lines(s)
+        if lines:
+            by_source[s.name] = lines
+
+    if not by_source:
+        return []
+
+    scaffold_name = next(iter(by_source))  # first by rank
+    scaffold_lines = by_source[scaffold_name]
+    # Drop rule for scaffold-only lines (Whisper hears nothing) only fires
+    # when ≥2 synced sources are available — otherwise every line is
+    # "scaffold-only" by construction and we'd silently delete legitimate
+    # content that Whisper just happened to miss (quiet bridges, backing
+    # vocals masking the lead, dropped final consonants). The user's
+    # "extra zwrotka" rule needs a non-scaffold source to disagree with.
+    multi_source_drop_active = len(by_source) >= 2
+
+    # End-of-song bound for the last scaffold line's whisper window.
+    audio_end = 0.0
+    if whisper_words:
+        for w in whisper_words:
+            we = getattr(w, "end", None)
+            if we is not None and we > audio_end:
+                audio_end = we
+    if audio_end <= 0.0:
+        audio_end = scaffold_lines[-1].start + 12.0
+
+    out_lines: list[TimedLine] = []
+
+    # ---- Pass 1: scaffold-driven line selection ----
+    for i, sline in enumerate(scaffold_lines):
+        if i + 1 < len(scaffold_lines):
+            window_end = scaffold_lines[i + 1].start
         else:
-            out_lines.append(f"{prefix}{' '.join(chosen)}")
-    return "\n".join(out_lines)
+            window_end = max(sline.start + 8.0, audio_end)
+        window = _whisper_window_tokens(whisper_words, sline.start, window_end)
+
+        candidates: list[TimedLine] = [sline]
+        for src_name, src_lines in by_source.items():
+            if src_name == scaffold_name:
+                continue
+            best: TimedLine | None = None
+            best_dt = _LINE_MATCH_WINDOW_S
+            for cand in src_lines:
+                dt = abs(cand.start - sline.start)
+                if dt < best_dt:
+                    best_dt = dt
+                    best = cand
+            if best is not None:
+                candidates.append(best)
+
+        only_scaffold = len(candidates) == 1
+        if multi_source_drop_active and only_scaffold and not window:
+            logger.info(
+                "consensus: dropped scaffold-only line @ %.2fs (silent window): %r",
+                sline.start,
+                sline.text[:60],
+            )
+            continue
+
+        if window:
+            scored = [
+                (_line_score(window, c.text), c) for c in candidates
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            chosen = scored[0][1]
+        else:
+            # No whisper window but multiple sources agree on the position —
+            # keep scaffold's text (its ranking already preferred it).
+            chosen = sline
+
+        out_lines.append(
+            TimedLine(start=sline.start, text=chosen.text, source_name=chosen.source_name)
+        )
+
+    # ---- Pass 2: extras (lines absent from scaffold) ----
+    inserted_keys: set[tuple[float, str]] = set()
+    for src_name, src_lines in by_source.items():
+        if src_name == scaffold_name:
+            continue
+        for cand in src_lines:
+            close_to_scaffold = any(
+                abs(cand.start - sl.start) < _LINE_MATCH_WINDOW_S for sl in scaffold_lines
+            )
+            if close_to_scaffold:
+                continue
+
+            supporters = 0
+            for other_name, other_lines in by_source.items():
+                if other_name in (scaffold_name, src_name):
+                    continue
+                for olin in other_lines:
+                    if abs(olin.start - cand.start) < _LINE_MATCH_WINDOW_S:
+                        supporters += 1
+                        break
+            if supporters < 1:
+                logger.info(
+                    "consensus: dropped extra line (single source) @ %.2fs from %s: %r",
+                    cand.start,
+                    src_name,
+                    cand.text[:60],
+                )
+                continue
+
+            window = _whisper_window_tokens(
+                whisper_words, max(0.0, cand.start - 0.5), cand.start + 6.0
+            )
+            score = _line_score(window, cand.text)
+            if score < _EXTRA_LINE_WHISPER_GATE:
+                logger.info(
+                    "consensus: dropped extra line (whisper score %.2f < %.2f) @ %.2fs: %r",
+                    score,
+                    _EXTRA_LINE_WHISPER_GATE,
+                    cand.start,
+                    cand.text[:60],
+                )
+                continue
+
+            key = (round(cand.start, 1), cand.text)
+            if key in inserted_keys:
+                continue
+            inserted_keys.add(key)
+            out_lines.append(
+                TimedLine(start=cand.start, text=cand.text, source_name=src_name)
+            )
+
+    out_lines.sort(key=lambda x: x.start)
+    return out_lines
 
 
-# ---------- Step 8: top-level ----------
+def lines_to_lrc(timed_lines: list[TimedLine]) -> str:
+    """Emit a standard LRC string from the merged TimedLine sequence."""
+    out: list[str] = []
+    for tl in timed_lines:
+        mm = int(tl.start // 60)
+        ss = tl.start - mm * 60
+        out.append(f"[{mm:02d}:{ss:05.2f}]{tl.text}")
+    return "\n".join(out)
+
+
+# ---------- Top-level ----------
+
+
+def _aggregate_text(timed_lines: list[TimedLine]) -> str:
+    """Lowercase token sequence joined by spaces — what the aligner consumes."""
+    tokens: list[str] = []
+    for tl in timed_lines:
+        tokens.extend(normalize_tokens(tl.text))
+    return " ".join(tokens)
+
+
+def _compute_confidence(
+    sources: list[SourceResult],
+    survivors: list[SourceResult],
+    coverages: list[float],
+    *,
+    audio_ref_present: bool,
+    confidence_penalty: float,
+) -> float:
+    title_total = sum(1 for s in sources if s.kind == "title_matched")
+    title_surviving = sum(1 for s in survivors if s.kind == "title_matched")
+    title_rate = title_surviving / title_total if title_total else 1.0
+    title_cov = sum(coverages) / len(coverages) if coverages else 1.0
+    base = 0.6 if audio_ref_present else 0.0
+    return (base + (1.0 - base) * title_rate * title_cov) * confidence_penalty
 
 
 def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> ConsensusResult | None:
-    """Cross-validate sources against the audio reference.
+    """Cross-validate sources against the audio reference, emit a line-merge LRC.
 
-    Returns None when:
-      * all title-matched sources are rejected and no audio-ref-derived
-        scaffold survives;
-      * the resulting confidence falls below ``_CONFIDENCE_MIN``;
-      * no scaffold can be selected.
+    Three paths:
 
-    The caller treats None as "do not write T3" — T1/T2 stay on screen and
-    a song_warning is emitted.
+    * **Empty audio_ref** — no Whisper / no VTT. Fall back to the highest-
+      ranked title-matched source's LRC verbatim, with a confidence
+      penalty so downstream knows to trust it less.
+    * **Synced survivors + Whisper words** — main path: walk scaffold
+      lines, pick best phrasing per Whisper window, drop scaffold-only
+      lines on silent windows, optionally insert extras when ≥2 sources
+      agree.
+    * **No synced + no Whisper but audio_ref present** — fall back to the
+      best-ranked scaffold's LRC unchanged.
+
+    Returns ``None`` when:
+
+    * no sources at all,
+    * no audio_ref AND no title-matched candidates,
+    * every title-matched source falls below its rejection threshold and
+      no audio-ref-derived scaffold survives,
+    * resulting confidence below ``_CONFIDENCE_MIN``.
     """
     if not sources:
         return None
 
-    confidence_penalty = 1.0
+    # ---- Empty audio_ref ----
     if not audio_ref:
-        # Empty audio reference: fall back to highest-coverage title-matched
-        # as the reference, and penalize confidence to flag the degradation.
         title_matched = [s for s in sources if s.kind == "title_matched"]
         if not title_matched:
             return None
         title_matched.sort(key=lambda s: _SCAFFOLD_RANK.get(s.name, 99))
-        audio_ref = _source_tokens(title_matched[0])
-        confidence_penalty = _CONFIDENCE_PENALTY_NO_AUDIO_REF
-        if not audio_ref:
+        chosen = title_matched[0]
+        chosen_tokens = _source_tokens(chosen)
+        if not chosen_tokens:
             return None
+        return ConsensusResult(
+            text=" ".join(chosen_tokens),
+            lrc=chosen.lrc or "",
+            sources_used=[chosen.name],
+            sources_rejected=[],
+            confidence=_CONFIDENCE_PENALTY_NO_AUDIO_REF,
+            source_scores={},
+        )
 
+    # ---- Score sources, reject low coverage ----
     survivors: list[SourceResult] = []
-    survivor_tokens: list[tuple[SourceResult, list[str]]] = []
     rejected: list[tuple[str, str]] = []
-    order_uncertain: set[str] = set()
-    coverages: list[float] = []
     source_scores: dict[str, tuple[float, bool]] = {}
-
+    coverages: list[float] = []
     audio_ref_owners = {"vtt", "whisper"}
+
     for source in sources:
-        tokens = _source_tokens(source)
         if source.name in audio_ref_owners:
             survivors.append(source)
-            survivor_tokens.append((source, tokens))
             continue
+        tokens = _source_tokens(source)
         coverage, uncertain = score_against_reference(tokens, audio_ref)
         source_scores[source.name] = (coverage, uncertain)
         threshold = _threshold_for(source.name)
         if coverage < threshold:
             rejected.append((source.name, f"coverage {coverage:.2f} < {threshold:.2f}"))
             continue
-        if uncertain:
-            order_uncertain.add(source.name)
         survivors.append(source)
-        survivor_tokens.append((source, tokens))
         coverages.append(coverage)
 
     if not survivors:
         return None
 
-    scaffold = select_scaffold(survivors, order_uncertain)
+    whisper_source = next(
+        (s for s in sources if s.name == "whisper" and s.words), None
+    )
+    synced_survivors = [
+        s for s in survivors if s.is_synced and s.lrc and s.name != "whisper"
+    ]
+
+    # ---- Main path: line-merge ----
+    if synced_survivors and whisper_source is not None and whisper_source.words:
+        merged = merge_lines_per_window(synced_survivors, whisper_source.words)
+        if merged:
+            confidence = _compute_confidence(
+                sources, survivors, coverages,
+                audio_ref_present=True, confidence_penalty=1.0,
+            )
+            if confidence < _CONFIDENCE_MIN:
+                logger.info(
+                    "consensus: confidence %.2f below %.2f gate, skipping T3",
+                    confidence,
+                    _CONFIDENCE_MIN,
+                )
+                return None
+            return ConsensusResult(
+                text=_aggregate_text(merged),
+                lrc=lines_to_lrc(merged),
+                sources_used=[s.name for s in survivors],
+                sources_rejected=rejected,
+                confidence=confidence,
+                source_scores=source_scores,
+            )
+
+    # ---- Fallback path: pick best scaffold's LRC verbatim ----
+    scaffold = select_scaffold(survivors, set())
     if scaffold is None:
         return None
 
-    voted = vote_tokens(audio_ref, survivor_tokens)
-    voted_text = " ".join(voted[i] for i in sorted(voted.keys()))
-    lrc_out = build_consensus_lrc(scaffold, voted)
-    if not lrc_out:
+    if scaffold.lrc:
+        lrc_out = scaffold.lrc
+        body_text = _strip_lrc_tags(scaffold.lrc)
+        text_out = " ".join(normalize_tokens(body_text))
+    elif scaffold.words:
+        lines: list[str] = []
+        for w in scaffold.words:
+            ws = getattr(w, "start", None)
+            if ws is None:
+                continue
+            mm = int(ws // 60)
+            ss = ws - mm * 60
+            lines.append(f"[{mm:02d}:{ss:05.2f}]{w.text}")
+        lrc_out = "\n".join(lines)
+        text_out = " ".join(normalize_tokens(" ".join(w.text for w in scaffold.words)))
+    else:
         return None
 
-    audio_ref_present = any(s.name in ("vtt", "whisper") for s in survivors)
-    title_total = sum(1 for s in sources if s.kind == "title_matched")
-    title_surviving = sum(1 for s in survivors if s.kind == "title_matched")
-    title_rate = title_surviving / title_total if title_total else 1.0
-    title_cov = sum(coverages) / len(coverages) if coverages else 1.0
-    base = 0.6 if audio_ref_present else 0.0
-    confidence = (base + (1.0 - base) * title_rate * title_cov) * confidence_penalty
+    if not lrc_out or not text_out:
+        return None
+
+    confidence = _compute_confidence(
+        sources, survivors, coverages,
+        audio_ref_present=True, confidence_penalty=1.0,
+    )
     if confidence < _CONFIDENCE_MIN:
         logger.info(
-            "consensus: confidence %.2f below %.2f gate, skipping T3",
+            "consensus: confidence %.2f below %.2f gate (fallback path)",
             confidence,
             _CONFIDENCE_MIN,
         )
         return None
 
     return ConsensusResult(
-        text=voted_text,
+        text=text_out,
         lrc=lrc_out,
         sources_used=[s.name for s in survivors],
         sources_rejected=rejected,
