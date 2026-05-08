@@ -199,6 +199,27 @@ export function deriveQueueRosetteState(sources) {
 }
 
 /**
+ * Bucket a per-source coverage score (0..1) into one of three UI tiers:
+ *   ``good``  — coverage ≥ 0.85, the variant tracks audio cleanly.
+ *   ``warn``  — 0.55 ≤ coverage < 0.85, partial match, render but flag.
+ *   ``bad``   — coverage < 0.55, or order_uncertain (tokens present but
+ *               heavily permuted vs audio reference). The chip stays
+ *               clickable so the operator can still try, but the badge
+ *               warns "this is unlikely to match this song".
+ *
+ * Returns ``null`` when ``coverage`` is null/undefined — caller should
+ * skip the badge entirely so existing songs without persisted scores
+ * render unchanged.
+ */
+export function coverageTier(coverage, orderUncertain) {
+  if (coverage == null || Number.isNaN(coverage)) return null;
+  if (orderUncertain) return 'bad';
+  if (coverage >= 0.85) return 'good';
+  if (coverage >= 0.55) return 'warn';
+  return 'bad';
+}
+
+/**
  * Map a single source row to a chip view-model. Used by the queue rosette
  * expand panel and the edit-view chip row — neither surface is
  * interactive, so this is just a glyph + css-class projection.
@@ -770,10 +791,14 @@ function patchSourceState(sources, payload) {
  */
 function appendChip(parent, source) {
   const view = deriveChipState(source);
+  const tier = coverageTier(source.coverage, source.order_uncertain);
   const chip = el('div', {
     className: 'pk-chip',
     attrs: { 'data-state': view.cssClass, 'data-source': source.source },
   });
+  if (tier) {
+    setAttr(chip, 'data-coverage-tier', tier);
+  }
   if (source.error_message) {
     setAttr(chip, 'title', source.error_message);
   }
@@ -787,6 +812,20 @@ function appendChip(parent, source) {
     text: source.label || source.source,
   });
   chip.append(glyphEl, labelEl);
+  if (tier && source.coverage != null) {
+    const pct = Math.round(source.coverage * 100);
+    const badge = el('span', {
+      className: 'pk-chip-coverage',
+      attrs: {
+        'data-tier': tier,
+        title: source.order_uncertain
+          ? `Pokrycie ${pct}% (kolejność słów niepewna)`
+          : `Pokrycie ${pct}%`,
+      },
+      text: `${pct}%`,
+    });
+    chip.appendChild(badge);
+  }
   parent.appendChild(chip);
 }
 

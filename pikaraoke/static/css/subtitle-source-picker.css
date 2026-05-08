@@ -412,3 +412,28 @@
 }
 .pk-chip[data-state="pending"] { color: var(--pk-ink-3); }
 .pk-chip[data-state="na"] { color: var(--pk-ink-4); opacity: 0.7; }
+
+/* Coverage badge — small percentage tag rendered after the label,
+   keyed off the consensus engine's per-source SequenceMatcher score
+   persisted to ``subtitle_jobs.coverage``. Three tiers: good (green) /
+   warn (amber) / bad (red). Absent when the consensus pipeline has not
+   yet scored the source. */
+.pk-chip-coverage {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  line-height: 1.4;
+  margin-left: 2px;
+}
+.pk-chip-coverage[data-tier="good"] { color: var(--pk-success); }
+.pk-chip-coverage[data-tier="warn"] { color: var(--pk-sun-deep, var(--pk-amber)); }
+.pk-chip-coverage[data-tier="bad"]  { color: var(--pk-danger); }
+.pk-chip[data-coverage-tier="bad"] {
+  /* When coverage is below the consensus rejection threshold, dim the
+     chip itself so the operator sees that pinning this source will
+     soft-miss (the variant gate refuses to render). */
+  opacity: 0.65;
+}

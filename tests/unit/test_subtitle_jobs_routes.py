@@ -28,6 +28,8 @@ def _row(
     error_code: str | None = None,
     error_message: str | None = None,
     next_retry_at: str | None = None,
+    coverage: float | None = None,
+    order_uncertain: bool = False,
 ) -> dict:
     """Fake sqlite3.Row-shaped dict — only named-key reads are used."""
     return {
@@ -40,6 +42,8 @@ def _row(
         "finished_at": None,
         "attempt_count": 1,
         "next_retry_at": next_retry_at,
+        "coverage": coverage,
+        "order_uncertain": 1 if order_uncertain else 0,
     }
 
 
@@ -199,6 +203,45 @@ class TestPostBulkResponseShape:
         resp = admin_client.post("/api/songs/subtitles/bulk", json={"song_ids": [9]})
         body = json.loads(resp.data)
         assert body["9"]["sources"][0]["error_message"] == payload
+
+
+class TestPostBulkCoverageBadge:
+    """v11: per-source coverage + order_uncertain surfaced for the chip badge."""
+
+    @patch("pikaraoke.routes.subtitle_jobs.get_karaoke_instance")
+    @patch("pikaraoke.routes.subtitle_jobs.is_admin", return_value=True)
+    def test_coverage_round_trips_through_serializer(self, _admin, mock_get, admin_client):
+        k = MagicMock()
+        k.db.get_subtitle_jobs_bulk.return_value = {
+            42: [
+                _row("lrclib", "success", coverage=0.05, order_uncertain=False),
+                _row("genius-sync", "success", coverage=0.92, order_uncertain=False),
+                _row("AI", "success", coverage=0.7, order_uncertain=True),
+            ]
+        }
+        mock_get.return_value = k
+
+        resp = admin_client.post("/api/songs/subtitles/bulk", json={"song_ids": [42]})
+        assert resp.status_code == 200
+        body = json.loads(resp.data)
+        sources = {s["source"]: s for s in body["42"]["sources"]}
+        assert sources["lrclib"]["coverage"] == pytest.approx(0.05)
+        assert sources["lrclib"]["order_uncertain"] is False
+        assert sources["genius-sync"]["coverage"] == pytest.approx(0.92)
+        assert sources["AI"]["order_uncertain"] is True
+
+    @patch("pikaraoke.routes.subtitle_jobs.get_karaoke_instance")
+    @patch("pikaraoke.routes.subtitle_jobs.is_admin", return_value=True)
+    def test_placeholder_carries_null_coverage(self, _admin, mock_get, admin_client):
+        k = MagicMock()
+        k.db.get_subtitle_jobs_bulk.return_value = {}
+        mock_get.return_value = k
+
+        resp = admin_client.post("/api/songs/subtitles/bulk", json={"song_ids": [7]})
+        body = json.loads(resp.data)
+        for s in body["7"]["sources"]:
+            assert s["coverage"] is None
+            assert s["order_uncertain"] is False
 
 
 class TestPostBulkBatchPath:

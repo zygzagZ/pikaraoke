@@ -45,8 +45,11 @@ _SCAFFOLD_RANK: dict[str, int] = {
     "lrclib": 0,
     "musixmatch": 1,
     "megalobiz": 2,
-    "whisper": 3,
-    "vtt": 4,
+    # Human-curated captions outrank ASR. Whisper text is rough — typos,
+    # hallucinated tokens, missed lines — and only earns the scaffold seat
+    # when nothing else survives the rejection thresholds.
+    "vtt": 3,
+    "whisper": 99,
 }
 
 _CONFIDENCE_MIN = 0.5
@@ -79,6 +82,13 @@ class ConsensusResult:
     sources_used: list[str]
     sources_rejected: list[tuple[str, str]] = field(default_factory=list)
     confidence: float = 0.0
+    # ``source_name -> (coverage, order_uncertain)`` for every non-audio-ref
+    # source seen, including rejected ones. Audio-ref contributors (vtt,
+    # whisper) are excluded — they ARE the reference, so coverage against
+    # themselves is meaningless. Persisted to ``subtitle_jobs.coverage`` so
+    # the variant fetch path can refuse to render a known-bad source and
+    # the picker chip can show a per-source badge.
+    source_scores: dict[str, tuple[float, bool]] = field(default_factory=dict)
 
 
 # ---------- Step 1: tokenize ----------
@@ -163,6 +173,34 @@ def _threshold_for(name: str) -> float:
     return _REJECT_THRESHOLDS.get(name, _DEFAULT_THRESHOLD)
 
 
+def score_sources_against_reference(
+    sources: list[SourceResult], audio_ref: list[str]
+) -> dict[str, tuple[float, bool]]:
+    """Compute ``(coverage, order_uncertain)`` for every non-audio-ref source.
+
+    Pure helper extracted so the consensus persister can record scores
+    even when ``build_consensus`` decides to abort (every title-matched
+    source rejected, scaffold missing, confidence below the gate). The
+    Kolorowy wiatr regression hinges on this: the LRCLib variant must
+    learn its own coverage was 0.05 BEFORE the variant fetch path is
+    asked to render it again from a picker pin.
+
+    Audio-reference owners (``vtt``, ``whisper``) are skipped — they
+    define the reference, scoring them against themselves is meaningless.
+    Returns ``{}`` when ``audio_ref`` is empty (no signal to score against).
+    """
+    if not audio_ref:
+        return {}
+    out: dict[str, tuple[float, bool]] = {}
+    audio_ref_owners = {"vtt", "whisper"}
+    for source in sources:
+        if source.name in audio_ref_owners:
+            continue
+        coverage, uncertain = score_against_reference(_source_tokens(source), audio_ref)
+        out[source.name] = (coverage, uncertain)
+    return out
+
+
 # ---------- Step 5: vote ----------
 
 
@@ -182,7 +220,16 @@ def vote_tokens(
     truth) beats ``title_matched`` (curated lyrics text) on presence —
     better to keep an audio-confirmed token with a minor typo than swap
     in a confident-but-absent word.
+
+    AI demotion: Whisper text is rough ASR (typos, hallucinations); when
+    any title-matched lyric source survives, drop Whisper from the voting
+    pool so its tokens don't outvote real lyrics on disagreements. Whisper
+    still drives ``audio_ref`` upstream; it just stops competing for the
+    text content.
     """
+    has_title_matched = any(s.kind == "title_matched" for s, _ in survivors)
+    if has_title_matched:
+        survivors = [(s, t) for s, t in survivors if s.name != "whisper"]
     candidates: list[list[tuple[str, str]]] = [[] for _ in audio_ref]
     for source, tokens in survivors:
         if not tokens:
@@ -227,11 +274,12 @@ def select_scaffold(
 ) -> SourceResult | None:
     """Pick the source whose timestamps drive the consensus LRC.
 
-    Synced title-matched sources rank highest (LRCLib > MXM > Megalobiz);
-    Whisper words rank below those because timestamps are word-level but
-    the text may diverge from human-curated. VTT is the last-resort
-    line-level scaffold. Order-uncertain sources are excluded — their
-    tokens still vote, but their timestamps would mis-place lines.
+    Title-matched lyric sources rank highest (LRCLib > MXM > Megalobiz),
+    then human-curated VTT captions, with Whisper ASR sitting at the
+    bottom of the rank table — its words only earn the scaffold seat
+    when no other survivor is eligible (the "tylko gdy nic innego" rule).
+    Order-uncertain sources are excluded — their tokens still vote, but
+    their timestamps would mis-place lines.
     """
     eligible: list[SourceResult] = []
     for s in survivors:
@@ -353,6 +401,7 @@ def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> Consen
     rejected: list[tuple[str, str]] = []
     order_uncertain: set[str] = set()
     coverages: list[float] = []
+    source_scores: dict[str, tuple[float, bool]] = {}
 
     audio_ref_owners = {"vtt", "whisper"}
     for source in sources:
@@ -362,6 +411,7 @@ def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> Consen
             survivor_tokens.append((source, tokens))
             continue
         coverage, uncertain = score_against_reference(tokens, audio_ref)
+        source_scores[source.name] = (coverage, uncertain)
         threshold = _threshold_for(source.name)
         if coverage < threshold:
             rejected.append((source.name, f"coverage {coverage:.2f} < {threshold:.2f}"))
@@ -406,4 +456,5 @@ def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> Consen
         sources_used=[s.name for s in survivors],
         sources_rejected=rejected,
         confidence=confidence,
+        source_scores=source_scores,
     )

@@ -31,6 +31,10 @@ MAX_BULK = 100
 def _serialize_job_row(row) -> dict:
     """Translate a ``subtitle_jobs`` DB row to the picker's UI DTO."""
     state = row["state"]
+    coverage_raw = row["coverage"] if "coverage" in row.keys() else None
+    coverage = float(coverage_raw) if coverage_raw is not None else None
+    order_uncertain_raw = row["order_uncertain"] if "order_uncertain" in row.keys() else 0
+    order_uncertain = bool(order_uncertain_raw)
     return {
         "source": row["source"],
         "label": SUBTITLE_SOURCE_LABELS.get(row["source"], row["source"]),
@@ -43,6 +47,8 @@ def _serialize_job_row(row) -> dict:
         "finished_at": row["finished_at"],
         "attempt_count": row["attempt_count"],
         "next_retry_at": row["next_retry_at"],
+        "coverage": coverage,
+        "order_uncertain": order_uncertain,
     }
 
 
@@ -67,6 +73,8 @@ def _placeholder_sources() -> list[dict]:
             "finished_at": None,
             "attempt_count": 0,
             "next_retry_at": None,
+            "coverage": None,
+            "order_uncertain": False,
         }
         for source in DEFAULT_AUTO_SOURCES
     ]

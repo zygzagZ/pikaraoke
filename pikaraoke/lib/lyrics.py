@@ -343,6 +343,45 @@ def _tier_for_variant_source(source: str) -> str | None:
     return _VARIANT_SOURCE_TIERS.get(source)
 
 
+# Map consensus-engine source names (`lyrics_consensus.SourceResult.name`)
+# to the canonical subtitle-source keys used by ``subtitle_jobs.source``
+# and the picker chip row. Sources that don't have a per-song variant
+# file (Musixmatch, Megalobiz — no on-demand picker entry) are absent;
+# the persister silently skips them. Audio-ref sources (vtt, whisper)
+# never appear in ``ConsensusResult.source_scores`` so they don't need
+# a mapping either.
+_CONSENSUS_SOURCE_TO_VARIANT: dict[str, str] = {
+    "lrclib": SUBTITLE_SOURCE_LRCLIB,
+    "genius": SUBTITLE_SOURCE_GENIUS_SYNC,
+}
+
+# Which ``subtitle_jobs.source`` row carries the coverage score the
+# variant render path should gate against. ``lrclib-sync`` re-uses
+# LRCLib's raw record (only the alignment differs) so both line + sync
+# variants gate on the same persisted score under ``lrclib``. Variants
+# that don't share upstream data with another source point to
+# themselves.
+_VARIANT_SCORE_KEY: dict[str, str] = {
+    SUBTITLE_SOURCE_LRCLIB: SUBTITLE_SOURCE_LRCLIB,
+    SUBTITLE_SOURCE_LRCLIB_SYNC: SUBTITLE_SOURCE_LRCLIB,
+    SUBTITLE_SOURCE_GENIUS_SYNC: SUBTITLE_SOURCE_GENIUS_SYNC,
+}
+
+
+# Per-source coverage rejection thresholds — re-exported here so the
+# variant gate can mirror the consensus engine's accept/reject decision
+# without importing the private name. ``_DEFAULT_THRESHOLD`` is used
+# when a variant source has no entry. Keep in sync with
+# ``lyrics_consensus._REJECT_THRESHOLDS``.
+def _coverage_threshold_for(variant_source: str) -> float:
+    from pikaraoke.lib import lyrics_consensus as _lc
+
+    score_key = _VARIANT_SCORE_KEY.get(variant_source, variant_source)
+    consensus_key_map = {v: k for k, v in _CONSENSUS_SOURCE_TO_VARIANT.items()}
+    consensus_name = consensus_key_map.get(score_key, score_key)
+    return _lc._REJECT_THRESHOLDS.get(consensus_name, _lc._DEFAULT_THRESHOLD)
+
+
 def _dispatch_reenrich(db, song_id: int, song_path: str) -> None:
     """Fire ``enrich_song`` in a daemon thread after a language-write site.
 
@@ -938,8 +977,73 @@ class LyricsService:
             return False
         return True
 
+    def _persisted_variant_blocked_by_score(self, song_path: str, source: str) -> bool:
+        """Soft-miss gate keyed on a previously persisted coverage score.
+
+        ``subtitle_jobs.coverage`` is populated by the consensus engine
+        whenever a song goes through ``_upgrade_via_consensus_locked``.
+        On the next on-demand pick, the variant render path consults the
+        same score: when it falls below the per-source threshold (e.g.
+        the LRCLib record is mislabel — Polish title, English text), we
+        refuse to write the variant rather than letting the operator
+        pin a known-bad source. The Kolorowy wiatr case.
+
+        Returns True when the score exists and is below the threshold.
+        Missing row, NULL coverage, or no DB → False (let the renderer
+        decide as before).
+        """
+        if self._db is None:
+            return False
+        score_key = _VARIANT_SCORE_KEY.get(source)
+        if score_key is None:
+            return False
+        try:
+            song_id = self._db.get_song_id_by_path(song_path)
+        except Exception:
+            logger.exception(
+                "variant gate: get_song_id_by_path failed for %s",
+                os.path.basename(song_path),
+            )
+            return False
+        if song_id is None:
+            return False
+        try:
+            score = self._db.get_subtitle_job_score(song_id, score_key)
+        except Exception:
+            logger.exception(
+                "variant gate: get_subtitle_job_score failed for %s/%s",
+                os.path.basename(song_path),
+                score_key,
+            )
+            return False
+        if score is None:
+            return False
+        coverage, order_uncertain = score
+        threshold = _coverage_threshold_for(source)
+        if coverage < threshold:
+            logger.info(
+                "variant gate: %s coverage %.2f < %.2f, soft miss for %s",
+                source,
+                coverage,
+                threshold,
+                os.path.basename(song_path),
+            )
+            return True
+        if order_uncertain:
+            logger.info(
+                "variant gate: %s order_uncertain for %s; rendering anyway "
+                "(coverage %.2f >= %.2f)",
+                source,
+                os.path.basename(song_path),
+                coverage,
+                threshold,
+            )
+        return False
+
     def _render_for_variant(self, song_path: str, source: str) -> str | None:
         """Dispatch to the per-source render helper. Pure-ish: returns ASS or None."""
+        if self._persisted_variant_blocked_by_score(song_path, source):
+            return None
         if source == SUBTITLE_SOURCE_YOUTUBE_VTT:
             return self._render_vtt_ass(song_path)
         if source == SUBTITLE_SOURCE_LRCLIB:
@@ -3406,6 +3510,15 @@ class LyricsService:
             return
 
         audio_ref = lc.build_audio_reference(vtt_source, whisper_source)
+        # Persist scores BEFORE the consensus result decision: when every
+        # title-matched source is rejected ``build_consensus`` returns
+        # None and discards its own ``source_scores``. The variant gate
+        # downstream still wants those numbers — the Kolorowy wiatr
+        # mislabel survives by being rejected, then re-fetched on the
+        # next picker click. Score-first means the second click sees
+        # the same verdict the consensus engine reached.
+        score_map = lc.score_sources_against_reference(sources, audio_ref)
+        self._persist_consensus_scores(song_path, score_map)
         consensus = lc.build_consensus(sources, audio_ref)
         if consensus is None:
             logger.info("consensus: build returned None for %s", basename)
@@ -3597,6 +3710,44 @@ class LyricsService:
             consensus.confidence,
             [n for n, _ in consensus.sources_rejected],
         )
+
+    def _persist_consensus_scores(
+        self, song_path: str, score_map: dict[str, tuple[float, bool]]
+    ) -> None:
+        """Write per-source coverage to ``subtitle_jobs.coverage``.
+
+        Maps consensus-engine source names to canonical subtitle-source
+        keys via ``_CONSENSUS_SOURCE_TO_VARIANT``. Sources without a
+        variant chip (Musixmatch, Megalobiz) are silently skipped — the
+        consensus engine still uses their scores internally for confidence,
+        we just don't surface them in the picker. Per-source failures are
+        logged and swallowed so a missing subtitle_jobs row (orchestrator
+        hasn't dispatched yet) doesn't tank the rest.
+        """
+        if self._db is None or not score_map:
+            return
+        try:
+            song_id = self._db.get_song_id_by_path(song_path)
+        except Exception:
+            logger.exception(
+                "consensus persist: get_song_id_by_path failed for %s",
+                os.path.basename(song_path),
+            )
+            return
+        if song_id is None:
+            return
+        for consensus_name, (coverage, uncertain) in score_map.items():
+            variant_source = _CONSENSUS_SOURCE_TO_VARIANT.get(consensus_name)
+            if variant_source is None:
+                continue
+            try:
+                self._db.update_subtitle_job_score(song_id, variant_source, coverage, uncertain)
+            except Exception:
+                logger.exception(
+                    "consensus persist: update_subtitle_job_score failed for %s/%s",
+                    os.path.basename(song_path),
+                    variant_source,
+                )
 
     def _emit_consensus_decision(
         self, song_path: str, source: str, decision: str, confidence: float

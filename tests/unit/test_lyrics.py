@@ -837,6 +837,30 @@ class TestMetadataCandidates:
         out = service._metadata_candidates(info, song_path)
         assert any(c["track"] == "Hello" and c["artist"] == "Adele" for c in out)
 
+    def test_blank_db_falls_back_to_filename(self, tmp_path):
+        """Bug-E: when DB artist/title are blank, seed candidates from the
+        filename so downstream lyrics lookups don't short-circuit on a
+        row whose filename clearly spells out Artist - Title."""
+        service = _make_service(tmp_path)
+        info = {"track": "", "artist": "", "duration": 271, "isrc": None}
+        song_path = str(tmp_path / "Queen - I Want To Break Free---f4Mc-NYPHaQ.mp4")
+        out = service._metadata_candidates(info, song_path)
+        assert out, "filename fallback must emit at least one candidate"
+        assert out[0]["track"] == "I Want To Break Free"
+        assert out[0]["artist"] == "Queen"
+        # duration propagates so Spotify's ISRC fast-path / duration scoring keeps working.
+        assert out[0]["duration"] == 271
+
+    def test_blank_db_with_unparseable_filename_returns_empty(self, tmp_path):
+        """Bug-E negative case: a filename without an Artist - Title separator
+        cannot rescue a blank DB row — the candidate ladder is empty
+        (matches lyrics.py:2098-2099 has_artist_title_separator gate)."""
+        service = _make_service(tmp_path)
+        info = {"track": "", "artist": "", "duration": 200, "isrc": None}
+        song_path = str(tmp_path / "Don Pedalini---nUggLAGKc-k.mp4")
+        out = service._metadata_candidates(info, song_path)
+        assert out == []
+
     def test_itunes_hits_added(self, tmp_path):
         service = _make_service(tmp_path)
         info = {"track": "Stan", "artist": "Eminem", "duration": 489, "isrc": None}
@@ -2387,6 +2411,74 @@ class TestFetchVariantDispatchAndDedup:
         with patch.object(service, "_render_vtt_ass", return_value=None):
             assert service.fetch_variant(song, "youtube-vtt") is False
         assert misses == [{"song_path": song, "source": "youtube-vtt"}]
+        db.close()
+
+    def test_persisted_low_coverage_blocks_variant_render(self, tmp_path):
+        """Kolorowy wiatr regression: when consensus persisted a coverage
+        below the source's threshold, the on-demand variant fetch must
+        soft-miss without invoking the renderer. The picker chip will then
+        flip to error (subtitle_variant_miss) rather than write a known-bad
+        variant file.
+        """
+        song, db, service = self._service(tmp_path)
+        sid = db.get_song_id_by_path(song)
+        # Orchestrator-style row + low score below LRCLib threshold (0.70).
+        db.upsert_subtitle_job(sid, "lrclib", "queued")
+        db.update_subtitle_job_score(sid, "lrclib", 0.05, False)
+        misses: list = []
+        service._events.on("subtitle_variant_miss", lambda p: misses.append(p))
+
+        # Render helper MUST NOT be reached — the gate fires first.
+        with patch.object(service, "_render_lrclib_line_ass") as render:
+            assert service.fetch_variant(song, "lrclib") is False
+            render.assert_not_called()
+
+        assert not (tmp_path / "Foo---abc.lrclib.ass").exists()
+        assert misses == [{"song_path": song, "source": "lrclib"}]
+        db.close()
+
+    def test_persisted_low_coverage_also_blocks_lrclib_sync(self, tmp_path):
+        """``lrclib-sync`` shares LRCLib's upstream record — the same
+        persisted score must gate both variants."""
+        song, db, service = self._service(tmp_path)
+        sid = db.get_song_id_by_path(song)
+        db.upsert_subtitle_job(sid, "lrclib", "queued")
+        db.update_subtitle_job_score(sid, "lrclib", 0.05, False)
+        # Need a row for lrclib-sync too so dispatch finds something.
+        db.upsert_subtitle_job(sid, "lrclib-sync", "queued")
+
+        with patch.object(service, "_render_lrclib_word_ass") as render:
+            assert service.fetch_variant(song, "lrclib-sync") is False
+            render.assert_not_called()
+        db.close()
+
+    def test_persisted_high_coverage_lets_render_through(self, tmp_path):
+        song, db, service = self._service(tmp_path)
+        sid = db.get_song_id_by_path(song)
+        db.upsert_subtitle_job(sid, "lrclib", "queued")
+        db.update_subtitle_job_score(sid, "lrclib", 0.92, False)
+
+        with patch.object(
+            service,
+            "_render_lrclib_line_ass",
+            return_value=("[Script Info]\nrendered\n", "abc", None),
+        ):
+            assert service.fetch_variant(song, "lrclib") is True
+        assert (tmp_path / "Foo---abc.lrclib.ass").exists()
+        db.close()
+
+    def test_no_persisted_score_falls_through_to_render(self, tmp_path):
+        # Backwards-compat: a song that has never been through consensus
+        # has no score row; the gate must NOT block — fall through to the
+        # renderer as if the gate didn't exist.
+        song, db, service = self._service(tmp_path)
+        with patch.object(
+            service,
+            "_render_lrclib_line_ass",
+            return_value=("[Script Info]\nrendered\n", "abc", None),
+        ) as render:
+            assert service.fetch_variant(song, "lrclib") is True
+            render.assert_called_once()
         db.close()
 
     def test_in_flight_dedup_across_threads(self, tmp_path):

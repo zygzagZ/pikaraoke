@@ -28,7 +28,7 @@ class TestInit:
 
     def test_user_version(self, db):
         ver = db._conn.execute("PRAGMA user_version").fetchone()[0]
-        assert ver == 10
+        assert ver == 11
 
     def test_songs_table_exists(self, db):
         tables = {
@@ -602,11 +602,11 @@ class TestMigrationFromV1:
         conn.commit()
         conn.close()
 
-        # Open via KaraokeDatabase: should apply v2..v10 migrations in-place.
+        # Open via KaraokeDatabase: should apply v2..v11 migrations in-place.
         db = KaraokeDatabase(db_path)
         try:
             ver = db._conn.execute("PRAGMA user_version").fetchone()[0]
-            assert ver == 10
+            assert ver == 11
 
             cols = {row[1] for row in db._conn.execute("PRAGMA table_info(songs)").fetchall()}
             assert "metadata_sources" in cols
@@ -614,6 +614,11 @@ class TestMigrationFromV1:
             assert "subtitle_source_override" in cols
             assert "language_at_enrich" in cols
             assert "lyrics_confidence" in cols
+            job_cols = {
+                row[1] for row in db._conn.execute("PRAGMA table_info(subtitle_jobs)").fetchall()
+            }
+            # v11: per-(song, source) coverage badge inputs.
+            assert {"coverage", "order_uncertain"}.issubset(job_cols)
             art_cols = {
                 row[1] for row in db._conn.execute("PRAGMA table_info(song_artifacts)").fetchall()
             }
@@ -924,6 +929,66 @@ class TestSubtitleJobs:
         db.delete_subtitle_jobs(sid_a)
         assert db.get_subtitle_jobs(sid_a) == []
         assert len(db.get_subtitle_jobs(sid_b)) == 1
+
+
+class TestSubtitleJobScores:
+    """v11 columns: per-(song, source) coverage + order_uncertain."""
+
+    def _insert_song(self, db) -> int:
+        db.insert_songs([{"file_path": "/songs/x.mp4", "youtube_id": None, "format": "mp4"}])
+        return db.get_song_id_by_path("/songs/x.mp4")
+
+    def test_score_default_null_after_v11_migration(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "queued")
+        assert db.get_subtitle_job_score(sid, "lrclib") is None
+
+    def test_update_then_read_back(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "success")
+        assert db.update_subtitle_job_score(sid, "lrclib", 0.42, False) is True
+        coverage, uncertain = db.get_subtitle_job_score(sid, "lrclib")
+        assert coverage == pytest.approx(0.42)
+        assert uncertain is False
+
+    def test_order_uncertain_round_trips(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "success")
+        db.update_subtitle_job_score(sid, "lrclib", 0.78, True)
+        coverage, uncertain = db.get_subtitle_job_score(sid, "lrclib")
+        assert coverage == pytest.approx(0.78)
+        assert uncertain is True
+
+    def test_update_returns_false_when_row_missing(self, db):
+        sid = self._insert_song(db)
+        # No upsert_subtitle_job called → no row → no update.
+        assert db.update_subtitle_job_score(sid, "lrclib", 0.5, False) is False
+
+    def test_get_returns_none_when_row_missing(self, db):
+        sid = self._insert_song(db)
+        assert db.get_subtitle_job_score(sid, "lrclib") is None
+
+    def test_get_returns_none_when_coverage_null(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "queued")  # never scored
+        assert db.get_subtitle_job_score(sid, "lrclib") is None
+
+    def test_invalid_coverage_raises(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "success")
+        with pytest.raises(ValueError):
+            db.update_subtitle_job_score(sid, "lrclib", 1.5, False)
+        with pytest.raises(ValueError):
+            db.update_subtitle_job_score(sid, "lrclib", -0.1, False)
+
+    def test_score_is_per_source(self, db):
+        sid = self._insert_song(db)
+        db.upsert_subtitle_job(sid, "lrclib", "success")
+        db.upsert_subtitle_job(sid, "genius-sync", "success")
+        db.update_subtitle_job_score(sid, "lrclib", 0.10, False)
+        db.update_subtitle_job_score(sid, "genius-sync", 0.90, False)
+        assert db.get_subtitle_job_score(sid, "lrclib")[0] == pytest.approx(0.10)
+        assert db.get_subtitle_job_score(sid, "genius-sync")[0] == pytest.approx(0.90)
 
 
 class TestSubtitleJobsBulk:

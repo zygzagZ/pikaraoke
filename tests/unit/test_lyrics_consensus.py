@@ -12,6 +12,7 @@ from pikaraoke.lib.lyrics_consensus import (
     build_consensus_lrc,
     normalize_tokens,
     score_against_reference,
+    score_sources_against_reference,
     select_scaffold,
     vote_tokens,
 )
@@ -209,10 +210,20 @@ class TestSelectScaffold:
         s = select_scaffold([mxm, lrclib], order_uncertain=set())
         assert s is lrclib
 
-    def test_whisper_when_no_synced(self):
+    def test_vtt_outranks_whisper(self):
+        # AI demotion: human-curated VTT now beats Whisper ASR for the
+        # scaffold seat. Whisper only earns scaffold when nothing else
+        # is eligible — see ``test_whisper_when_truly_alone``.
         whisper = _whisper([Word(text="a", start=0.0, end=0.5)])
         vtt = _vtt("[00:00.00]a")
         s = select_scaffold([whisper, vtt], order_uncertain=set())
+        assert s is vtt
+
+    def test_whisper_when_truly_alone(self):
+        # When VTT is missing and no title-matched survives, Whisper is
+        # the last-resort scaffold ("AI tylko gdy nic innego").
+        whisper = _whisper([Word(text="a", start=0.0, end=0.5)])
+        s = select_scaffold([whisper], order_uncertain=set())
         assert s is whisper
 
     def test_vtt_line_only_fallback(self):
@@ -220,7 +231,16 @@ class TestSelectScaffold:
         s = select_scaffold([vtt], order_uncertain=set())
         assert s is vtt
 
-    def test_order_uncertain_excluded(self):
+    def test_order_uncertain_excludes_lrclib_falls_to_vtt(self):
+        # With Whisper demoted, an order-uncertain LRClib + a VTT now
+        # falls through to VTT (rank 3) rather than Whisper (rank 99).
+        lrclib = _lrclib("[00:00.00]a")
+        vtt = _vtt("[00:00.00]a")
+        whisper = _whisper([Word(text="a", start=0.0, end=0.5)])
+        s = select_scaffold([lrclib, vtt, whisper], order_uncertain={"lrclib"})
+        assert s is vtt
+
+    def test_order_uncertain_lrclib_falls_to_whisper_only_if_no_vtt(self):
         lrclib = _lrclib("[00:00.00]a")
         whisper = _whisper([Word(text="a", start=0.0, end=0.5)])
         s = select_scaffold([lrclib, whisper], order_uncertain={"lrclib"})
@@ -421,3 +441,106 @@ class TestGroupFailureMode:
         rejected_names = [name for name, _ in result.sources_rejected]
         assert {"lrclib", "musixmatch", "megalobiz"} <= set(rejected_names)
         assert result.text.startswith("the last")
+
+
+# ---------------- T26 vote whisper demotion (AI demotion) ----------------
+
+
+class TestVoteWhisperDemotion:
+    """Whisper text loses to title-matched lyrics on disagreement.
+
+    Audio_ref still uses Whisper for structure, but at any token position
+    where a title-matched source has a different opinion, Whisper's vote
+    is dropped from the pool entirely. When NO title-matched source
+    survives, Whisper text wins by default — that's the "tylko gdy nic
+    innego" rule.
+    """
+
+    def test_title_matched_present_drops_whisper_from_voting(self):
+        # Audio_ref says "alpha bravo charlie"; whisper agrees on
+        # "alpha bravo charlie"; lrclib says "alpha bravo delta".
+        # Without demotion: whisper would tie-break-win at index 2.
+        # With demotion: whisper is dropped → lrclib's "delta" wins.
+        ref = ["alpha", "bravo", "charlie"]
+        whisper = SourceResult(
+            name="whisper",
+            kind="source_matched",
+            words=[
+                Word(text="alpha", start=0.0, end=0.5),
+                Word(text="bravo", start=0.5, end=1.0),
+                Word(text="charlie", start=1.0, end=1.5),
+            ],
+            is_synced=False,
+        )
+        lrclib = _lrclib("[00:00.00]alpha bravo delta")
+        votes = vote_tokens(
+            ref,
+            [
+                (whisper, ["alpha", "bravo", "charlie"]),
+                (lrclib, ["alpha", "bravo", "delta"]),
+            ],
+        )
+        assert votes[2] == "delta"
+
+    def test_no_title_matched_leaves_whisper_voting(self):
+        # No lyric source survived; whisper text remains the only signal.
+        ref = ["alpha", "bravo"]
+        whisper = SourceResult(
+            name="whisper",
+            kind="source_matched",
+            words=[
+                Word(text="alpha", start=0.0, end=0.5),
+                Word(text="bravo", start=0.5, end=1.0),
+            ],
+            is_synced=False,
+        )
+        votes = vote_tokens(ref, [(whisper, ["alpha", "bravo"])])
+        assert votes[0] == "alpha"
+        assert votes[1] == "bravo"
+
+
+# ---------------- T27 source scores attached + score_sources helper ----------------
+
+
+class TestSourceScoresAttached:
+    def test_consensus_result_carries_per_source_coverage(self):
+        # Build a fixture where the wrong-version source is unambiguously
+        # below the genius threshold (0.55). The audio_ref tokens here are
+        # the Moonlight chorus; the bad source talks about completely
+        # different lyrics so coverage is near zero.
+        vtt = _vtt(_MOONLIGHT_CORRECT_LRC)
+        good_lrclib = _lrclib(_MOONLIGHT_CORRECT_LRC)
+        unrelated_genius = _genius(
+            "We are the champions of the world\nNo time for losers\nWe'll keep on fighting"
+        )
+        ref = build_audio_reference(vtt, None)
+        result = build_consensus([vtt, good_lrclib, unrelated_genius], ref)
+        assert result is not None
+        assert "lrclib" in result.source_scores
+        assert "genius" in result.source_scores
+        # Surviving source scored above the threshold.
+        lrclib_cov, _ = result.source_scores["lrclib"]
+        assert lrclib_cov >= 0.7
+        # Rejected source recorded its (low) coverage too.
+        genius_cov, _ = result.source_scores["genius"]
+        assert 0.0 <= genius_cov < 0.55
+        rejected_names = [name for name, _reason in result.sources_rejected]
+        assert "genius" in rejected_names
+
+    def test_score_sources_helper_runs_independently_of_build(self):
+        # Even when consensus aborts (e.g. all title-matched rejected),
+        # the persister can still recover the scores it would've computed.
+        vtt = _vtt(_MOONLIGHT_CORRECT_LRC)
+        bad = _lrclib("[00:00.00]totally unrelated jazz fusion phrase")
+        ref = build_audio_reference(vtt, None)
+        scores = score_sources_against_reference([vtt, bad], ref)
+        # vtt is audio-ref owner — excluded.
+        assert "vtt" not in scores
+        # lrclib (title-matched) gets recorded, even though it'd be rejected.
+        assert "lrclib" in scores
+        cov, _ = scores["lrclib"]
+        assert cov < 0.55
+
+    def test_score_sources_empty_audio_ref_returns_empty(self):
+        bad = _lrclib("[00:00.00]hello")
+        assert score_sources_against_reference([bad], []) == {}

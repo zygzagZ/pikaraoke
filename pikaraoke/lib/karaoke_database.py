@@ -246,6 +246,19 @@ _MIGRATION_V10 = """
 ALTER TABLE songs ADD COLUMN language_at_enrich TEXT;
 """
 
+# v10 -> v11: per-(song, source) coverage score from the consensus engine.
+# ``coverage`` is the SequenceMatcher ratio (0..1) returned by
+# ``lyrics_consensus.score_against_reference`` — i.e. how much of the
+# variant's tokens overlap the audio reference (VTT + Whisper). NULL =
+# never scored. ``order_uncertain`` carries the contiguity flag (1 when
+# matched tokens were heavily permuted vs the reference, 0 otherwise).
+# Persisted so the variant fetch path can refuse to render a known-bad
+# variant and the picker chip can surface the score as a badge.
+_MIGRATION_V11 = """
+ALTER TABLE subtitle_jobs ADD COLUMN coverage REAL;
+ALTER TABLE subtitle_jobs ADD COLUMN order_uncertain INTEGER NOT NULL DEFAULT 0;
+"""
+
 LYRICS_PROVENANCE_AUTO_WORD = "auto_word"
 LYRICS_PROVENANCE_AUTO_LINE = "auto_line"
 LYRICS_PROVENANCE_USER = "user"
@@ -300,7 +313,7 @@ VARIANT_FILE_SOURCES = frozenset(
     }
 )
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 
 # Lifecycle states a subtitle_jobs row can hold (Phase 1).
 SUBTITLE_JOB_QUEUED = "queued"
@@ -449,6 +462,11 @@ class KaraokeDatabase:
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(songs)").fetchall()}
             if "language_at_enrich" not in columns:
                 self._conn.executescript(_MIGRATION_V10)
+            job_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(subtitle_jobs)").fetchall()
+            }
+            if "coverage" not in job_columns:
+                self._conn.executescript(_MIGRATION_V11)
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------
@@ -1193,6 +1211,53 @@ class KaraokeDatabase:
         with self._lock, self._conn:
             cur = self._conn.execute("DELETE FROM subtitle_jobs WHERE song_id = ?", (song_id,))
             return cur.rowcount
+
+    def update_subtitle_job_score(
+        self,
+        song_id: int,
+        source: str,
+        coverage: float,
+        order_uncertain: bool,
+    ) -> bool:
+        """Update coverage + order_uncertain on an existing subtitle_jobs row.
+
+        Returns True when a row was updated, False when nothing matched.
+        Uses UPDATE not UPSERT — the orchestrator owns row creation; if no
+        row exists for ``(song_id, source)`` the score was computed for a
+        source we never dispatched, which is a pipeline bug worth surfacing
+        rather than silently inserting a stateless row.
+        """
+        if not (0.0 <= coverage <= 1.0):
+            raise ValueError(f"update_subtitle_job_score: coverage must be 0..1, got {coverage!r}")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE subtitle_jobs "
+                "SET coverage = ?, order_uncertain = ? "
+                "WHERE song_id = ? AND source = ?",
+                (float(coverage), 1 if order_uncertain else 0, song_id, source),
+            )
+            return cur.rowcount > 0
+
+    def get_subtitle_job_score(self, song_id: int, source: str) -> tuple[float, bool] | None:
+        """Return ``(coverage, order_uncertain)`` for one job, or None.
+
+        None means: row missing, or row exists but ``coverage`` is NULL
+        (never scored). Callers treat None as "no signal" — the variant
+        gate falls through to its normal fetch path, the picker chip
+        renders without a badge.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT coverage, order_uncertain FROM subtitle_jobs "
+                "WHERE song_id = ? AND source = ?",
+                (song_id, source),
+            ).fetchone()
+        if row is None:
+            return None
+        coverage = row[0]
+        if coverage is None:
+            return None
+        return float(coverage), bool(row[1])
 
     # ------------------------------------------------------------------
     # Metadata (app-level key-value store)

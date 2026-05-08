@@ -8,6 +8,7 @@ import {
   deriveQueueRosetteState,
   deriveChipState,
   computePickerSig,
+  coverageTier,
 } from '../../pikaraoke/static/js/subtitle-source-picker.js';
 
 const CANONICAL = [
@@ -352,5 +353,42 @@ describe('XSS regression — text fields are inert', () => {
     const payload = '<img src=x onerror=alert(1)>';
     const sources = [{ ...row('AI', 'ready', { state: 'success' }), label: payload }];
     expect(deriveCornerBadgeState('AI', sources).label).toBe(payload);
+  });
+});
+
+describe('coverageTier', () => {
+  it('returns null when coverage is null/undefined', () => {
+    expect(coverageTier(null, false)).toBeNull();
+    expect(coverageTier(undefined, false)).toBeNull();
+  });
+
+  it('returns null for NaN coverage (defensive)', () => {
+    expect(coverageTier(NaN, false)).toBeNull();
+  });
+
+  it('classifies 0..0.55 as bad', () => {
+    expect(coverageTier(0.0, false)).toBe('bad');
+    expect(coverageTier(0.05, false)).toBe('bad');
+    expect(coverageTier(0.54, false)).toBe('bad');
+  });
+
+  it('classifies 0.55..0.85 as warn', () => {
+    expect(coverageTier(0.55, false)).toBe('warn');
+    expect(coverageTier(0.7, false)).toBe('warn');
+    expect(coverageTier(0.84, false)).toBe('warn');
+  });
+
+  it('classifies 0.85..1 as good', () => {
+    expect(coverageTier(0.85, false)).toBe('good');
+    expect(coverageTier(0.95, false)).toBe('good');
+    expect(coverageTier(1.0, false)).toBe('good');
+  });
+
+  it('order_uncertain forces bad regardless of numeric coverage', () => {
+    // Tokens match in count but the order is permuted vs audio_ref —
+    // a strong signal that this variant is not for THIS song. Override
+    // the numeric tier so the chip warns the operator.
+    expect(coverageTier(0.99, true)).toBe('bad');
+    expect(coverageTier(0.6, true)).toBe('bad');
   });
 });
