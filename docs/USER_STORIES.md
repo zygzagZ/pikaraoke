@@ -756,3 +756,228 @@ US-25 / US-25b).
   as a side-effect-free ES module, with vitest unit coverage for
   the rolling-window hot-segment extraction and `\kf` chunk parsing
   (including the pulse-tag-injected first chunk per word).
+
+## Metadata robustness and recovery
+
+This section codifies the bug-class invariants the
+`fix-them-all-also-humble-pebble` change set established. Each story
+maps to a concrete failure mode that previously left songs without
+captions or with poisoned metadata, and ships with regression tests
+in `tests/unit/test_song_enricher.py`, `tests/unit/test_lyrics.py`,
+and `tests/unit/test_song_manager.py`.
+
+### US-46 Lyrics work for songs with incomplete DB metadata
+
+As a user, songs whose DB row has empty or missing `artist` / `title`
+still get a chance at synced lyrics if the filename spells the song
+out as `"Artist - Title---<youtubeID>.mp4"` (or the bare-stem yt-dlp
+form). Specifically, `LyricsService._metadata_candidates` falls back
+to `regex_tidy(_title_from_filename(song_path))` when the DB row is
+blank, partitions on `" - "`, and feeds the parsed pair into the
+candidate ladder.
+
+**Why this matters:** scanner-imported libraries (US-5), pre-fix
+poisoned rows where the old enricher left blank `artist`/`title`
+under an `enriched` status, and edge cases where yt-dlp's info.json
+lacks dedicated `track`/`artist` fields would otherwise short-circuit
+to "no candidates" and never reach LRCLib / Genius / Spotify, even
+though the metadata was visible right there in the filename.
+
+**Acceptance:**
+
+- Empty-DB row + parseable filename → at least the filename-derived
+  candidate fires through LRCLib / Genius / Spotify.
+- Empty-DB row + unparseable filename (no `" - "` separator) → still
+  returns `[]`, no behaviour change for genuinely unidentifiable rows.
+- Filename fallback is independent of `register_download` — works for
+  scanner-imported songs that never had an info.json.
+
+### US-47 Metadata status reflects reality
+
+As a user / operator inspecting the library, `metadata_status` in the
+DB and the SongDetail UI tells the honest story of what's known about
+a row. Specifically:
+
+- `enriched` rows always have non-empty `artist` and `title`. A run
+  that produced only side-fields (album, genre, itunes_id) without
+  resolving identity does not stamp `enriched`.
+- `language_mismatch` requires the row to already have `artist` /
+  `title`. Without prior identity, the verdict has nothing to
+  mismatch against — the enricher down-grades to `not_found`,
+  with the event-log detail flagging `(no prior metadata)`.
+- `not_found` is the legitimate terminal state for a row whose
+  identity simply isn't in iTunes / MusicBrainz; downstream lyrics
+  recovery via the candidate ladder still applies (US-46).
+
+**Why this matters:** the previous enricher would stamp `enriched`
+or `language_mismatch` on rows it had failed to identify, hiding the
+problem from operators trawling the DB and from the UI's "needs
+attention" surfaces.
+
+### US-48 Covers and karaoke variants don't poison the canonical row
+
+As a user, when iTunes' only language-matching hit is a non-canonical
+recording (live / remastered / instrumental / karaoke / acoustic /
+cover / demo / unplugged / `<X> Version` / `<X> Mix`), the variant
+guard refuses to overwrite the row's identity fields with the variant
+recording's metadata.
+
+Two distinct sub-cases:
+
+1. **Same-artist variant** (Queen — "I Want to Break Free
+   (Remastered 2011)"): the canonical track suffix (`(Remastered 2011)`) is dropped, but iTunes' artist (`Queen`) flows through
+   the confidence ladder and overwrites a lower-confidence YouTube
+   tag — the artist is variant-invariant.
+2. **Cover / tribute variant** (a "(Punk Version)" cover by a
+   different artist): the artist tokens of iTunes' hit are disjoint
+   from the query artist, so the guard drops both title AND artist.
+   Album, genre, and itunes_id (descriptive of the wrong recording)
+   may still land but the row's identity stays clean.
+
+**Why this matters:** before this guard, iTunes' single hit on small
+catalogues was often a karaoke / instrumental / cover cut, and
+overwriting `title` / `artist` with that suffix poisoned every
+downstream LRCLib / Genius / Spotify lookup, which all index by the
+canonical recording.
+
+**Acceptance:**
+
+- The variant alternation in `lyrics._VARIANT_RE` covers
+  `instrumental | karaoke | acoustic[ version] | live | remix | remastered | extended | radio edit | cover[ version] | unplugged | demo | bonus track | <word> version | <word> mix`.
+- The guard fires only when the iTunes track adds a marker the
+  query lacks (so a user-issued `"Foo (Karaoke)"` query still
+  legitimately accepts iTunes' matching karaoke cut).
+- The cover-disjoint check uses the existing `_artist_tokens` /
+  fuzzy-token logic (so `"Maryla Rodowicz"` on the query side and
+  `"Maryla Rodowicz & Lanberry"` on iTunes still match).
+
+### US-49 yt-dlp info.json is a permanent provenance record
+
+As a user, every song downloaded via yt-dlp keeps its
+`<stem>.info.json` on disk after `register_download` runs, registered
+in the artifact registry (US-29) under role `info_json`. The DB
+still owns the canonical metadata for runtime queries, but the raw
+yt-dlp output is preserved so:
+
+- Operators can forensically check what YouTube actually returned
+  for a song (Topic-channel `track` / `artist` extraction, original
+  language tag, manual subtitle availability).
+- A future re-classification pass (US-43 cold-DB healing, language
+  bump, etc.) can replay the YouTube signals without re-hitting the
+  YouTube API.
+- The backfill script (US-50) has an authoritative source of truth
+  to compare against when reseeding old rows.
+
+**Acceptance:**
+
+- After `register_download`, `<stem>.info.json` exists on disk.
+- The artifact registry has an `info_json` row pointing at it.
+- `metadata_sources` for `artist` / `title` taken from info.json is
+  stamped `youtube` (so the confidence ladder still lets iTunes /
+  MusicBrainz override it).
+- Deleting the song (US-4) still cleans the file up via the artifact
+  walker — preservation only blocks the in-band consume-then-delete,
+  not user-initiated deletion.
+
+### US-50 One-shot backfill for legacy rows missing info.json
+
+As an operator who maintained a PiKaraoke library before US-49
+shipped (or who imported songs via the scanner), I run
+`uv run python scripts/backfill_info_json.py` once and the script:
+
+1. Identifies every DB row whose `<stem>.info.json` is missing on
+   disk.
+2. Re-fetches it via `yt-dlp --skip-download --write-info-json`
+   using the row's `youtube_id` (or the suffix parsed from the
+   filename as fallback).
+3. Replays the post-download seeding (`upsert_artifacts`,
+   `update_track_metadata_with_provenance(youtube, ...)`,
+   `classify_and_persist`) — same code path as a fresh
+   `register_download`.
+4. When the new info.json's `artist` or `title` differs from what
+   the row had, calls `reset_enrichment_state` so the standard
+   enricher re-evaluates the row from the new seed on its next run.
+
+**CLI ergonomics:**
+
+- `--dry-run` lists what would be fetched without touching the
+  network.
+- `--limit N` caps the run for operator pacing.
+- `--song-id N` debugs a single row.
+- `--force` re-fetches even when info.json exists (recovers rows
+  whose dump came from an old yt-dlp that lacked Topic-channel
+  extraction).
+
+**Acceptance:**
+
+- Final summary prints `scanned`, `fetched OK`, `fetched FAIL`,
+  `no YouTube ID`, and `artist/title changed` counters.
+- Rows whose identity changed end up `metadata_status='pending'` and
+  `enrichment_attempts=0` — visible to the existing enricher
+  scheduler.
+- Higher-confidence sources (`itunes`, `musicbrainz`, `manual`) are
+  not overwritten by the youtube-rung re-write.
+- 2 s sleep between fetches so we don't anger YouTube on a 30-song
+  library.
+
+### US-51 Spotify rate-limit cooldown is bounded
+
+As a user adding songs while Spotify is throttling (the chronic
+24h IP-level lockout on the WebPlayer-token search endpoint), the
+lyrics pipeline does not park worker threads in long sleeps:
+
+- `Retry-After ≤ SPOTIFY_RATE_LIMIT_SLEEP_CAP` (90 s): in-thread
+  sleep for that duration, single retry.
+- `Retry-After` between cap and `SPOTIFY_RATE_LIMIT_LONG_S` (300 s):
+  capped to 90 s.
+- `Retry-After > 300 s` (24h-style lockout): zero in-thread sleep.
+  The in-process cooldown gate is set to the full Retry-After window
+  so subsequent Spotify calls fast-fail until the window passes.
+
+**Why this matters:** before this, a single 24h Retry-After header
+cascaded into stacked 30 s + 50 s + 48 s + 51 s sleeps on the
+verification probe and on the orchestrator's parallel-fetch path,
+freezing the lyrics pipeline for minutes per song before giving up.
+
+**Acceptance:**
+
+- Locked-out `_resolve_spotify_track_id` calls return `None` in
+  ≤ 1 HTTP roundtrip (no sleep).
+- `_spotify_rate_limited_until` is set to a future timestamp matching
+  the Retry-After value, so concurrent threads see the gate without
+  re-issuing the request.
+- Other lyrics sources (LRCLib, Genius, YouTube VTT, Whisper ASR)
+  are not blocked by Spotify's lockout.
+
+### US-52 Garbled low-confidence tags get re-validated from the filename
+
+As a user, a song whose `artist` / `title` came from a low-confidence
+source (`scanner` raw tag, raw `youtube` extraction on a Topic-channel
+upload that mislabelled fields) and which iTunes can't identify on
+the next enrichment pass gets a last-chance reseed from the filename
+— **without** mutating rows whose identity came from a higher rung
+(`itunes`, `musicbrainz`, `manual`).
+
+**Trigger:**
+
+- Enricher dispatched for a row.
+- iTunes returns zero candidates for the query.
+- `metadata_sources` shows `artist` and/or `title` provenance is in
+  `{scanner, youtube}` (or absent entirely).
+- The filename, after stripping the `---<youtubeID>` suffix, parses
+  cleanly via `regex_tidy` into `"Artist - Title"`.
+
+**Action:** write the parsed pair via
+`update_track_metadata_with_provenance(song_id, "scanner", ...)`.
+Provenance `scanner` is the lowest rung, so any later iTunes /
+MusicBrainz / manual signal still wins.
+
+**Acceptance:**
+
+- Row with provenance `scanner` artist + parseable filename + iTunes
+  miss → artist/title get rewritten from the filename, status stamps
+  `not_found` (the iTunes verdict, US-47).
+- Row with provenance `manual` artist → filename re-validation does
+  NOT fire; the manual edit is sticky across iTunes-miss runs.
+- Row whose filename would re-write the same artist/title that's
+  already there → no-op (no spurious row updates).
