@@ -107,6 +107,42 @@ def test_preference_manager_type_conversion_string(temp_config_file):
     assert isinstance(result, str)
 
 
+def test_preference_manager_malformed_value_falls_back_to_default(temp_config_file):
+    """A corrupted stored value must never leak into a typed code path.
+
+    Legacy configs persisted list-reprs like ``splash_delay = ['3']``. Those
+    reached ``splash_delay * 1000`` in the run loop and crashed with a
+    TypeError. get() must coerce to the default's type and fall back on
+    failure instead.
+    """
+    prefs = PreferenceManager(temp_config_file)
+
+    # Write malformed values directly (bypassing set()'s str() normalization).
+    prefs.set("splash_delay", "['3']")
+    prefs.set("show_splash_clock", "['True']")
+
+    # int default -> fall back to the numeric default, never a str
+    result = prefs.get("splash_delay", 2)
+    assert result == 2
+    assert isinstance(result, int)
+    # Proves the original crash (int < str) can no longer happen
+    assert result * 1000 == 2000
+
+    # bool default -> fall back to the bool default
+    result = prefs.get("show_splash_clock", False)
+    assert result is False
+
+
+def test_preference_manager_integer_valued_float_stays_float(temp_config_file):
+    """A float preference stored as '1' must coerce to float, not fall back."""
+    prefs = PreferenceManager(temp_config_file)
+
+    prefs.set("volume", "1")
+    result = prefs.get("volume", 0.85)
+    assert result == 1.0
+    assert isinstance(result, float)
+
+
 def test_preference_manager_clear(temp_config_file):
     """Test clearing user preferences removes [USERPREFERENCES] section."""
     prefs = PreferenceManager(temp_config_file)

@@ -121,11 +121,12 @@ class PreferenceManager:
 
         try:
             pref = self._config_obj.get(section, preference)
-            if isinstance(default_value, str):
-                return pref
-            return self._convert_value(pref)
-        except (configparser.NoOptionError, ValueError):
+        except configparser.NoOptionError:
             return default_value
+
+        if isinstance(default_value, str):
+            return pref
+        return self._coerce_to_default(pref, default_value)
 
     def get_or_default(self, preference: str) -> Any:
         """Get a preference value, falling back to DEFAULTS if not set."""
@@ -190,6 +191,41 @@ class PreferenceManager:
         except (OSError, configparser.Error) as e:
             logging.error(f"Failed to clear preferences: {e}")
             return (False, _("Something went wrong! Your preferences were not cleared"))
+
+    def _coerce_to_default(self, raw: str, default_value: Any) -> Any:
+        """Coerce a stored string to the type of ``default_value``.
+
+        Falls back to ``default_value`` when the stored value can't be parsed
+        as that type. This guards against a corrupted config leaking a raw
+        string into numeric code paths — e.g. a legacy ``splash_delay = ['3']``
+        list-repr would otherwise reach ``splash_delay * 1000`` and crash the
+        run loop with a TypeError.
+        """
+        # bool is a subclass of int, so it must be checked first.
+        if isinstance(default_value, bool):
+            converted = self._convert_value(raw)
+            if isinstance(converted, bool):
+                return converted
+        elif isinstance(default_value, int):
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(default_value, float):
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+        else:
+            return self._convert_value(raw)
+
+        logging.warning(
+            "Malformed preference value %r for a %s setting; using default %r",
+            raw,
+            type(default_value).__name__,
+            default_value,
+        )
+        return default_value
 
     def _convert_value(self, val: Any) -> Any:
         """Convert a string to bool/int/float if applicable, otherwise return as-is."""
