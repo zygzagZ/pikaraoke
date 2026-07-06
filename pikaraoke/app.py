@@ -280,8 +280,9 @@ def main() -> None:
     # Download worker thread runs flask-babel ``_()`` for its notifications;
     # without an app context those return the English msgid regardless of
     # the operator's language (get_locale falls back to preferred_language
-    # under an app context, no request needed).
+    # under an app context, no request needed). Same for lyrics stage toasts.
     k.download_manager.set_app_context_factory(app.app_context)
+    k.lyrics_service.set_app_context_factory(app.app_context)
 
     # Wire download events to SocketIO broadcasts with app context
     from pikaraoke.lib.current_app import broadcast_event

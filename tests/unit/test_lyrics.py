@@ -4710,6 +4710,7 @@ class TestLrclibSyncReliabilityGate:
         aligner = MagicMock()
         aligner.align.return_value = [Word("hello", 10.0, 10.4)]
         aligner.last_line_starts = {}
+        aligner.last_dp_residuals = None
         service = LyricsService(str(tmp_path), EventSystem(), aligner=aligner, db=db)
         return str(song), db, service, aligner
 
@@ -4780,4 +4781,101 @@ class TestLrclibSyncReliabilityGate:
         ):
             assert self._render(service, song) == "ASS"
         assert "lrc_lines" not in aligner.align.call_args.kwargs
+        db.close()
+
+    def test_post_hoc_anchor_shift_kill_falls_back(self, tmp_path):
+        # Priors grade fine but the DP still collapses: max_anchor_shift at
+        # the grader's kill bound discards the line-windowed result and
+        # re-aligns whole-song (LRC fences kept).
+        from pikaraoke.lib.lyrics_align import DpResiduals
+
+        song, db, service, aligner = self._service(tmp_path)
+        aligner.last_dp_residuals = DpResiduals(
+            total_cost=99.0, max_anchor_shift=45.0, rejected_anchors=0
+        )
+        with patch(
+            "pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio",
+            return_value=(0.9, None),
+        ):
+            assert self._render(service, song) == "ASS"
+        assert aligner.align.call_count == 2
+        first, second = aligner.align.call_args_list
+        assert first.kwargs.get("lrc_lines"), "first attempt is line-windowed"
+        assert "lrc_lines" not in second.kwargs, "retry must be whole-song"
+        db.close()
+
+    def test_post_hoc_small_shift_keeps_windowed_result(self, tmp_path):
+        # A shift inside the legit global-offset band must NOT trigger the
+        # kill path (YouTube intro padding is expected to move anchors).
+        from pikaraoke.lib.lyrics_align import DpResiduals
+
+        song, db, service, aligner = self._service(tmp_path)
+        aligner.last_dp_residuals = DpResiduals(
+            total_cost=1.0, max_anchor_shift=8.0, rejected_anchors=0
+        )
+        with patch(
+            "pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio",
+            return_value=(0.9, None),
+        ):
+            assert self._render(service, song) == "ASS"
+        assert aligner.align.call_count == 1
+        assert aligner.align.call_args.kwargs.get("lrc_lines")
+        db.close()
+
+
+class TestStageNotification:
+    """Stage toasts translate under the wired app context and mirror into
+    the per-song song_event timeline with the stable English msgid."""
+
+    def _service(self, tmp_path):
+        from pikaraoke.lib.karaoke_database import KaraokeDatabase
+
+        song = tmp_path / "Foo---abc.mp4"
+        song.write_text("fake")
+        db = KaraokeDatabase(str(tmp_path / "f.db"))
+        db.insert_songs([{"file_path": str(song), "youtube_id": "abc", "format": "mp4"}])
+        events = EventSystem()
+        return str(song), db, events, LyricsService(str(tmp_path), events, db=db)
+
+    def test_emits_toast_and_song_event_with_msgid(self, tmp_path):
+        song, db, events, service = self._service(tmp_path)
+        toasts: list = []
+        song_events: list = []
+        events.on("notification", lambda *a: toasts.append(a))
+        events.on("song_event", lambda p: song_events.append(p))
+
+        service._emit_stage_notification(song, "Fetching lyrics")
+
+        assert toasts and toasts[0][0].startswith("Fetching lyrics: ")
+        assert song_events == [
+            {
+                "phase": "lyrics",
+                "message": "Fetching lyrics",
+                "detail": "",
+                "severity": "info",
+                "song": "Foo---abc.mp4",
+            }
+        ]
+        db.close()
+
+    def test_translate_uses_app_context_factory(self, tmp_path):
+        song, db, events, service = self._service(tmp_path)
+        entered: list = []
+
+        class Ctx:
+            def __enter__(self):
+                entered.append(True)
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        service.set_app_context_factory(Ctx)
+        with patch("flask_babel.gettext", return_value="Szukam napisów") as g:
+            assert service._translate("Fetching lyrics") == "Szukam napisów"
+            g.assert_called_once_with("Fetching lyrics")
+        assert entered == [True]
+        # Without a factory: identity, no context entered.
+        service._app_context_factory = None
+        assert service._translate("Fetching lyrics") == "Fetching lyrics"
         db.close()

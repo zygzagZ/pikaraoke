@@ -24,6 +24,8 @@ import re
 import tempfile
 import threading
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from threading import Thread
@@ -32,6 +34,19 @@ from urllib.parse import quote_plus
 
 import librosa
 import requests
+
+# Stage msgids for _emit_stage_notification. Call sites pass the plain
+# literal (song_event must carry the stable English msgid); this tuple
+# exists so pybabel extract sees the strings. gettext at import time has
+# no app context and returns each msgid unchanged.
+from flask_babel import gettext
+
+_STAGE_MSGIDS = (
+    gettext("Fetching lyrics"),
+    gettext("Aligning words"),
+    gettext("Aligning Genius lyrics"),
+    gettext("Transcribing (Whisper)"),
+)
 
 from pikaraoke.lib.events import EventSystem
 from pikaraoke.lib.karaoke_database import (
@@ -477,6 +492,7 @@ class LyricsService:
         self._events = events
         self._aligner = aligner
         self._db = db
+        self._app_context_factory: Callable[[], AbstractContextManager] | None = None
         # PreferenceManager is read dynamically on every Spotify fetch so
         # operators can rotate the sp_dc cookie via the settings UI without
         # restarting the server. Optional to keep the test surface narrow.
@@ -1220,8 +1236,34 @@ class LyricsService:
         except Exception:
             logger.exception("failed to emit lyrics_upgraded for %s", song_path)
 
+    def set_app_context_factory(self, factory: Callable[[], AbstractContextManager]) -> None:
+        """Flask app-context factory so background-thread toasts translate."""
+        self._app_context_factory = factory
+
+    def _translate(self, text: str) -> str:
+        """Translate ``text`` under an app context when wired; identity otherwise.
+
+        Lyrics work runs on plain threads where flask-babel's ``_()`` returns
+        the msgid — this pushes the app context just around the lookup.
+        """
+        if self._app_context_factory is None:
+            return text
+        try:
+            from flask_babel import gettext
+
+            with self._app_context_factory():
+                return gettext(text)
+        except Exception:
+            return text
+
     def _emit_stage_notification(self, song_path: str, stage: str) -> None:
         """Toast a pipeline-stage message (e.g. "Fetching lyrics: Song Title").
+
+        ``stage`` arrives as the English msgid (the ``_()`` at the call site
+        is an extraction marker — it evaluates to identity on these threads)
+        and is translated here under the app context. Also mirrored into the
+        per-song ``song_event`` timeline so control surfaces (queue prep
+        pill, edit view) can track the stage.
 
         Swallows emit exceptions so a missing/misconfigured event bus never
         breaks the stage it was meant to announce.
@@ -1229,9 +1271,12 @@ class LyricsService:
         if self._events is None:
             return
         try:
-            self._events.emit("notification", f"{stage}: {_title_from_filename(song_path)}")
+            self._events.emit(
+                "notification", f"{self._translate(stage)}: {_title_from_filename(song_path)}"
+            )
         except Exception:
             logger.exception("failed to emit %s stage notification", stage)
+        self._emit_song_event(song_path, phase="lyrics", message=stage)
 
     def _emit_song_event(
         self,
@@ -1625,6 +1670,7 @@ class LyricsService:
         if self._aligner is None:
             return None
         from pikaraoke.lib.lyrics_align import (
+            _GRADE_SHIFT_KILL_S,
             _RELIABILITY_GATE,
             grade_lrc_priors_against_audio,
         )
@@ -1677,6 +1723,27 @@ class LyricsService:
                     language=language,
                     vad_cache=vad_cache,
                 )
+                # Post-hoc guard: priors can grade fine and the DP still
+                # produce a collapsed assignment. A worst-case anchor drift
+                # at the grader's kill bound means the line-windowed result
+                # is garbage — discard and re-align whole-song. Legit global
+                # offsets (YouTube intro padding) stay well under this.
+                residuals = getattr(self._aligner, "last_dp_residuals", None)
+                if residuals is not None and residuals.max_anchor_shift >= _GRADE_SHIFT_KILL_S:
+                    logger.warning(
+                        "lrclib-sync: max anchor shift %.1fs >= %.1fs kill bound for %s; "
+                        "discarding line-windowed result, re-aligning whole-song",
+                        residuals.max_anchor_shift,
+                        _GRADE_SHIFT_KILL_S,
+                        os.path.basename(song_path),
+                    )
+                    use_lrc_windows = False
+                    words = self._aligner.align(
+                        audio_path,
+                        _lrc_plain_text(lrc),
+                        language=language,
+                        vad_cache=vad_cache,
+                    )
             else:
                 logger.info(
                     "lrclib-sync: priors score %.2f below %.2f gate for %s; "

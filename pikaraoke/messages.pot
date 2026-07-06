@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-07-06 11:50+0200\n"
+"POT-Creation-Date: 2026-07-06 12:39+0200\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -69,6 +69,18 @@ msgstr ""
 
 #, python-format
 msgid "Separating vocals: %s"
+msgstr ""
+
+msgid "Fetching lyrics"
+msgstr ""
+
+msgid "Aligning words"
+msgstr ""
+
+msgid "Aligning Genius lyrics"
+msgstr ""
+
+msgid "Transcribing (Whisper)"
 msgstr ""
 
 #, python-format

@@ -748,18 +748,40 @@
     tagEl.setAttribute('aria-expanded', 'true');
   }
 
-  // Vocal-separation progress per queue row (US-54): a queued song looks
-  // "ready" while demucs is still separating stems — surface it as a small
-  // pill under the row title. Keyed by file basename; demucs_progress /
-  // stems_ready payloads carry song_basename.
+  // Processing progress per queue row (US-54): a queued song looks "ready"
+  // while demucs separates stems or the lyrics pipeline still runs —
+  // surface it as a small pill under the row title. Keyed by file basename
+  // (demucs_progress/stems_ready carry song_basename, lyrics song_events
+  // carry song). Demucs percent wins when both are active.
   const prepState = new Map();
+  const lyricsPrep = new Map();
+
+  // song_event lyrics-phase messages are stable English msgids.
+  const LYRICS_STAGE_LABELS = {
+    'Fetching lyrics': 'szukam napisów…',
+    'Aligning words': 'dopasowuję napisy…',
+    'Aligning Genius lyrics': 'dopasowuję napisy…',
+    'Transcribing (Whisper)': 'transkrybuję (AI)…',
+  };
+  const LYRICS_DONE = new Set(['Lyrics fetched', 'Lyrics variant fetched']);
+  // Backstop: the failure paths don't all emit a terminal event — expire
+  // a stale lyrics pill instead of showing "szukam napisów" forever.
+  const LYRICS_PREP_TTL_MS = 15 * 60 * 1000;
 
   function applyPrepPills() {
+    const now = Date.now();
     document.querySelectorAll('#pk-queue-list [data-file]').forEach((row) => {
       const base = decodeURIComponent(row.dataset.file).split('/').pop();
       const pct = prepState.get(base);
+      const lyr = lyricsPrep.get(base);
+      let text = null;
+      if (pct != null) {
+        text = `przygotowuję wokal… ${pct}%`;
+      } else if (lyr && now - lyr.ts < LYRICS_PREP_TTL_MS) {
+        text = lyr.label;
+      }
       let pill = row.querySelector('.pk-queue-prep');
-      if (pct == null) {
+      if (!text) {
         if (pill) pill.remove();
         return;
       }
@@ -771,7 +793,7 @@
         pill.className = 'pk-queue-prep';
         body.appendChild(pill);
       }
-      pill.textContent = `przygotowuję wokal… ${pct}%`;
+      pill.textContent = text;
     });
   }
 
@@ -786,6 +808,25 @@
   function onStemsReady(d) {
     if (!d || !d.song_basename) return;
     prepState.delete(d.song_basename);
+    applyPrepPills();
+  }
+
+  function onLyricsSongEvent(ev) {
+    if (!ev || ev.phase !== 'lyrics' || !ev.song) return;
+    if (LYRICS_DONE.has(ev.message) || ev.severity === 'error') {
+      lyricsPrep.delete(ev.song);
+    } else if (LYRICS_STAGE_LABELS[ev.message]) {
+      lyricsPrep.set(ev.song, { label: LYRICS_STAGE_LABELS[ev.message], ts: Date.now() });
+    } else {
+      return;
+    }
+    applyPrepPills();
+  }
+
+  function onLyricsWarning(w) {
+    if (!w || !w.song || !lyricsPrep.has(w.song)) return;
+    if (!/lyric|align|whisper|subtitle/i.test(w.message || '')) return;
+    lyricsPrep.delete(w.song);
     applyPrepPills();
   }
 
@@ -828,14 +869,23 @@
         window.socket.off('demucs_progress', sockBindings.onDemucsProgress);
         window.socket.off('stems_ready', sockBindings.onStemsReady);
       }
+      if (sockBindings.onLyricsSongEvent) {
+        window.socket.off('song_event', sockBindings.onLyricsSongEvent);
+        window.socket.off('song_warning', sockBindings.onLyricsWarning);
+      }
     }
-    window.PK._homeSockBindings = { refreshQueue, pollDownloads, onDemucsProgress, onStemsReady };
+    window.PK._homeSockBindings = {
+      refreshQueue, pollDownloads, onDemucsProgress, onStemsReady,
+      onLyricsSongEvent, onLyricsWarning,
+    };
     window.socket.on('queue_update', refreshQueue);
     window.socket.on('now_playing', refreshQueue);
     window.socket.on('download_started', pollDownloads);
     window.socket.on('download_stopped', pollDownloads);
     window.socket.on('demucs_progress', onDemucsProgress);
     window.socket.on('stems_ready', onStemsReady);
+    window.socket.on('song_event', onLyricsSongEvent);
+    window.socket.on('song_warning', onLyricsWarning);
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
