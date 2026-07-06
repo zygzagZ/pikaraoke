@@ -1037,10 +1037,10 @@ ______________________________________________________________________
 - \[x\] ~~**P2** Mark queue rows whose song is still downloading/processing.~~
   Done — `demucs_progress` / `stems_ready` render a "przygotowuję wokal…
   X%" pill under the matching queue row.
-- \[ \] **P2** Surface the lyrics stage on the phone too (demucs is
-  covered by the queue pill; "Fetching lyrics…" is still splash/toast
-  only, and that toast is an ungettexted f-string —
-  `lyrics.py:_emit_stage_notification`).
+- \[x\] ~~**P2** Surface the lyrics stage on the phone too.~~ Done —
+  stage notifications mirror into `song_event` (phase=lyrics, stable
+  msgids) and the queue prep pill renders them ("szukam napisów…",
+  "dopasowuję napisy…", "transkrybuję (AI)…") with a 15-min TTL backstop.
 
 ### US-55 Auto subtitle source quality (P0 RESOLVED 2026-07-06; rest open)
 
@@ -1080,9 +1080,10 @@ consulted it.
 - \[x\] Variant render now replays/regrades the prior score and falls
   back to whole-song alignment with the LRC's own line fences below the
   gate (`tests/unit/test_lyrics.py::TestLrclibSyncReliabilityGate`).
-- \[ \] **P3** Consider the cheaper post-hoc check too: reject when
-  `aligner.last_dp_residuals.max_anchor_shift` exceeds a sane bound —
-  catches collapse even when priors graded well.
+- \[x\] ~~**P3** Post-hoc check: reject when
+  `aligner.last_dp_residuals.max_anchor_shift` exceeds a sane bound.~~
+  Done — line-windowed variant render re-aligns whole-song when the max
+  anchor shift reaches `_GRADE_SHIFT_KILL_S` (30s).
 
 ### US-56 Subtitle offset on mobile (RESOLVED 2026-07-06)
 
@@ -1105,10 +1106,9 @@ consulted it.
   `get_locale` short-circuits when there's no request context.
 - \[x\] ~~**P3** Complete the `pl` catalog.~~ Done — pot regenerated
   (was stale) and all 331 strings translated.
-- \[ \] **P3** `LyricsService._emit_stage_notification` toasts
-  ("Fetching lyrics: …") are raw f-strings — not gettexted at all, and
-  the lyrics threads carry no app context. Gettext + context plumbing
-  if these should localize.
+- \[x\] ~~**P3** `_emit_stage_notification` toasts are raw f-strings
+  with no app context.~~ Done — `_translate` pushes the app context just
+  around the gettext lookup; msgids extracted via `_STAGE_MSGIDS`.
 
 ______________________________________________________________________
 
