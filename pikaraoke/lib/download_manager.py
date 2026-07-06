@@ -9,6 +9,8 @@ import re
 import subprocess
 import time
 import uuid
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from queue import Queue
 from threading import Thread
 from typing import TYPE_CHECKING
@@ -93,6 +95,7 @@ class DownloadManager:
         self.download_errors: list[dict] = self._load_persisted_errors()
         self.active_download: dict | None = None
         self._worker_thread: Thread | None = None
+        self._app_context_factory: Callable[[], AbstractContextManager] | None = None
         self._is_downloading: bool = False  # Track if a download is currently in progress
 
     def _load_persisted_errors(self) -> list[dict]:
@@ -244,44 +247,56 @@ class DownloadManager:
         """
         while True:
             download_request = self.download_queue.get()
+            # Push a Flask app context (when wired) so flask-babel ``_()``
+            # calls in this worker translate to the operator's language
+            # instead of silently returning the English msgid.
+            ctx = self._app_context_factory() if self._app_context_factory else nullcontext()
+            with ctx:
+                self._process_one(download_request)
 
-            # Remove from shadow queue
-            # Note: Since this is a single worker thread and append happens on main thread,
-            # we simply pop the first item as it corresponds to FIFO queue.
-            # In a multi-worker scenario, this would need a lock.
-            if self.pending_downloads:
-                self.pending_downloads.pop(0)
+    def set_app_context_factory(self, factory: Callable[[], AbstractContextManager]) -> None:
+        """Wire a Flask ``app.app_context`` factory for worker-thread i18n."""
+        self._app_context_factory = factory
 
-            self._is_downloading = True
+    def _process_one(self, download_request: dict) -> None:
+        """Process a single queued download request."""
+        # Remove from shadow queue
+        # Note: Since this is a single worker thread and append happens on main thread,
+        # we simply pop the first item as it corresponds to FIFO queue.
+        # In a multi-worker scenario, this would need a lock.
+        if self.pending_downloads:
+            self.pending_downloads.pop(0)
 
-            # Initialize active download state
-            self.active_download = {
-                "title": download_request.get("display_title", download_request["video_url"]),
-                "url": download_request["video_url"],
-                "user": download_request["user"],
-                "progress": 0.0,
-                "status": "starting",
-                "eta": "--:--",
-                "speed": "---",
-            }
+        self._is_downloading = True
 
-            try:
-                self._execute_download(
-                    download_request["video_url"],
-                    download_request["enqueue"],
-                    download_request["user"],
-                    download_request["title"],
-                )
-            except Exception as e:
-                logging.error(f"Error processing download: {e}")
-            finally:
-                self._is_downloading = False
-                self.active_download = None
-                self.download_queue.task_done()
+        # Initialize active download state
+        self.active_download = {
+            "title": download_request.get("display_title", download_request["video_url"]),
+            "url": download_request["video_url"],
+            "user": download_request["user"],
+            "progress": 0.0,
+            "status": "starting",
+            "eta": "--:--",
+            "speed": "---",
+        }
 
-                # Check if we are done with all downloads
-                if self.download_queue.empty():
-                    self._events.emit("download_stopped")
+        try:
+            self._execute_download(
+                download_request["video_url"],
+                download_request["enqueue"],
+                download_request["user"],
+                download_request["title"],
+            )
+        except Exception as e:
+            logging.error(f"Error processing download: {e}")
+        finally:
+            self._is_downloading = False
+            self.active_download = None
+            self.download_queue.task_done()
+
+            # Check if we are done with all downloads
+            if self.download_queue.empty():
+                self._events.emit("download_stopped")
 
     def _execute_download(
         self,
@@ -595,8 +610,18 @@ class DownloadManager:
             if video_state["rc"] != 0:
                 cancel(audio_proc, "audio")
 
-        at = Thread(target=run_audio, name="yt-dlp-audio", daemon=True)
-        vt = Thread(target=run_video, name="yt-dlp-video", daemon=True)
+        # Same app-context wrap as the worker loop: the audio leg toasts
+        # ("Separating vocals") from its own thread.
+        def in_app_context(fn: Callable[[], None]) -> Callable[[], None]:
+            def _runner() -> None:
+                ctx = self._app_context_factory() if self._app_context_factory else nullcontext()
+                with ctx:
+                    fn()
+
+            return _runner
+
+        at = Thread(target=in_app_context(run_audio), name="yt-dlp-audio", daemon=True)
+        vt = Thread(target=in_app_context(run_video), name="yt-dlp-video", daemon=True)
         at.start()
         vt.start()
         at.join()

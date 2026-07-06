@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import flask_babel
-from flask import Flask, request, session
+from flask import Flask, has_request_context, request, session
 from flask_babel import Babel
 from flask_socketio import SocketIO
 
@@ -118,6 +118,11 @@ def get_locale() -> str | None:
     except (RuntimeError, AttributeError):
         # App context not available or karaoke instance not initialized yet
         pass
+
+    # Worker threads translate under an app context without a request
+    # (download_manager notifications) — touching ``request`` there raises.
+    if not has_request_context():
+        return None
 
     # Check URL arguments
     if request.args.get("lang"):
@@ -271,6 +276,12 @@ def main() -> None:
     # expose karaoke object to the flask app
     with app.app_context():
         app.config["KARAOKE_INSTANCE"] = k
+
+    # Download worker thread runs flask-babel ``_()`` for its notifications;
+    # without an app context those return the English msgid regardless of
+    # the operator's language (get_locale falls back to preferred_language
+    # under an app context, no request needed).
+    k.download_manager.set_app_context_factory(app.app_context)
 
     # Wire download events to SocketIO broadcasts with app context
     from pikaraoke.lib.current_app import broadcast_event
