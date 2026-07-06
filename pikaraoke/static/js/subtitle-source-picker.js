@@ -100,6 +100,36 @@ export function deriveOptionState(source, activeSource) {
 }
 
 /**
+ * Split picker rows into the guest-facing primary list and the technical
+ * remainder collapsed behind a "Niedostępne (N)" toggle (US-55).
+ *
+ * Primary: rows a guest can act on or is already using — the anchors
+ * ('off', 'consensus'), the active source whatever its state, selectable
+ * rows ('enabled') and rows visibly in flight ('disabled-running').
+ * Failed / rate-limited / N-A rows are diagnostics, not choices, so they
+ * move to the secondary section instead of reading as broken options.
+ */
+export function partitionSourcesForDisplay(sources, activeSource) {
+  const anchors = new Set(['off', 'consensus']);
+  const primary = [];
+  const secondary = [];
+  for (const s of sources || []) {
+    if (!s) continue;
+    const opt = deriveOptionState(s, activeSource);
+    // s.source === activeSource (not just opt.state === 'active'):
+    // a failed-but-selected row derives 'disabled-error', yet folding it
+    // away would show a selection that isn't in the list.
+    const isPrimary =
+      anchors.has(s.source) ||
+      s.source === activeSource ||
+      opt.state === 'enabled' ||
+      opt.state === 'disabled-running';
+    (isPrimary ? primary : secondary).push(s);
+  }
+  return { primary, secondary };
+}
+
+/**
  * Render the rate-limit countdown for a row tooltip ("Dostępne za 47m").
  * Returns '' when ``nextRetryAt`` is in the past, missing, or unparseable.
  */
@@ -448,6 +478,7 @@ export function mountSmartPicker(container, getSongId, opts) {
   let prevActiveState = null;
   let pendingSelection = null;
   let popoverFlipUp = false;
+  let showAllSources = false;
 
   function activeSourceFor(data) {
     if (!data) return null;
@@ -465,8 +496,11 @@ export function mountSmartPicker(container, getSongId, opts) {
 
   function renderTrigger(active, sources) {
     const row = sources.find((s) => s.source === active);
+    // Guest-readable trigger (US-55): severity stays as a colored dot,
+    // the raw "3/7" counter moves into the popover's "Niedostępne" row.
     const summary = computeReadySummary(sources);
-    setText(triggerSummary, summary.label);
+    setText(triggerSummary, '');
+    setAttr(triggerSummary, 'title', `Gotowe źródła: ${summary.label}`);
     triggerSummary.dataset.severity = summary.severity;
     if (row) {
       const view = deriveCornerBadgeState(active, sources);
@@ -480,60 +514,87 @@ export function mountSmartPicker(container, getSongId, opts) {
     }
   }
 
+  function buildRow(s, active, now) {
+    const opt = deriveOptionState(s, active);
+    const tier = coverageTier(s.coverage, s.order_uncertain);
+    const row = el('button', {
+      className: 'pk-row',
+      attrs: {
+        type: 'button',
+        role: 'option',
+        'data-source': s.source,
+        'data-state': opt.state,
+        'aria-selected': opt.state === 'active' ? 'true' : 'false',
+      },
+    });
+    if (tier) {
+      setAttr(row, 'data-coverage-tier', tier);
+    }
+    if (opt.state.startsWith('disabled-')) {
+      row.disabled = true;
+      row.tabIndex = -1;
+    }
+    const rowGlyph = el('span', {
+      className: 'pk-row-glyph',
+      attrs: { 'aria-hidden': 'true' },
+      text: glyphForOption(opt.state),
+    });
+    const rowLabel = el('span', { className: 'pk-row-label', text: s.label || s.source });
+    if (tier && s.coverage != null) {
+      const pct = Math.round(s.coverage * 100);
+      const cov = el('span', {
+        className: 'pk-row-coverage',
+        attrs: {
+          'data-tier': tier,
+          title: s.order_uncertain
+            ? `Pokrycie ${pct}% (kolejność słów niepewna)`
+            : `Pokrycie ${pct}%`,
+        },
+        text: `${pct}%`,
+      });
+      rowLabel.appendChild(cov);
+    }
+    const rowStatus = el('span', { className: 'pk-row-status' });
+    const suffix = statusSuffix(opt, now);
+    setText(rowStatus, suffix);
+    if (opt.tooltip) {
+      setAttr(row, 'title', opt.tooltip);
+    }
+    row.append(rowGlyph, rowLabel, rowStatus);
+    return row;
+  }
+
   function renderRows(active, sources) {
-    // Wipe and rebuild — cheap because <=9 rows. textContent setters mean
+    // Wipe and rebuild — cheap because <=11 rows. textContent setters mean
     // no XSS exposure even if a server-side label ever leaks an <script>.
     while (popover.firstChild) popover.removeChild(popover.firstChild);
     const sorted = sortSourcesCanonically(sources, canonicalOrder);
     const now = Date.now();
-    for (const s of sorted) {
-      const opt = deriveOptionState(s, active);
-      const tier = coverageTier(s.coverage, s.order_uncertain);
-      const row = el('button', {
-        className: 'pk-row',
-        attrs: {
-          type: 'button',
-          role: 'option',
-          'data-source': s.source,
-          'data-state': opt.state,
-          'aria-selected': opt.state === 'active' ? 'true' : 'false',
-        },
-      });
-      if (tier) {
-        setAttr(row, 'data-coverage-tier', tier);
-      }
-      if (opt.state.startsWith('disabled-')) {
-        row.disabled = true;
-        row.tabIndex = -1;
-      }
-      const rowGlyph = el('span', {
-        className: 'pk-row-glyph',
-        attrs: { 'aria-hidden': 'true' },
-        text: glyphForOption(opt.state),
-      });
-      const rowLabel = el('span', { className: 'pk-row-label', text: s.label || s.source });
-      if (tier && s.coverage != null) {
-        const pct = Math.round(s.coverage * 100);
-        const cov = el('span', {
-          className: 'pk-row-coverage',
-          attrs: {
-            'data-tier': tier,
-            title: s.order_uncertain
-              ? `Pokrycie ${pct}% (kolejność słów niepewna)`
-              : `Pokrycie ${pct}%`,
-          },
-          text: `${pct}%`,
-        });
-        rowLabel.appendChild(cov);
-      }
-      const rowStatus = el('span', { className: 'pk-row-status' });
-      const suffix = statusSuffix(opt, now);
-      setText(rowStatus, suffix);
-      if (opt.tooltip) {
-        setAttr(row, 'title', opt.tooltip);
-      }
-      row.append(rowGlyph, rowLabel, rowStatus);
-      popover.appendChild(row);
+    const { primary, secondary } = partitionSourcesForDisplay(sorted, active);
+    for (const s of primary) popover.appendChild(buildRow(s, active, now));
+    if (!secondary.length) return;
+    // Failed / N-A sources fold behind one toggle so a guest never scans
+    // a wall of BŁĄD rows to find the three sources that work (US-55).
+    const moreRow = el('button', {
+      className: 'pk-row pk-row-more',
+      attrs: {
+        type: 'button',
+        'aria-expanded': showAllSources ? 'true' : 'false',
+      },
+    });
+    const moreGlyph = el('span', {
+      className: 'pk-row-glyph',
+      attrs: { 'aria-hidden': 'true' },
+      text: showAllSources ? '▾' : '▸',
+    });
+    const moreLabel = el('span', {
+      className: 'pk-row-label',
+      text: `Niedostępne (${secondary.length})`,
+    });
+    moreRow.append(moreGlyph, moreLabel, el('span', { className: 'pk-row-status' }));
+    popover.appendChild(moreRow);
+    if (showAllSources) {
+      for (const s of secondary) popover.appendChild(buildRow(s, active, now));
     }
   }
 
@@ -668,6 +729,13 @@ export function mountSmartPicker(container, getSongId, opts) {
   });
 
   function handleRowClick(row) {
+    if (row.classList.contains('pk-row-more')) {
+      showAllSources = !showAllSources;
+      if (lastData) renderAll(lastData, /*forceRows*/ true);
+      else renderRows(null, []);
+      if (isOpen) placePopover();
+      return;
+    }
     const source = row.dataset.source;
     if (!source || pendingSelection) return;
     pendingSelection = source;

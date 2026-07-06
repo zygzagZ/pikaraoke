@@ -148,28 +148,25 @@
   text-overflow: ellipsis;
 }
 
-/* T3=B: drop the ✓; colour-code the fraction by severity. */
+/* US-55: the trigger shows severity as a quiet dot — the raw "3/7"
+   counter lives in the popover's "Niedostępne (N)" row instead. */
 .pk-trigger .pk-summary {
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  padding: 2px 8px;
-  border-radius: var(--pk-r-pill, 100px);
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 .pk-trigger .pk-summary[data-severity="green"] {
-  background: var(--pk-lime-glow);
-  color: var(--pk-lime);
+  background: var(--pk-lime);
 }
 .pk-trigger .pk-summary[data-severity="amber"] {
-  background: var(--pk-amber-glow);
-  color: var(--pk-amber);
+  background: var(--pk-amber);
 }
 .pk-trigger .pk-summary[data-severity="red"] {
-  background: rgba(156, 64, 42, 0.18);
-  color: var(--pk-danger);
+  background: var(--pk-danger);
 }
 [data-theme="late-show"] .pk-trigger .pk-summary[data-severity="red"] {
-  background: rgba(255, 77, 143, 0.18);
+  background: #ff4d8f;
 }
 
 .pk-trigger .pk-arrow {
@@ -274,6 +271,22 @@
 }
 .pk-row[data-state="disabled-error"] .pk-row-status { color: var(--pk-danger); }
 .pk-row[data-state="disabled-rate-limited"] .pk-row-status { color: var(--pk-sun-deep, var(--pk-amber)); }
+
+/* "Niedostępne (N)" fold toggle — reads as a section divider, not an
+   option: smaller, muted, with a hairline above (US-55). */
+.pk-row-more {
+  min-height: 36px;
+  border-top: 1px solid var(--pk-border);
+  border-radius: 0;
+  margin-top: 4px;
+}
+.pk-row-more .pk-row-label {
+  font-size: 11px;
+  color: var(--pk-ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.pk-row-more .pk-row-glyph { color: var(--pk-ink-3); }
 
 /* Coverage badge inside the dropdown row label — same three tiers as
    the chip-row badge (good/warn/bad), persisted to subtitle_jobs.coverage

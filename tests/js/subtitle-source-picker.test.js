@@ -9,6 +9,7 @@ import {
   deriveChipState,
   computePickerSig,
   coverageTier,
+  partitionSourcesForDisplay,
 } from '../../pikaraoke/static/js/subtitle-source-picker.js';
 
 const CANONICAL = [
@@ -412,5 +413,60 @@ describe('coverageTier', () => {
     // the numeric tier so the chip warns the operator.
     expect(coverageTier(0.99, true)).toBe('bad');
     expect(coverageTier(0.6, true)).toBe('bad');
+  });
+});
+
+describe('partitionSourcesForDisplay', () => {
+  it('keeps selectable and running rows primary, folds failed and n/a', () => {
+    const sources = [
+      row('off', 'ready'),
+      row('user', 'na'),
+      row('consensus', 'ready'),
+      row('lrclib', 'ready'),
+      row('lrclib-sync', 'ready'),
+      row('genius-sync', 'na', { state: 'failed' }),
+      row('spotify-sync', 'na', { state: 'failed' }),
+      row('tekstowo-sync', 'ready'),
+      row('AI', 'na', { state: 'failed' }),
+      row('youtube-vtt', 'na', { state: 'failed' }),
+      row('spotify', 'downloading'),
+    ];
+    const { primary, secondary } = partitionSourcesForDisplay(sources, 'consensus');
+    expect(primary.map((s) => s.source)).toEqual([
+      'off', 'consensus', 'lrclib', 'lrclib-sync', 'tekstowo-sync', 'spotify',
+    ]);
+    expect(secondary.map((s) => s.source)).toEqual([
+      'user', 'genius-sync', 'spotify-sync', 'AI', 'youtube-vtt',
+    ]);
+  });
+
+  it('the active source stays primary even when failed', () => {
+    const sources = [
+      row('off', 'ready'),
+      row('consensus', 'ready'),
+      row('genius-sync', 'na', { state: 'failed' }),
+    ];
+    const { primary, secondary } = partitionSourcesForDisplay(sources, 'genius-sync');
+    // deriveOptionState reports 'failed' job state over active status, so
+    // the row is disabled — but it must remain primary, not folded away,
+    // or the picker would show a selection that isn't in the list.
+    expect(primary.map((s) => s.source)).toEqual(['off', 'consensus', 'genius-sync']);
+    expect(secondary).toEqual([]);
+  });
+
+  it('anchors off and consensus are always primary even when n/a', () => {
+    const sources = [
+      row('off', 'na'),
+      row('consensus', 'na'),
+      row('lrclib', 'na'),
+    ];
+    const { primary, secondary } = partitionSourcesForDisplay(sources, null);
+    expect(primary.map((s) => s.source)).toEqual(['off', 'consensus']);
+    expect(secondary.map((s) => s.source)).toEqual(['lrclib']);
+  });
+
+  it('empty input yields empty partitions', () => {
+    expect(partitionSourcesForDisplay([], null)).toEqual({ primary: [], secondary: [] });
+    expect(partitionSourcesForDisplay(null, null)).toEqual({ primary: [], secondary: [] });
   });
 });
