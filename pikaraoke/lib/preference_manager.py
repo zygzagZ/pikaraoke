@@ -39,7 +39,9 @@ class PreferenceManager:
         "limit_user_songs_by": 0,
         "enable_fair_queue": False,
         "cdg_pixel_scaling": False,
-        "avsync": 0,
+        # float: avsync is fractional seconds (e.g. 0.25); an int default
+        # would make the type coercion reject every non-integer value.
+        "avsync": 0.0,
         "browse_results_per_page": 100,
         "low_score_phrases": "",
         "mid_score_phrases": "",

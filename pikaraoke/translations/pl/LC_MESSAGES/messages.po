@@ -1,0 +1,117 @@
+# Polish translations for PiKaraoke.
+# Partial catalog: guest-visible notifications (toasts) first; untranslated
+# strings fall back to English msgids.
+msgid ""
+msgstr ""
+"Project-Id-Version: PiKaraoke\n"
+"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
+"Language: pl\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
+
+msgid "%s added to the queue: %s"
+msgstr "%s dodał(a) do kolejki: %s"
+
+msgid "%s added to top of queue: %s"
+msgstr "%s dodał(a) na początek kolejki: %s"
+
+msgid "Added %s random tracks"
+msgstr "Dodano %s losowych utworów"
+
+msgid "Already downloaded: %s"
+msgstr "Już pobrane: %s"
+
+msgid "Clear queue"
+msgstr "Wyczyść kolejkę"
+
+msgid "Cleared the queue!"
+msgstr "Kolejka wyczyszczona!"
+
+msgid "Deleted from queue"
+msgstr "Usunięto z kolejki"
+
+msgid "Download queued (#%d): %s"
+msgstr "Pobieranie w kolejce (#%d): %s"
+
+msgid "Download starting: %s"
+msgstr "Zaczynam pobieranie: %s"
+
+msgid "Downloaded and queued: %s"
+msgstr "Pobrano i dodano do kolejki: %s"
+
+msgid "Downloaded: %s"
+msgstr "Pobrano: %s"
+
+msgid "Downloading audio: %s"
+msgstr "Pobieram audio: %s"
+
+msgid "Downloading video: %s"
+msgstr "Pobieram wideo: %s"
+
+msgid "Error deleting from queue"
+msgstr "Błąd usuwania z kolejki"
+
+msgid "Error downloading song: "
+msgstr "Błąd pobierania utworu: "
+
+msgid "Error moving down in queue"
+msgstr "Błąd przesuwania w dół kolejki"
+
+msgid "Error moving to bottom of queue"
+msgstr "Błąd przesuwania na koniec kolejki"
+
+msgid "Error moving to top of queue"
+msgstr "Błąd przesuwania na początek kolejki"
+
+msgid "Error moving up in queue"
+msgstr "Błąd przesuwania w górę kolejki"
+
+msgid "Error queueing song: "
+msgstr "Błąd dodawania do kolejki: "
+
+msgid "Moved down in queue"
+msgstr "Przesunięto w dół kolejki"
+
+msgid "Moved to bottom of queue"
+msgstr "Przesunięto na koniec kolejki"
+
+msgid "Moved to top of queue"
+msgstr "Przesunięto na początek kolejki"
+
+msgid "Moved up in queue"
+msgstr "Przesunięto w górę kolejki"
+
+msgid "Pause: %s"
+msgstr "Pauza: %s"
+
+msgid "Ran out of songs!"
+msgstr "Skończyły się piosenki!"
+
+msgid "Resume: %s"
+msgstr "Wznowiono: %s"
+
+msgid "Separating vocals: %s"
+msgstr "Oddzielam wokal: %s"
+
+msgid "Skip: %s"
+msgstr "Pominięto: %s"
+
+msgid "Song added to the queue: %s"
+msgstr "Dodano do kolejki: %s"
+
+msgid "Song ended abnormally: %s"
+msgstr "Utwór zakończył się nieprawidłowo: %s"
+
+msgid "Song is already in the queue: %s"
+msgstr "Utwór już jest w kolejce: %s"
+
+msgid "Unauthorized"
+msgstr "Brak uprawnień"
+
+msgid "You don't have permission to add random songs"
+msgstr "Nie masz uprawnień do dodawania losowych utworów"
+
+msgid "You reached the limit of %s song(s) from an user in queue!"
+msgstr "Osiągnięto limit %s utworów jednego użytkownika w kolejce!"

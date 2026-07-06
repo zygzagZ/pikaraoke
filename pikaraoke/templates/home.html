@@ -104,6 +104,9 @@
     padding-left: 14px;
   }
   .pk-queue-now.is-list-item.is-drag-handle::before { left: 38px; }
+  /* The pulsing circle sits at 38..60px in the drag-handle variant, while
+     the text column starts at 48px — push the text clear of the circle. */
+  .pk-queue-now.is-list-item.is-drag-handle > .pk-queue-drag + div { padding-left: 24px; }
   .pk-queue-now.is-chosen {
     box-shadow: var(--pk-shadow-elev);
   }

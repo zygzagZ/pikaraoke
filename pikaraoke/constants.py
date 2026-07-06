@@ -1,5 +1,6 @@
 LANGUAGES = {
     "en": "English",
+    "pl": "Polski",
     "de_DE": "German",
     "es_VE": "Spanish (Venezuela)",
     "fi_FI": "Finnish",

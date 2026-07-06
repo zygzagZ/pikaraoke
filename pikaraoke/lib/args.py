@@ -48,6 +48,19 @@ def parse_volume(volume: str | float | None, volume_type: str) -> float | None:
     return parsed_volume
 
 
+def parse_log_level(value: str | int) -> int:
+    """Accept both numeric levels ("20") and names ("info", "DEBUG")."""
+    text = str(value)
+    if text.isdigit():
+        return int(text)
+    level = logging.getLevelName(text.upper())
+    if isinstance(level, int):
+        return level
+    raise argparse.ArgumentTypeError(
+        f"invalid log level: {value!r} (use DEBUG/INFO/WARNING/ERROR/CRITICAL or an int)"
+    )
+
+
 # Default values for non-preference CLI args only
 # Preference defaults are in PreferenceManager.DEFAULTS (single source of truth)
 platform = get_platform()
@@ -120,7 +133,9 @@ def parse_pikaraoke_args() -> argparse.Namespace:
     parser.add_argument(
         "-l",
         "--log-level",
-        help=f"Logging level int value (DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50). (default: {default_log_level})",
+        type=parse_log_level,
+        help="Logging level: name (debug/info/warning/error/critical) or int "
+        f"(DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50). (default: {default_log_level})",
         default=default_log_level,
         required=False,
     )
