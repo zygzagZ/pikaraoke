@@ -267,6 +267,14 @@
     margin-top: 2px;
   }
   .pk-queue-singer-r i.icon { display: none; }
+  /* Vocal-separation progress pill (US-54) — injected by applyPrepPills
+     while demucs still runs for a queued song. */
+  .pk-queue-prep {
+    margin-top: 3px;
+    font-size: 11px;
+    color: var(--pk-amber);
+    font-feature-settings: "tnum";
+  }
   .pk-queue-singer-r .singer {
     font-family: var(--pk-font-hand);
     font-size: 14.5px;
@@ -531,6 +539,7 @@
 
     initSortable();
     refreshRosettes();
+    applyPrepPills();
 
     if (highlightFile) {
       const rows = $list.querySelectorAll('[data-file]');
@@ -739,6 +748,47 @@
     tagEl.setAttribute('aria-expanded', 'true');
   }
 
+  // Vocal-separation progress per queue row (US-54): a queued song looks
+  // "ready" while demucs is still separating stems — surface it as a small
+  // pill under the row title. Keyed by file basename; demucs_progress /
+  // stems_ready payloads carry song_basename.
+  const prepState = new Map();
+
+  function applyPrepPills() {
+    document.querySelectorAll('#pk-queue-list [data-file]').forEach((row) => {
+      const base = decodeURIComponent(row.dataset.file).split('/').pop();
+      const pct = prepState.get(base);
+      let pill = row.querySelector('.pk-queue-prep');
+      if (pct == null) {
+        if (pill) pill.remove();
+        return;
+      }
+      if (!pill) {
+        const body = row.querySelector('.pk-queue-body')
+          || (row.querySelector('.pk-queue-now-title') || {}).parentElement;
+        if (!body) return;
+        pill = document.createElement('div');
+        pill.className = 'pk-queue-prep';
+        body.appendChild(pill);
+      }
+      pill.textContent = `przygotowuję wokal… ${pct}%`;
+    });
+  }
+
+  function onDemucsProgress(d) {
+    if (!d || !d.song_basename || !d.total) return;
+    const pct = Math.min(100, Math.round((d.processed / d.total) * 100));
+    if (pct >= 100) prepState.delete(d.song_basename);
+    else prepState.set(d.song_basename, pct);
+    applyPrepPills();
+  }
+
+  function onStemsReady(d) {
+    if (!d || !d.song_basename) return;
+    prepState.delete(d.song_basename);
+    applyPrepPills();
+  }
+
   function pollDownloads() {
     if (downloadTimer) clearTimeout(downloadTimer);
     $.get('{{ url_for("queue.get_current_downloads") }}').done(function (data) {
@@ -774,12 +824,18 @@
       window.socket.off('now_playing', sockBindings.refreshQueue);
       window.socket.off('download_started', sockBindings.pollDownloads);
       window.socket.off('download_stopped', sockBindings.pollDownloads);
+      if (sockBindings.onDemucsProgress) {
+        window.socket.off('demucs_progress', sockBindings.onDemucsProgress);
+        window.socket.off('stems_ready', sockBindings.onStemsReady);
+      }
     }
-    window.PK._homeSockBindings = { refreshQueue, pollDownloads };
+    window.PK._homeSockBindings = { refreshQueue, pollDownloads, onDemucsProgress, onStemsReady };
     window.socket.on('queue_update', refreshQueue);
     window.socket.on('now_playing', refreshQueue);
     window.socket.on('download_started', pollDownloads);
     window.socket.on('download_stopped', pollDownloads);
+    window.socket.on('demucs_progress', onDemucsProgress);
+    window.socket.on('stems_ready', onStemsReady);
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
