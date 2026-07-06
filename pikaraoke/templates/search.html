@@ -219,7 +219,35 @@
   .pk-result-play { width: 32px; height: 32px; }
   .pk-result-play i.icon { font-size: 11px; }
 
+  .pk-result-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .pk-result-progress-bar {
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--pk-surface-2);
+    overflow: hidden;
+  }
+  .pk-result-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--pk-amber);
+    transition: width 0.3s ease;
+  }
+  .pk-result-progress-fill.is-success { background: var(--pk-success); }
+  .pk-result-progress-fill.is-error { background: var(--pk-danger); }
+  .pk-result-progress-text {
+    font-size: 11px;
+    color: var(--pk-ink-3);
+    font-feature-settings: "tnum";
+    white-space: nowrap;
+  }
+
   .pk-preview-video {
+    position: relative;
     aspect-ratio: 16 / 9;
     border-radius: var(--pk-r-md);
     overflow: hidden;
@@ -230,6 +258,34 @@
     height: 100%;
     display: block;
   }
+  .pk-preview-loading {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: 32px;
+    height: 32px;
+    border: 3px solid rgba(255, 255, 255, 0.25);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: pk-preview-spin 0.8s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes pk-preview-spin {
+    to { transform: rotate(360deg); }
+  }
+  .pk-preview-error {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    text-align: center;
+    color: #fff;
+    font-size: 13px;
+  }
+  .pk-preview-error[hidden] { display: none; }
+  #pk-preview-add { margin-top: 10px; }
 
   .pk-direct-row {
     display: flex;
@@ -486,7 +542,7 @@
       btn.addEventListener('click', () => {
         const card = btn.closest('.pk-result-card');
         const queue = $addQueueSearch ? $addQueueSearch.checked : true;
-        downloadSong(card.dataset.url, card.dataset.title, btn, queue);
+        downloadSong(card.dataset.url, card.dataset.title, btn, queue, card);
       });
     });
 
@@ -544,12 +600,102 @@
       next();
     })();
 
-    function downloadSong(url, title, btn, queue) {
+    // ---- Download lifecycle tracking (US-54) ----
+    // Cards are keyed by YouTube video id. Socket events carry either the
+    // id (song_event, song_warning) or the video url (download_progress);
+    // the card strip walks requested -> downloading (%) -> done / error
+    // instead of the old 2.5s checkmark that reset to a neutral button.
+    const dlTracked = new Map();
+
+    function setCardProgress(entry, pct, text, cls) {
+      const strip = entry.card.querySelector('.pk-result-progress');
+      if (!strip) return;
+      strip.hidden = false;
+      const fill = strip.querySelector('.pk-result-progress-fill');
+      fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      fill.classList.remove('is-success', 'is-error');
+      if (cls) fill.classList.add(cls);
+      strip.querySelector('.pk-result-progress-text').textContent = text;
+    }
+
+    function trackCard(card, btn, queue) {
+      const videoId = card.dataset.videoId;
+      if (!videoId) return;
+      const entry = { card, btn, queue };
+      dlTracked.set(videoId, entry);
+      setCardProgress(entry, 0, 'w kolejce pobierania…');
+    }
+
+    function finishCard(videoId, entry) {
+      setCardProgress(entry, 100, entry.queue ? 'w kolejce' : 'pobrano', 'is-success');
+      entry.btn.innerHTML = '<i class="icon icon-ok"></i>';
+      entry.btn.classList.add('is-success');
+      dlTracked.delete(videoId);
+    }
+
+    function failCard(videoId, entry) {
+      setCardProgress(entry, 100, 'błąd pobierania', 'is-error');
+      entry.btn.innerHTML = '<i class="icon icon-down-big"></i>';
+      entry.btn.classList.remove('is-success');
+      entry.btn.disabled = false; // allow retry
+      dlTracked.delete(videoId);
+    }
+
+    const onDlSongEvent = (ev) => {
+      if (!ev || ev.phase !== 'download' || !ev.youtube_id) return;
+      const entry = dlTracked.get(ev.youtube_id);
+      if (!entry) return;
+      if (ev.message === 'Download starting') {
+        setCardProgress(entry, 0, 'pobieranie…');
+      } else if (ev.message === 'Download completed' || ev.message === 'Cache hit (already downloaded)') {
+        finishCard(ev.youtube_id, entry);
+      }
+    };
+    const onDlProgress = (d) => {
+      if (!d || !d.url) return;
+      dlTracked.forEach((entry, videoId) => {
+        if (!String(d.url).includes(videoId)) return;
+        const pct = Math.round(d.progress || 0);
+        setCardProgress(entry, pct, pct + '%' + (d.eta && d.eta !== '--:--' ? ' · ' + d.eta : ''));
+      });
+    };
+    const onDlWarning = (w) => {
+      if (!w || w.message !== 'Download failed' || !w.youtube_id) return;
+      const entry = dlTracked.get(w.youtube_id);
+      if (entry) failCard(w.youtube_id, entry);
+    };
+
+    // SPA navigation re-runs this script on every mount; unbind the
+    // previous mount's socket handlers first (same pattern as home.html).
+    // Wrapped in jQuery ready because base.html's connectSocket() also
+    // runs there — a raw DOMContentLoaded listener can beat it and find
+    // window.socket still undefined.
+    window.PK = window.PK || {};
+    $(function () {
+      if (!window.socket) return;
+      const prev = window.PK._searchDlBindings;
+      if (prev) {
+        window.socket.off('song_event', prev.onDlSongEvent);
+        window.socket.off('download_progress', prev.onDlProgress);
+        window.socket.off('song_warning', prev.onDlWarning);
+      }
+      window.PK._searchDlBindings = { onDlSongEvent, onDlProgress, onDlWarning };
+      window.socket.on('song_event', onDlSongEvent);
+      window.socket.on('download_progress', onDlProgress);
+      window.socket.on('song_warning', onDlWarning);
+    });
+
+    function downloadSong(url, title, btn, queue, card) {
       const original = btn.innerHTML;
       const originalWidth = btn.offsetWidth;
       btn.style.minWidth = originalWidth + 'px';
       btn.disabled = true;
       btn.innerHTML = '…';
+      const trackable = card && card.dataset.videoId && window.socket;
+      // Track BEFORE the POST: a cache-hit emits its socket events while
+      // the request is still in flight, so registering in .then() would
+      // lose the race and leave the card stuck on "w kolejce pobierania".
+      if (trackable) trackCard(card, btn, queue);
       fetch('{{ url_for("search.download") }}', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -561,14 +707,22 @@
         }),
       })
         .then(() => {
+          // Button stays disabled while the strip tracks progress;
+          // finishCard / failCard decide its final state.
           btn.innerHTML = '<i class="icon icon-ok"></i>';
-          btn.classList.add('is-success');
-          setTimeout(() => reset(), 2500);
+          if (!trackable) {
+            btn.classList.add('is-success');
+            setTimeout(() => reset(), 2500);
+          }
         })
         .catch(() => {
-          btn.innerHTML = '!';
-          btn.classList.add('is-danger');
-          setTimeout(() => reset(), 2500);
+          if (trackable) {
+            failCard(card.dataset.videoId, dlTracked.get(card.dataset.videoId) || { card, btn, queue });
+          } else {
+            btn.innerHTML = '!';
+            btn.classList.add('is-danger');
+            setTimeout(() => reset(), 2500);
+          }
         });
 
       function reset() {
@@ -584,16 +738,22 @@
     const $backdrop = document.getElementById('pk-preview-backdrop');
     const $video = document.getElementById('pk-preview-video');
     const $closeBtn = document.getElementById('pk-preview-close');
+    const $previewLoading = document.getElementById('pk-preview-loading');
+    const $previewError = document.getElementById('pk-preview-error');
+    const $previewAdd = document.getElementById('pk-preview-add');
+    let previewCard = null;
 
     document.querySelectorAll('.pk-result-thumb').forEach((thumb) => {
       thumb.addEventListener('click', () => {
-        const card = thumb.closest('.pk-result-card');
-        openPreview(card.dataset.url);
+        openPreview(thumb.closest('.pk-result-card'));
       });
     });
 
-    function openPreview(url) {
+    function openPreview(card) {
+      previewCard = card;
       $sheet.hidden = false;
+      $previewError.hidden = true;
+      $previewLoading.hidden = false;
       requestAnimationFrame(() => {
         $backdrop.classList.add('is-open');
         $sheet.classList.add('is-open');
@@ -601,18 +761,30 @@
       // iOS autoplay gesture association
       $video.play().then(() => $video.pause()).catch(() => {});
 
-      fetch('{{ url_for("search.preview") }}?url=' + encodeURIComponent(url))
+      fetch('{{ url_for("search.preview") }}?url=' + encodeURIComponent(card.dataset.url))
         .then((r) => r.json())
         .then((data) => {
           if (!data || !data.stream_url) throw new Error('no stream');
+          if (previewCard !== card) return; // sheet closed or reopened elsewhere
           $video.src = data.stream_url;
           $video.load();
           $video.play().catch(() => {});
         })
-        .catch(() => closePreview());
+        .catch(() => {
+          if (previewCard !== card) return;
+          // Say it failed instead of silently closing (US-53) — a vanishing
+          // sheet reads as "I tapped and nothing happened".
+          $previewLoading.hidden = true;
+          $previewError.hidden = false;
+        });
     }
 
+    $video.addEventListener('loadeddata', () => {
+      $previewLoading.hidden = true;
+    });
+
     function closePreview() {
+      previewCard = null;
       $sheet.classList.remove('is-open');
       $backdrop.classList.remove('is-open');
       $video.pause();
@@ -622,6 +794,20 @@
 
     $closeBtn && $closeBtn.addEventListener('click', closePreview);
     $backdrop && $backdrop.addEventListener('click', closePreview);
+
+    // Preview -> queue in one flow (US-53): queue the previewed song and
+    // close the sheet; its card strip takes over progress display.
+    $previewAdd && $previewAdd.addEventListener('click', () => {
+      const card = previewCard;
+      if (!card) return;
+      const btn = card.querySelector('.pk-result-download');
+      const queue = $addQueueSearch ? $addQueueSearch.checked : true;
+      closePreview();
+      card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      if (btn && !btn.disabled) {
+        downloadSong(card.dataset.url, card.dataset.title, btn, queue, card);
+      }
+    });
 
     function escHtml(s) {
       const d = document.createElement('div');
@@ -733,6 +919,12 @@
           <i class="icon icon-down-big"></i>
         </button>
       </div>
+      {# Download lifecycle strip (US-54): hidden until "Pobierz" is tapped,
+         then tracks requested -> downloading (live %) -> done / error. #}
+      <div class="pk-result-progress" hidden>
+        <div class="pk-result-progress-bar"><div class="pk-result-progress-fill"></div></div>
+        <span class="pk-result-progress-text"></span>
+      </div>
     </div>
   </div>
   {% endfor %}
@@ -752,7 +944,17 @@
   <div class="pk-sheet-body">
     <div class="pk-preview-video">
       <video id="pk-preview-video" controls playsinline></video>
+      <div class="pk-preview-loading" id="pk-preview-loading" hidden></div>
+      <p class="pk-preview-error" id="pk-preview-error" hidden>
+        Podgląd niedostępny. Możesz mimo to dodać utwór do kolejki.
+      </p>
     </div>
+    {# Preview -> queue is one flow (US-53): no closing the sheet and
+       re-locating the card just to press its download button. #}
+    <button type="button" id="pk-preview-add" class="pk-btn is-primary is-full">
+      <i class="icon icon-plus-circled"></i>
+      <span>Dodaj do kolejki</span>
+    </button>
   </div>
 </div>
 
