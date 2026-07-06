@@ -34,3 +34,15 @@ fork, the create is wrong — close the upstream PR with a comment and
 re-create with `--repo zygzagZ/pikaraoke`.
 
 This has happened more than once. Memorize.
+
+## 2026-07-06: Flask cache'uje szablony poza debug — restart przed weryfikacją
+
+Podczas weryfikacji poprawek w `templates/search.html` (headless Chrome,
+serwer `uv run pikaraoke`) dwie kolejne iteracje "fixów" wyglądały na
+nieskuteczne, bo serwer wciąż serwował szablon sprzed edycji — Flask bez
+`debug=True` nie przeładowuje Jinja templates (auto_reload = debug).
+
+**Reguła:** po KAŻDEJ edycji pliku w `pikaraoke/templates/` restartuj
+serwer testowy zanim uznasz, że zmiana (nie) działa. Objaw rozjazdu:
+w przeglądarce działa kod, którego commit dopiero co zmienił, albo
+`window.PK.*` nie zawiera świeżo dodanych symboli mimo twardego reloadu.
