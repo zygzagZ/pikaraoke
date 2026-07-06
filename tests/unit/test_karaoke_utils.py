@@ -619,3 +619,98 @@ class TestSongEventsLedger:
         ]
         self._wire(mock_karaoke, {"song_events": json.dumps(prior)})
         assert mock_karaoke.get_song_events_for(song="old.mp4") == prior
+
+
+class TestDemucsLifecycleEvents:
+    """The prewarm started/completed milestones must each fire once per separation.
+
+    Regression: the main run loop calls demucs prewarm() every 500 ms. After
+    stems land in the on-disk cache, the cache-hit branch re-fires the ready
+    hook on every tick — without dedup the per-song timeline gets ~2 entries
+    per second of "Vocal separation completed" for as long as the song stays
+    at queue[0].
+    """
+
+    @staticmethod
+    def _wire(mock_karaoke):
+        stored: dict[str, str] = {}
+        db = MagicMock()
+        db.get_metadata.side_effect = lambda key: stored.get(key)
+        db.set_metadata.side_effect = lambda key, value: stored.__setitem__(key, value)
+        mock_karaoke.db = db
+        mock_karaoke._song_warnings = mock_karaoke._load_song_warnings()
+        mock_karaoke._song_warnings_lock = threading.Lock()
+        mock_karaoke._song_events = mock_karaoke._load_song_events()
+        mock_karaoke._song_events_lock = threading.Lock()
+        mock_karaoke.socketio = MagicMock()
+        # Mirror karaoke.py:613 — _emit_song_event publishes on the bus and
+        # _handle_song_event is what actually appends to the buffer.
+        mock_karaoke.events.on("song_event", mock_karaoke._handle_song_event)
+
+    @staticmethod
+    def _completed_count(mock_karaoke, song):
+        return sum(
+            1
+            for e in mock_karaoke.get_song_events_for(song=song)
+            if e["message"] == "Vocal separation completed"
+        )
+
+    @staticmethod
+    def _started_count(mock_karaoke, song):
+        return sum(
+            1
+            for e in mock_karaoke.get_song_events_for(song=song)
+            if e["message"] == "Vocal separation started"
+        )
+
+    def test_ready_hook_emits_completed_only_once_per_song(self, mock_karaoke):
+        """Re-firing the ready hook for the same basename appends only one event."""
+        self._wire(mock_karaoke)
+        for _ in range(10):
+            mock_karaoke._handle_demucs_ready("Song.mp4", "cachekey-abc")
+        assert self._completed_count(mock_karaoke, "Song.mp4") == 1
+
+    def test_progress_hook_emits_started_only_once_per_song(self, mock_karaoke):
+        """The first progress tick produces 'started'; later ticks are silent."""
+        self._wire(mock_karaoke)
+        for i in range(5):
+            mock_karaoke._handle_demucs_progress("Song.mp4", float(i), 10.0)
+        assert self._started_count(mock_karaoke, "Song.mp4") == 1
+
+    def test_progress_after_ready_re_arms_the_completed_event(self, mock_karaoke):
+        """A fresh separation (new progress tick) lets the next ready fire again."""
+        self._wire(mock_karaoke)
+        # First separation: progress + ready.
+        mock_karaoke._handle_demucs_progress("Song.mp4", 0.0, 10.0)
+        mock_karaoke._handle_demucs_ready("Song.mp4", "cachekey-abc")
+        # Run loop spam: ready re-fires repeatedly with cache hit.
+        for _ in range(5):
+            mock_karaoke._handle_demucs_ready("Song.mp4", "cachekey-abc")
+        # Cache invalidated, separation runs again.
+        mock_karaoke._handle_demucs_progress("Song.mp4", 0.0, 10.0)
+        mock_karaoke._handle_demucs_ready("Song.mp4", "cachekey-def")
+
+        assert self._started_count(mock_karaoke, "Song.mp4") == 2
+        assert self._completed_count(mock_karaoke, "Song.mp4") == 2
+
+    def test_dedup_is_per_song_basename(self, mock_karaoke):
+        """Different basenames don't share the dedup flag."""
+        self._wire(mock_karaoke)
+        mock_karaoke._handle_demucs_ready("SongA.mp4", "cachekey-1")
+        mock_karaoke._handle_demucs_ready("SongB.mp4", "cachekey-2")
+        mock_karaoke._handle_demucs_ready("SongA.mp4", "cachekey-1")  # dup
+        mock_karaoke._handle_demucs_ready("SongB.mp4", "cachekey-2")  # dup
+
+        assert self._completed_count(mock_karaoke, "SongA.mp4") == 1
+        assert self._completed_count(mock_karaoke, "SongB.mp4") == 1
+
+    def test_ready_without_song_basename_emits_stems_ready_only(self, mock_karaoke):
+        """No basename means no per-song timeline entry, but stems_ready still fires."""
+        self._wire(mock_karaoke)
+        events_received = []
+        mock_karaoke.events.on("stems_ready", events_received.append)
+        mock_karaoke._handle_demucs_ready(None, "cachekey-orphan")
+        mock_karaoke._handle_demucs_ready("", "cachekey-orphan")
+
+        assert len(events_received) == 2
+        assert mock_karaoke.get_song_events_for(song="anything") == []

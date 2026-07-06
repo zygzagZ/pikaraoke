@@ -122,6 +122,8 @@ class MockKaraoke:
         self.now_playing_notification = None
         self._subtitle_offsets: dict[tuple[int, str], float] = {}
         self._subtitle_offsets_lock = threading.Lock()
+        self._demucs_started_for: set[str] = set()
+        self._demucs_completed_for: set[str] = set()
 
         # Set preferences that differ from defaults
         self.preferences.set("enable_fair_queue", True)
@@ -197,6 +199,8 @@ class MockKaraoke:
     get_song_events_for = Karaoke.get_song_events_for
     _SONG_EVENTS_DB_KEY = Karaoke._SONG_EVENTS_DB_KEY
     _SONG_EVENTS_MAX = Karaoke._SONG_EVENTS_MAX
+    _handle_demucs_progress = Karaoke._handle_demucs_progress
+    _handle_demucs_ready = Karaoke._handle_demucs_ready
     _maybe_initial_reprocess_with_whisperx = Karaoke._maybe_initial_reprocess_with_whisperx
     _WHISPERX_REPROCESS_SENTINEL = Karaoke._WHISPERX_REPROCESS_SENTINEL
 

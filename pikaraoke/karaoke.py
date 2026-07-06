@@ -470,8 +470,12 @@ class Karaoke:
         self._song_events: list[dict[str, Any]] = self._load_song_events()
         self._song_events_lock = threading.Lock()
         # Tracks first-progress-per-song for Demucs so we emit a single
-        # "started" milestone instead of one per progress tick.
+        # "started" milestone instead of one per progress tick. The companion
+        # _demucs_completed_for set suppresses the "completed" event when the
+        # main run loop re-fires the ready hook every 500 ms via prewarm()'s
+        # cache-hit path — see _forward_ready below.
         self._demucs_started_for: set[str] = set()
+        self._demucs_completed_for: set[str] = set()
 
         # Pending subtitle-source picks (song_path -> source). Set by the
         # picker when the user taps an unready variant: the actual override
@@ -658,40 +662,8 @@ class Karaoke:
         # payloads carry ``song_basename`` so the client can decide whether
         # the event applies to the currently-playing song (live prewarm is
         # indistinguishable from in-flight play-time separation on-wire).
-        def _forward_progress(song: str | None, processed: float, total: float) -> None:
-            self.events.emit(
-                "demucs_progress",
-                {
-                    "processed": float(processed),
-                    "total": float(total),
-                    "song_basename": song or "",
-                },
-            )
-            # First progress tick for this song = "separation started".
-            # Subsequent ticks are noise — the splash already shows the bar.
-            if song and song not in self._demucs_started_for:
-                self._demucs_started_for.add(song)
-                self._emit_song_event(
-                    phase="demucs",
-                    message="Vocal separation started",
-                    song=song,
-                )
-
-        def _forward_ready(song: str | None, cache_key: str) -> None:
-            self.events.emit(
-                "stems_ready",
-                {"song_basename": song or "", "cache_key": cache_key},
-            )
-            self._demucs_started_for.discard(song or "")
-            if song:
-                self._emit_song_event(
-                    phase="demucs",
-                    message="Vocal separation completed",
-                    song=song,
-                )
-
-        demucs_processor.set_progress_hook(_forward_progress)
-        demucs_processor.set_ready_hook(_forward_ready)
+        demucs_processor.set_progress_hook(self._handle_demucs_progress)
+        demucs_processor.set_ready_hook(self._handle_demucs_ready)
 
         # Active-stream probe (US-32): the prewarm-mode MP3 encoder asks
         # this before unlinking WAVs so a live byte-range request never
@@ -1512,6 +1484,54 @@ class Karaoke:
             except Exception:
                 logging.exception("failed to emit song_event via socketio")
 
+    def _handle_demucs_progress(self, song: str | None, processed: float, total: float) -> None:
+        """Forward demucs prewarm progress and synthesize a one-shot 'started' event."""
+        self.events.emit(
+            "demucs_progress",
+            {
+                "processed": float(processed),
+                "total": float(total),
+                "song_basename": song or "",
+            },
+        )
+        # First progress tick for this song = "separation started". Subsequent
+        # ticks are noise — the splash already shows the bar. Discarding the
+        # song from _demucs_completed_for re-arms the next ready emission for
+        # cases where the cache was invalidated and a fresh separation runs.
+        if song and song not in self._demucs_started_for:
+            self._demucs_started_for.add(song)
+            self._demucs_completed_for.discard(song)
+            self._emit_song_event(
+                phase="demucs",
+                message="Vocal separation started",
+                song=song,
+            )
+
+    def _handle_demucs_ready(self, song: str | None, cache_key: str) -> None:
+        """Forward stems_ready and emit a one-shot 'completed' event per song.
+
+        The main run loop calls demucs prewarm() every 500 ms. Once stems are
+        cached the cache-hit branch re-fires this hook every tick, which would
+        otherwise spam stems_ready over socketio and append "Vocal separation
+        completed" to the per-song timeline twice per second. Suppress repeats;
+        _handle_demucs_progress re-arms by discarding the basename when a fresh
+        separation actually starts.
+        """
+        if song and song in self._demucs_completed_for:
+            return
+        self.events.emit(
+            "stems_ready",
+            {"song_basename": song or "", "cache_key": cache_key},
+        )
+        self._demucs_started_for.discard(song or "")
+        if song:
+            self._demucs_completed_for.add(song)
+            self._emit_song_event(
+                phase="demucs",
+                message="Vocal separation completed",
+                song=song,
+            )
+
     def _handle_subtitle_job_update(self, data: dict[str, Any]) -> None:
         """Rebroadcast a ``subtitle_job_update`` event over SocketIO.
 
@@ -1793,9 +1813,7 @@ class Karaoke:
                     has_youtube_id or self._has_local_vtt_file(file_path)
                 ):
                     na_reason = "no YouTube ID and no local VTT"
-                elif source == SUBTITLE_SOURCE_CONSENSUS and not (
-                    has_whisper and has_aligner
-                ):
+                elif source == SUBTITLE_SOURCE_CONSENSUS and not (has_whisper and has_aligner):
                     # Consensus needs Whisper (audio reference) + aligner (k-tag
                     # word timing). Without either, the line-merge has nothing
                     # to align lines against. Operator can still pick raw
