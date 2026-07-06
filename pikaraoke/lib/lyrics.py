@@ -1624,6 +1624,11 @@ class LyricsService:
         """
         if self._aligner is None:
             return None
+        from pikaraoke.lib.lyrics_align import (
+            _RELIABILITY_GATE,
+            grade_lrc_priors_against_audio,
+        )
+
         try:
             audio_path = _wait_for_alignment_audio(song_path)
             song_id = self._db.get_song_id_by_path(song_path) if self._db else None
@@ -1634,20 +1639,65 @@ class LyricsService:
             language = db_lang or _detect_language(_lrc_plain_text(lrc))
             if not language:
                 return None
-            words = self._aligner.align(
-                audio_path,
-                _lrc_plain_text(lrc),
-                lrc_lines=lrc_line_windows(lrc),
-                language=language,
-                vad_cache=self._vad_cache_for_song(song_path),
-            )
+            vad_cache = self._vad_cache_for_song(song_path)
+            windows = lrc_line_windows(lrc)
+
+            # Reliability gate (US-43, the "Drive" incident): line-windowed
+            # alignment anchors LRC lines to VAD onsets, and one spurious
+            # onset can pull the whole intro seconds early while gap
+            # compression crushes later lines into 0.6s slivers. The
+            # consensus path grades the priors before choosing a route;
+            # this variant path used to anchor unconditionally. Below the
+            # gate we fall back to whole-song alignment and keep the LRC's
+            # own line fences (they're the part LRCLib got right).
+            score: float | None = None
+            if song_id is not None and self._db is not None:
+                persisted = self._db.get_lyrics_confidence(song_id)
+                if persisted is not None and persisted >= _RELIABILITY_GATE:
+                    score = persisted
+            if score is None and windows:
+                try:
+                    score, _residuals = grade_lrc_priors_against_audio(
+                        audio_path, windows, vad_cache=vad_cache
+                    )
+                except Exception:
+                    logger.exception(
+                        "lrclib-sync: prior grading crashed for %s; "
+                        "falling back to whole-song alignment",
+                        os.path.basename(song_path),
+                    )
+                    score = 0.0
+            use_lrc_windows = bool(windows) and (score is None or score >= _RELIABILITY_GATE)
+
+            if use_lrc_windows:
+                words = self._aligner.align(
+                    audio_path,
+                    _lrc_plain_text(lrc),
+                    lrc_lines=windows,
+                    language=language,
+                    vad_cache=vad_cache,
+                )
+            else:
+                logger.info(
+                    "lrclib-sync: priors score %.2f below %.2f gate for %s; "
+                    "whole-song alignment with LRC line fences",
+                    score if score is not None else 0.0,
+                    _RELIABILITY_GATE,
+                    os.path.basename(song_path),
+                )
+                words = self._aligner.align(
+                    audio_path,
+                    _lrc_plain_text(lrc),
+                    language=language,
+                    vad_cache=vad_cache,
+                )
             if not words:
                 return None
-            line_starts = getattr(self._aligner, "last_line_starts", None)
-            if isinstance(line_starts, dict) and line_starts:
-                render_lrc = _shift_lrc_per_line(lrc, line_starts)
-            else:
-                render_lrc = lrc
+            render_lrc = lrc
+            if use_lrc_windows:
+                line_starts = getattr(self._aligner, "last_line_starts", None)
+                if isinstance(line_starts, dict) and line_starts:
+                    render_lrc = _shift_lrc_per_line(lrc, line_starts)
             bpm = self._cached_estimate_bpm(song_path, audio_path)
             return _words_to_ass_with_k_tags(words, render_lrc, params=_anim_params_for_bpm(bpm))
         except Exception:

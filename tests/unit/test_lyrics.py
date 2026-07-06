@@ -4686,3 +4686,98 @@ class TestInvalidateForMetadataChange:
         # the cache is filesystem-keyed, not DB-keyed.
         assert not ass.exists()
         db.close()
+
+
+class TestLrclibSyncReliabilityGate:
+    """The "Drive" incident (2026-07-06): ``_render_lrclib_word_ass`` used to
+    anchor LRC lines to VAD onsets unconditionally, while the consensus path
+    grades the priors first. One spurious onset pulled the intro ~3.4s early
+    and gap compression crushed later lines into 0.6s slivers — for a song
+    whose persisted lyrics_confidence (0.624) was already below the gate.
+    Below the gate the variant must use whole-song alignment and keep the
+    LRC's own line fences.
+    """
+
+    _LRC = "[00:10.00]hello world\n[00:15.00]again again"
+
+    def _service(self, tmp_path):
+        from pikaraoke.lib.karaoke_database import KaraokeDatabase
+
+        song = tmp_path / "Drive---abc.mp4"
+        song.write_text("fake")
+        db = KaraokeDatabase(str(tmp_path / "f.db"))
+        db.insert_songs([{"file_path": str(song), "youtube_id": "abc", "format": "mp4"}])
+        aligner = MagicMock()
+        aligner.align.return_value = [Word("hello", 10.0, 10.4)]
+        aligner.last_line_starts = {}
+        service = LyricsService(str(tmp_path), EventSystem(), aligner=aligner, db=db)
+        return str(song), db, service, aligner
+
+    def _render(self, service, song):
+        with (
+            patch("pikaraoke.lib.lyrics._wait_for_alignment_audio", side_effect=lambda p: p),
+            patch("pikaraoke.lib.lyrics._detect_language", return_value="en"),
+            patch.object(service, "_vad_cache_for_song", return_value=None),
+            patch.object(service, "_cached_estimate_bpm", return_value=120.0),
+            patch("pikaraoke.lib.lyrics._words_to_ass_with_k_tags", return_value="ASS"),
+        ):
+            return service._render_lrclib_word_ass(song, self._LRC)
+
+    def test_below_gate_uses_whole_song_alignment(self, tmp_path):
+        song, db, service, aligner = self._service(tmp_path)
+        with patch(
+            "pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio",
+            return_value=(0.5, None),
+        ) as grade:
+            assert self._render(service, song) == "ASS"
+            grade.assert_called_once()
+        kwargs = aligner.align.call_args.kwargs
+        assert "lrc_lines" not in kwargs, "below-gate render must not anchor to LRC windows"
+        db.close()
+
+    def test_above_gate_keeps_line_windowed_alignment(self, tmp_path):
+        song, db, service, aligner = self._service(tmp_path)
+        with patch(
+            "pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio",
+            return_value=(0.9, None),
+        ):
+            assert self._render(service, song) == "ASS"
+        kwargs = aligner.align.call_args.kwargs
+        assert kwargs.get("lrc_lines"), "above-gate render keeps the fast LRC-windowed path"
+        db.close()
+
+    def test_persisted_high_confidence_skips_regrade(self, tmp_path):
+        song, db, service, aligner = self._service(tmp_path)
+        sid = db.get_song_id_by_path(song)
+        db.update_lyrics_confidence(sid, 0.9)
+        with patch("pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio") as grade:
+            assert self._render(service, song) == "ASS"
+            grade.assert_not_called()
+        assert aligner.align.call_args.kwargs.get("lrc_lines")
+        db.close()
+
+    def test_persisted_low_confidence_regrades_then_falls_back(self, tmp_path):
+        # A below-gate persisted score is re-graded (an improved upstream
+        # LRC deserves a chance to flip the routing) — and when the grade
+        # stays low, the render falls back to whole-song alignment.
+        song, db, service, aligner = self._service(tmp_path)
+        sid = db.get_song_id_by_path(song)
+        db.update_lyrics_confidence(sid, 0.624)
+        with patch(
+            "pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio",
+            return_value=(0.6, None),
+        ) as grade:
+            assert self._render(service, song) == "ASS"
+            grade.assert_called_once()
+        assert "lrc_lines" not in aligner.align.call_args.kwargs
+        db.close()
+
+    def test_grading_crash_falls_back_to_whole_song(self, tmp_path):
+        song, db, service, aligner = self._service(tmp_path)
+        with patch(
+            "pikaraoke.lib.lyrics_align.grade_lrc_priors_against_audio",
+            side_effect=RuntimeError("vad exploded"),
+        ):
+            assert self._render(service, song) == "ASS"
+        assert "lrc_lines" not in aligner.align.call_args.kwargs
+        db.close()
