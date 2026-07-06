@@ -1022,8 +1022,9 @@ ______________________________________________________________________
 - \[x\] ~~**P1** "Dodaj do kolejki" CTA inside the preview sheet, reusing
   the card download flow.~~ Done — queues the previewed card and hands
   progress off to its lifecycle strip.
-- \[ \] **P2** Make the card's download action read as the primary CTA
-  (label or size), demote the YouTube-link icon.
+- \[x\] ~~**P2** Make the card's download action read as the primary CTA
+  (label or size), demote the YouTube-link icon.~~ Done — labelled
+  "Dodaj" primary button, YouTube icon stays a small ghost.
 
 ### US-54 Download/processing progress on the phone (mostly RESOLVED 2026-07-06)
 
@@ -1033,9 +1034,13 @@ ______________________________________________________________________
 - \[x\] ~~**P1** Persistent card lifecycle state (requested → downloading →
   w kolejce / błąd) replacing the 2.5 s checkmark reset.~~ Done — cards
   register before the POST so cache-hit events can't outrun tracking.
-- \[ \] **P2** Mark queue rows whose song is still downloading/processing.
-- \[ \] **P2** Surface post-download processing (demucs / lyrics) on the
-  phone, not only on splash (US-11 covers splash).
+- \[x\] ~~**P2** Mark queue rows whose song is still downloading/processing.~~
+  Done — `demucs_progress` / `stems_ready` render a "przygotowuję wokal…
+  X%" pill under the matching queue row.
+- \[ \] **P2** Surface the lyrics stage on the phone too (demucs is
+  covered by the queue pill; "Fetching lyrics…" is still splash/toast
+  only, and that toast is an ungettexted f-string —
+  `lyrics.py:_emit_stage_notification`).
 
 ### US-55 Auto subtitle source quality (P0 RESOLVED 2026-07-06; rest open)
 
@@ -1054,9 +1059,30 @@ ______________________________________________________________________
   `tasks/subtitle-smart-selection-phase-3.md` is the real fix). Include
   a same-tier regression guard in `_try_write_ass_tiered` so a
   worse-sourced write can't clobber a better same-tier canonical.
-- \[ \] **P2** Guest-readable picker: hide failed sources behind details,
-  drop raw "BŁĄD"/"N/D" rows and the bare "3/7" counter from the
-  primary list.
+- \[x\] ~~**P2** Guest-readable picker: hide failed sources behind
+  details, drop raw "BŁĄD"/"N/D" rows and the bare "3/7" counter from
+  the primary list.~~ Done — `partitionSourcesForDisplay` folds
+  failed/rate-limited/N-A rows behind a "Niedostępne (N)" toggle; the
+  trigger counter became a severity dot (numbers in the tooltip).
+
+### US-43 addendum: lrclib-sync bypassed the reliability gate (RESOLVED 2026-07-06)
+
+Operator report: "Drive" — plain lrclib perfectly synced, lrclib-sync
+seconds off (first line 0:06 vs 0:10, later up to 110s of collapse).
+Root cause: `_render_lrclib_word_ass` anchored LRC lines to VAD onsets
+unconditionally; a spurious onset pulled the intro 3.4s early and
+`_gap_window_distribution` compressed anchor-gap line runs into 0.6s
+windows. The canonical/consensus path grades priors
+(`grade_lrc_priors_against_audio`, gate 0.75) and had correctly fallen
+back for this song (persisted confidence 0.624) — the variant path never
+consulted it.
+
+- \[x\] Variant render now replays/regrades the prior score and falls
+  back to whole-song alignment with the LRC's own line fences below the
+  gate (`tests/unit/test_lyrics.py::TestLrclibSyncReliabilityGate`).
+- \[ \] **P3** Consider the cheaper post-hoc check too: reject when
+  `aligner.last_dp_residuals.max_anchor_shift` exceeds a sane bound —
+  catches collapse even when priors graded well.
 
 ### US-56 Subtitle offset on mobile (RESOLVED 2026-07-06)
 
@@ -1072,12 +1098,17 @@ ______________________________________________________________________
 
 ### i18n follow-up (from the same audit)
 
-- \[ \] **P2** Toasts emitted from worker threads (download complete,
-  demucs) render the English msgid — no request context at `_()` time.
-  Needs app-context (or locale) plumbing into `download_manager`'s
-  worker; the `pl` catalog only fixes request-context emissions.
-- \[ \] **P3** Complete the `pl` catalog beyond the guest-visible
-  notification subset (253 msgids total in `messages.pot`).
+- \[x\] ~~**P2** Toasts emitted from worker threads (download complete,
+  demucs) render the English msgid — no request context at `_()` time.~~
+  Done — the download worker and the split-download audio/video threads
+  run under `app.app_context()` (`set_app_context_factory`), and
+  `get_locale` short-circuits when there's no request context.
+- \[x\] ~~**P3** Complete the `pl` catalog.~~ Done — pot regenerated
+  (was stale) and all 331 strings translated.
+- \[ \] **P3** `LyricsService._emit_stage_notification` toasts
+  ("Fetching lyrics: …") are raw f-strings — not gettexted at all, and
+  the lyrics threads carry no app context. Gettext + context plumbing
+  if these should localize.
 
 ______________________________________________________________________
 
