@@ -290,9 +290,7 @@ def _extract_timed_lines(source: SourceResult) -> list[TimedLine]:
     return out
 
 
-def _whisper_window_tokens(
-    whisper_words: "list[Word]", t_start: float, t_end: float
-) -> list[str]:
+def _whisper_window_tokens(whisper_words: "list[Word]", t_start: float, t_end: float) -> list[str]:
     """Return normalized whisper tokens whose start time is in [t_start, t_end)."""
     out: list[str] = []
     for w in whisper_words:
@@ -408,9 +406,7 @@ def merge_lines_per_window(
             continue
 
         if window:
-            scored = [
-                (_line_score(window, c.text), c) for c in candidates
-            ]
+            scored = [(_line_score(window, c.text), c) for c in candidates]
             scored.sort(key=lambda x: x[0], reverse=True)
             chosen = scored[0][1]
         else:
@@ -469,9 +465,7 @@ def merge_lines_per_window(
             if key in inserted_keys:
                 continue
             inserted_keys.add(key)
-            out_lines.append(
-                TimedLine(start=cand.start, text=cand.text, source_name=src_name)
-            )
+            out_lines.append(TimedLine(start=cand.start, text=cand.text, source_name=src_name))
 
     out_lines.sort(key=lambda x: x.start)
     return out_lines
@@ -583,20 +577,19 @@ def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> Consen
     if not survivors:
         return None
 
-    whisper_source = next(
-        (s for s in sources if s.name == "whisper" and s.words), None
-    )
-    synced_survivors = [
-        s for s in survivors if s.is_synced and s.lrc and s.name != "whisper"
-    ]
+    whisper_source = next((s for s in sources if s.name == "whisper" and s.words), None)
+    synced_survivors = [s for s in survivors if s.is_synced and s.lrc and s.name != "whisper"]
 
     # ---- Main path: line-merge ----
     if synced_survivors and whisper_source is not None and whisper_source.words:
         merged = merge_lines_per_window(synced_survivors, whisper_source.words)
         if merged:
             confidence = _compute_confidence(
-                sources, survivors, coverages,
-                audio_ref_present=True, confidence_penalty=1.0,
+                sources,
+                survivors,
+                coverages,
+                audio_ref_present=True,
+                confidence_penalty=1.0,
             )
             if confidence < _CONFIDENCE_MIN:
                 logger.info(
@@ -617,6 +610,15 @@ def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> Consen
     # ---- Fallback path: pick best scaffold's LRC verbatim ----
     scaffold = select_scaffold(survivors, set())
     if scaffold is None:
+        return None
+
+    # Raw ASR must never become the consensus output on its own: an
+    # uncorroborated transcript is exactly the garbled-lyrics failure
+    # US-55 gates against (whisper skips coverage scoring as an
+    # audio_ref owner, so nothing else vouches for it here). The AI
+    # variant stays pinnable via the picker for whoever wants it.
+    if scaffold.name == "whisper" and not synced_survivors:
+        logger.info("consensus: refusing whisper-only fallback")
         return None
 
     if scaffold.lrc:
@@ -641,8 +643,11 @@ def build_consensus(sources: list[SourceResult], audio_ref: list[str]) -> Consen
         return None
 
     confidence = _compute_confidence(
-        sources, survivors, coverages,
-        audio_ref_present=True, confidence_penalty=1.0,
+        sources,
+        survivors,
+        coverages,
+        audio_ref_present=True,
+        confidence_penalty=1.0,
     )
     if confidence < _CONFIDENCE_MIN:
         logger.info(

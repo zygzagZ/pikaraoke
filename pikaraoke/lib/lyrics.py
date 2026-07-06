@@ -720,7 +720,9 @@ class LyricsService:
           * no audio fingerprint to key the hash off,
           * the hash is unchanged (no new input vs last run).
         """
-        from pikaraoke.lib.karaoke_database import SUBTITLE_SOURCE_CONSENSUS as _CONSENSUS
+        from pikaraoke.lib.karaoke_database import (
+            SUBTITLE_SOURCE_CONSENSUS as _CONSENSUS,
+        )
 
         if just_landed_source == _CONSENSUS:
             return
@@ -754,11 +756,8 @@ class LyricsService:
                 "consensus rerun: failed to persist hash for %s", os.path.basename(song_path)
             )
         info = self._read_metadata_for_lrclib(song_path)
-        # Don't re-fetch lrclib here — _upgrade_via_consensus_locked will
-        # only include lrclib in its source pool when ``lrclib_lrc`` is
-        # passed in. The first run of the pipeline already wrote
-        # ``<stem>.lrclib.ass`` (variant); LRCLib's network call is HTTP-
-        # cached so we let the consensus engine re-fetch via its own path.
+        # lrclib_lrc=None: _upgrade_via_consensus_locked re-fetches LRCLib
+        # itself (HTTP-cached) whenever the caller doesn't hand it one.
         # ``lyrics_sha`` is derived inside the engine when needed.
         threading.Thread(
             target=self._upgrade_via_consensus,
@@ -784,7 +783,9 @@ class LyricsService:
         """
         import hashlib
 
-        from pikaraoke.lib.karaoke_database import SUBTITLE_SOURCE_CONSENSUS as _CONSENSUS
+        from pikaraoke.lib.karaoke_database import (
+            SUBTITLE_SOURCE_CONSENSUS as _CONSENSUS,
+        )
 
         parts: list[str] = []
         for source in VARIANT_FILE_SOURCES:
@@ -3558,6 +3559,14 @@ class LyricsService:
                 fetchers["megalobiz"] = _wrap("Megalobiz (consensus)", _fetch_megalobiz)
             if GENIUS_ACCESS_TOKEN:
                 fetchers["genius"] = _wrap("Genius (consensus)", _fetch_genius)
+            if not lrclib_lrc:
+                # Recompute dispatches (variant-landed reruns) pass
+                # lrclib_lrc=None — re-fetch here (HTTP-cached) so the pool
+                # never silently loses its strongest synced source and
+                # degrades to "consensus: no sources" / whisper-only (US-55).
+                fetchers["lrclib"] = lambda: self._fetch_lrc_with_itunes_fallback(info, song_path)[
+                    0
+                ]
         if _whisper_fallback_enabled():
             fetchers["whisper"] = lambda: self._run_whisper_for_consensus(song_path)
 
@@ -3588,7 +3597,7 @@ class LyricsService:
                                 is_synced=False,
                             )
                             sources.append(whisper_source)
-                        elif name in ("musixmatch", "megalobiz") and r:
+                        elif name in ("musixmatch", "megalobiz", "lrclib") and r:
                             sources.append(
                                 lc.SourceResult(
                                     name=name,
@@ -3823,9 +3832,7 @@ class LyricsService:
             if audio_sha_persist and self._db is not None:
                 final_hash = self._compute_consensus_input_hash(song_path)
                 if final_hash:
-                    self._db.set_metadata(
-                        f"consensus_input_hash:{audio_sha_persist}", final_hash
-                    )
+                    self._db.set_metadata(f"consensus_input_hash:{audio_sha_persist}", final_hash)
         except Exception:
             logger.exception("consensus: failed to persist input hash for %s", basename)
         logger.info(

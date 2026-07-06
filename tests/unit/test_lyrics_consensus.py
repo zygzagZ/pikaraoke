@@ -182,9 +182,7 @@ class TestMergeLinesPerWindow:
         # word ("pcha"); LRCLib has the full line. Old token-vote produced
         # "lat coś objęcia chłodu mnie"; new line-merge keeps the LRCLib
         # phrasing whole.
-        lrclib = _lrclib(
-            "[00:00.00]od lat coś w objęcia chłodu mnie pcha"
-        )
+        lrclib = _lrclib("[00:00.00]od lat coś w objęcia chłodu mnie pcha")
         whisper_words = self._ws(
             ("od", 0.0, 0.2),
             ("lat", 0.2, 0.4),
@@ -218,10 +216,7 @@ class TestMergeLinesPerWindow:
         # Two synced sources agree on the first line; the second line is
         # unique to LRClib and Whisper hears nothing. Drop fires because
         # multi-source baseline lets us trust the disagreement signal.
-        lrclib = _lrclib(
-            "[00:00.00]hello world\n"
-            "[00:10.00]ghost line nobody sings"
-        )
+        lrclib = _lrclib("[00:00.00]hello world\n" "[00:10.00]ghost line nobody sings")
         mxm = _musixmatch("[00:00.00]hello world")
         whisper_words = self._ws(
             ("hello", 0.0, 0.3),
@@ -235,9 +230,7 @@ class TestMergeLinesPerWindow:
         # With only one synced source, "scaffold-only line" is every line
         # by construction. Drop rule disabled — keep the LRClib content
         # so quiet bridges aren't silently deleted.
-        lrclib = _lrclib(
-            "[00:00.00]hello world\n[00:10.00]quiet bridge here"
-        )
+        lrclib = _lrclib("[00:00.00]hello world\n[00:10.00]quiet bridge here")
         whisper_words = self._ws(
             ("hello", 0.0, 0.3),
             ("world", 0.3, 0.6),
@@ -250,12 +243,8 @@ class TestMergeLinesPerWindow:
         # Both LRCLib and MXM agree the second line exists, even though
         # Whisper missed it. No drop — multi-source agreement wins over
         # silent window.
-        lrclib = _lrclib(
-            "[00:00.00]hello world\n[00:10.00]quiet refrain we keep"
-        )
-        mxm = _musixmatch(
-            "[00:00.00]hello world\n[00:10.00]quiet refrain we keep"
-        )
+        lrclib = _lrclib("[00:00.00]hello world\n[00:10.00]quiet refrain we keep")
+        mxm = _musixmatch("[00:00.00]hello world\n[00:10.00]quiet refrain we keep")
         whisper_words = self._ws(
             ("hello", 0.0, 0.3),
             ("world", 0.3, 0.6),
@@ -269,12 +258,8 @@ class TestMergeLinesPerWindow:
         # at the same timestamp; Whisper hears its tokens. Insert the
         # extra line into the merged output.
         lrclib = _lrclib("[00:00.00]first line\n[00:10.00]third line")
-        mxm = _musixmatch(
-            "[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line"
-        )
-        meg = _megalobiz(
-            "[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line"
-        )
+        mxm = _musixmatch("[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line")
+        meg = _megalobiz("[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line")
         whisper_words = self._ws(
             ("first", 0.0, 0.3),
             ("line", 0.3, 0.6),
@@ -292,9 +277,7 @@ class TestMergeLinesPerWindow:
         # Only MXM has the extra; Megalobiz doesn't. No multi-source
         # support → drop even if Whisper hears something close.
         lrclib = _lrclib("[00:00.00]first line\n[00:10.00]third line")
-        mxm = _musixmatch(
-            "[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line"
-        )
+        mxm = _musixmatch("[00:00.00]first line\n[00:05.00]middle extra line\n[00:10.00]third line")
         whisper_words = self._ws(
             ("first", 0.0, 0.3),
             ("middle", 5.0, 5.3),
@@ -427,6 +410,22 @@ class TestBuildConsensus:
 
     def test_no_sources_returns_none(self):
         assert build_consensus([], []) is None
+
+    def test_whisper_only_pool_returns_none(self):
+        # US-55: raw ASR must never become the consensus output on its
+        # own — with no synced source vouching for it, a whisper-only
+        # pool is refused instead of serving the transcript verbatim
+        # (the Toto - Africa garbled-lyrics incident, 2026-07-06 audit).
+        whisper = _whisper(
+            [
+                Word(text="do", start=0.0, end=0.4),
+                Word(text="bless", start=0.5, end=0.9),
+                Word(text="the", start=1.0, end=1.2),
+                Word(text="rains", start=1.3, end=1.8),
+            ]
+        )
+        ref = build_audio_reference(None, whisper)
+        assert build_consensus([whisper], ref) is None
 
 
 # ---------------- T10 all-rejected fallback ----------------
