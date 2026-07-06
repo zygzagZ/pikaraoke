@@ -208,6 +208,17 @@
     font-size: 12px;
   }
   .pk-result-actions .pk-btn i.icon { font-size: 13px; margin: 0; }
+  /* The download action is the card's primary CTA (US-53): labelled and
+     wide, next to the demoted ghost YouTube icon. */
+  .pk-result-actions .pk-result-download {
+    width: auto;
+    padding: 0 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+  }
   .pk-result-actions .pk-btn-yt {
     color: var(--pk-ink-3);
   }
@@ -635,7 +646,7 @@
 
     function failCard(videoId, entry) {
       setCardProgress(entry, 100, 'błąd pobierania', 'is-error');
-      entry.btn.innerHTML = '<i class="icon icon-down-big"></i>';
+      entry.btn.innerHTML = '<i class="icon icon-down-big"></i><span>Dodaj</span>';
       entry.btn.classList.remove('is-success');
       entry.btn.disabled = false; // allow retry
       dlTracked.delete(videoId);
@@ -915,8 +926,9 @@
             <path d="M21.58 7.19a2.51 2.51 0 0 0-1.77-1.78C18.25 5 12 5 12 5s-6.25 0-7.81.41A2.51 2.51 0 0 0 2.42 7.2 26.29 26.29 0 0 0 2 12a26.29 26.29 0 0 0 .42 4.81 2.51 2.51 0 0 0 1.77 1.78C5.75 19 12 19 12 19s6.25 0 7.81-.41a2.51 2.51 0 0 0 1.77-1.78A26.29 26.29 0 0 0 22 12a26.29 26.29 0 0 0-.42-4.81zM10 15V9l5.2 3L10 15z"/>
           </svg>
         </a>
-        <button type="button" class="pk-btn is-primary pk-result-download" aria-label="Pobierz" title="Pobierz">
+        <button type="button" class="pk-btn is-primary pk-result-download" title="Pobierz i dodaj do kolejki">
           <i class="icon icon-down-big"></i>
+          <span>Dodaj</span>
         </button>
       </div>
       {# Download lifecycle strip (US-54): hidden until "Pobierz" is tapped,
