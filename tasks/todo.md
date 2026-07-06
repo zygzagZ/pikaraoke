@@ -8,31 +8,37 @@ dopisać brakujące scenariusze do `docs/USER_STORIES.md` + compliance-wpisy do
 
 ## Plan
 
-- \[ \] **Dokument audytu** `docs/UX_AUDIT_2026-07-06.md` — metodologia, co
-  sprawdzono, obserwacje z dowodami (file:line), priorytety.
-- \[ \] **User stories**: US-53 (interakcja z wynikiem YouTube / preview),
-  US-54 (widoczność postępu pobierania i pipeline z telefonu),
-  US-55 (jakość doboru źródła napisów w Auto + czytelny picker),
-  US-56 (kontrolka offsetu napisów na mobile).
-- \[ \] **USER_STORIES_TODO.md**: wpisy compliance dla US-53..56 z priorytetami.
-- \[ \] **Fix: stepper offsetu** — `touch-action: manipulation`,
-  `user-select: none`, hit-area ≥44px, hold-to-repeat z akceleracją
-  (pointer events), obsługa minusa mimo klawiatury iOS bez "−".
-- \[ \] **Fix: postęp pobierania na karcie wyniku** — nasłuch
-  `download_progress`/`download_started`/`download_stopped` na stronie
-  szukaj; trwały stan karty (pobieranie % → w kolejce), przycisk nie
-  wraca do stanu neutralnego po 2,5 s.
-- \[ \] **Fix: preview sheet** — spinner podczas resolve, komunikat błędu
-  zamiast cichego zamknięcia, CTA "Dodaj do kolejki" w arkuszu.
-- \[ \] **Fix: Auto-napisy** — root cause "consensus: no sources" mimo hitu
-  LRCLib (agent bada); preferencja LRCLib nad transkryptem AI.
-- \[ \] **Fix drobne**: toast po polsku ("Song added to the queue"),
-  `--log-level info` (int() crash), nakładanie się kółka na tytuł
-  w wierszu "gra teraz".
-- \[ \] **Testy**: vitest dla logiki hold-to-repeat/parsera offsetu (pure),
-  pytest dla zmian w lib (jeśli dotknięte).
-- \[ \] **Pre-commit + commity** per logiczna jednostka.
+- \[x\] **Dokument audytu** `docs/UX_AUDIT_2026-07-06.md`.
+- \[x\] **User stories** US-53..US-56 w `USER_STORIES.md`.
+- \[x\] **USER_STORIES_TODO.md**: wpisy compliance z priorytetami.
+- \[x\] **Fix: stepper offsetu** — touch-action/user-select, hit ≥44px,
+  hold-to-repeat z akceleracją, debounce POST, przycisk ±, parser
+  (przecinek, trailing minus). `offset-stepper.js` + vitest.
+- \[x\] **Fix: postęp pobierania na karcie wyniku** — nasłuch
+  `download_progress`/`song_event`/`song_warning`, trwały lifecycle
+  karty (requested → % → w kolejce / błąd), rejestracja przed POST
+  (race z cache-hitem), binding w jQuery ready (race z connectSocket).
+- \[x\] **Fix: preview sheet** — spinner, komunikat błędu, CTA
+  "Dodaj do kolejki" przejmujące flow karty.
+- \[x\] **Fix: Auto-napisy (P0)** — engine sam re-fetchuje LRCLib gdy
+  caller nie przekaże LRC (recompute przekazywał None); odmowa
+  whisper-only fallbacku w `build_consensus`. Testy regresyjne.
+- \[x\] **Fix drobne** — katalog pl (toasty), `--log-level info`,
+  avsync jako float (naprawia pre-existing fail
+  `test_play_file_avsync_...`), kółko nachodzące na tytuł.
+- \[x\] **Testy**: 1907 passed (pytest), 84 passed (vitest), pre-commit OK.
+- \[x\] **Weryfikacja E2E** w headless Chrome (viewport iPhone):
+  stepper (klik/hold/±/parser), cache-hit → "w kolejce", świeży
+  download z żywym %, preview spinner + CTA, polski toast, wiersz
+  "gra teraz" bez nakładania.
 
 ## Review
 
-(uzupełnić po zakończeniu)
+Commity: `49e0ccf9` (docs), `071dd175` (US-56), `049ffc31` (US-53/54),
+`f0c9185c` (US-55 P0), `ab5f9bb0` (drobne). Pozostałe otwarte pozycje
+(picker guest-readable, post-processing na telefonie, worker-thread
+toasty, pełny katalog pl, Phase-3 scoring) — w `USER_STORIES_TODO.md`.
+
+Lekcja: serwer poza debug **cache'uje szablony** — przy weryfikacji
+zmian w `templates/` restart serwera jest obowiązkowy, inaczej testuje
+się starą wersję (kosztowało dwie fałszywe iteracje debugowania).

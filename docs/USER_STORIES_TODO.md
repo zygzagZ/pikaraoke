@@ -1013,48 +1013,71 @@ ______________________________________________________________________
 
 ## Phone UX (2026-07-06 audit — `docs/UX_AUDIT_2026-07-06.md`)
 
-### US-53 YouTube result interaction (FAIL at audit time)
+### US-53 YouTube result interaction (mostly RESOLVED 2026-07-06)
 
-- \[ \] **P1** Preview sheet: loading spinner while `/search/preview`
+- \[x\] ~~**P1** Preview sheet: loading spinner while `/search/preview`
   resolves; visible error state instead of the silent
-  `catch(() => closePreview())` (`templates/search.html:612`).
-- \[ \] **P1** "Dodaj do kolejki" CTA inside the preview sheet
-  (`templates/search.html:743-757`), reusing the card download flow.
+  `catch(() => closePreview())`.~~ Done — spinner overlay +
+  "Podgląd niedostępny" message.
+- \[x\] ~~**P1** "Dodaj do kolejki" CTA inside the preview sheet, reusing
+  the card download flow.~~ Done — queues the previewed card and hands
+  progress off to its lifecycle strip.
 - \[ \] **P2** Make the card's download action read as the primary CTA
   (label or size), demote the YouTube-link icon.
 
-### US-54 Download/processing progress on the phone (FAIL at audit time)
+### US-54 Download/processing progress on the phone (mostly RESOLVED 2026-07-06)
 
-- \[ \] **P1** Wire the emitted-but-unconsumed `download_progress` socket
-  event (`lib/download_manager.py:470-495`) to the search page: live
-  percent on the active result card.
-- \[ \] **P1** Persistent card lifecycle state (requested → downloading →
-  w kolejce / błąd) replacing the 2.5 s checkmark reset
-  (`templates/search.html:564-566`).
+- \[x\] ~~**P1** Wire the emitted-but-unconsumed `download_progress` socket
+  event to the search page.~~ Done — live percent + ETA on the active
+  result card, bound SPA-safely.
+- \[x\] ~~**P1** Persistent card lifecycle state (requested → downloading →
+  w kolejce / błąd) replacing the 2.5 s checkmark reset.~~ Done — cards
+  register before the POST so cache-hit events can't outrun tracking.
 - \[ \] **P2** Mark queue rows whose song is still downloading/processing.
 - \[ \] **P2** Surface post-download processing (demucs / lyrics) on the
   phone, not only on splash (US-11 covers splash).
 
-### US-55 Auto subtitle source quality (FAIL at audit time)
+### US-55 Auto subtitle source quality (P0 RESOLVED 2026-07-06; rest open)
 
-- \[ \] **P0** Auto served AI transcript despite an lrclib variant on disk;
-  `consensus: no sources` logged for the same song. Root-cause the
-  consensus source enumeration and fix precedence (US-14).
-- \[ \] **P1** Garble/quality heuristic gating the AI transcript inside
-  Auto resolution.
+- \[x\] ~~**P0** Auto served AI transcript despite an lrclib variant on
+  disk; `consensus: no sources` logged for the same song.~~ Done — two
+  compounding bugs: (1) recompute dispatches passed `lrclib_lrc=None`
+  and the engine never re-read LRCLib, so every rerun pool lost its
+  strongest synced source (engine now re-fetches, HTTP-cached);
+  (2) `build_consensus`'s scaffold fallback accepted a whisper-only pool
+  and emitted raw ASR at confidence 1.0 (now refused outright).
+  Regression tests: `tests/integration/test_consensus_lrclib_refetch.py`,
+  `test_lyrics_consensus.py::test_whisper_only_pool_returns_none`.
+- \[ \] **P1** Fuller garble/quality scoring for the AI transcript inside
+  Auto resolution (whisper-only refusal is the coarse first cut; the
+  Phase-3 `subtitle_scoring.py` / `subtitle_selector.py` design in
+  `tasks/subtitle-smart-selection-phase-3.md` is the real fix). Include
+  a same-tier regression guard in `_try_write_ass_tiered` so a
+  worse-sourced write can't clobber a better same-tier canonical.
 - \[ \] **P2** Guest-readable picker: hide failed sources behind details,
   drop raw "BŁĄD"/"N/D" rows and the bare "3/7" counter from the
   primary list.
 
-### US-56 Subtitle offset on mobile (FAIL at audit time)
+### US-56 Subtitle offset on mobile (RESOLVED 2026-07-06)
 
-- \[ \] **P1** `.pk-tool-step`: `touch-action: manipulation`,
-  `user-select: none`, ≥44 px touch target
-  (`static/css/now-playing.css:587`).
-- \[ \] **P1** Press-and-hold auto-repeat with acceleration on − / +
-  (`static/js/now-playing-bar.js:630-638`).
-- \[ \] **P1** Negative-offset entry path that works with the minus-less
-  iOS decimal keyboard (`templates/base.html:536`).
+- \[x\] ~~**P1** `.pk-tool-step`: `touch-action: manipulation`,
+  `user-select: none`, ≥44 px touch target.~~ Done (also covers the
+  transpose steppers, same class).
+- \[x\] ~~**P1** Press-and-hold auto-repeat with acceleration on − / +.~~
+  Done — full ±2 s range in ~2 s of holding; POST debounced to one
+  commit per gesture (`static/js/offset-stepper.js`, vitest-covered).
+- \[x\] ~~**P1** Negative-offset entry path that works with the minus-less
+  iOS decimal keyboard.~~ Done — ± sign-toggle button plus tolerant
+  parsing (comma decimals, trailing minus).
+
+### i18n follow-up (from the same audit)
+
+- \[ \] **P2** Toasts emitted from worker threads (download complete,
+  demucs) render the English msgid — no request context at `_()` time.
+  Needs app-context (or locale) plumbing into `download_manager`'s
+  worker; the `pl` catalog only fixes request-context emissions.
+- \[ \] **P3** Complete the `pl` catalog beyond the guest-visible
+  notification subset (253 msgids total in `messages.pot`).
 
 ______________________________________________________________________
 
