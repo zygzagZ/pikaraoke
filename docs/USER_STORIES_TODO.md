@@ -1011,12 +1011,61 @@ Follow-ups:
 
 ______________________________________________________________________
 
+## Phone UX (2026-07-06 audit — `docs/UX_AUDIT_2026-07-06.md`)
+
+### US-53 YouTube result interaction (FAIL at audit time)
+
+- \[ \] **P1** Preview sheet: loading spinner while `/search/preview`
+  resolves; visible error state instead of the silent
+  `catch(() => closePreview())` (`templates/search.html:612`).
+- \[ \] **P1** "Dodaj do kolejki" CTA inside the preview sheet
+  (`templates/search.html:743-757`), reusing the card download flow.
+- \[ \] **P2** Make the card's download action read as the primary CTA
+  (label or size), demote the YouTube-link icon.
+
+### US-54 Download/processing progress on the phone (FAIL at audit time)
+
+- \[ \] **P1** Wire the emitted-but-unconsumed `download_progress` socket
+  event (`lib/download_manager.py:470-495`) to the search page: live
+  percent on the active result card.
+- \[ \] **P1** Persistent card lifecycle state (requested → downloading →
+  w kolejce / błąd) replacing the 2.5 s checkmark reset
+  (`templates/search.html:564-566`).
+- \[ \] **P2** Mark queue rows whose song is still downloading/processing.
+- \[ \] **P2** Surface post-download processing (demucs / lyrics) on the
+  phone, not only on splash (US-11 covers splash).
+
+### US-55 Auto subtitle source quality (FAIL at audit time)
+
+- \[ \] **P0** Auto served AI transcript despite an lrclib variant on disk;
+  `consensus: no sources` logged for the same song. Root-cause the
+  consensus source enumeration and fix precedence (US-14).
+- \[ \] **P1** Garble/quality heuristic gating the AI transcript inside
+  Auto resolution.
+- \[ \] **P2** Guest-readable picker: hide failed sources behind details,
+  drop raw "BŁĄD"/"N/D" rows and the bare "3/7" counter from the
+  primary list.
+
+### US-56 Subtitle offset on mobile (FAIL at audit time)
+
+- \[ \] **P1** `.pk-tool-step`: `touch-action: manipulation`,
+  `user-select: none`, ≥44 px touch target
+  (`static/css/now-playing.css:587`).
+- \[ \] **P1** Press-and-hold auto-repeat with acceleration on − / +
+  (`static/js/now-playing-bar.js:630-638`).
+- \[ \] **P1** Negative-offset entry path that works with the minus-less
+  iOS decimal keyboard (`templates/base.html:536`).
+
+______________________________________________________________________
+
 ## Priority Roll-Up
 
 **P0 (architectural / story-breaking):** all original P0s resolved (see
 "Completed P0s" below). Three new P0s open under **US-40 satellites**
 (sync contract, server-side registry, drift loop) — these are
-new-feature architectural decisions rather than regressions.
+new-feature architectural decisions rather than regressions. One new P0
+under **US-55**: Auto subtitle source served AI transcript despite an
+lrclib variant on disk (2026-07-06 audit).
 
 **P1 (significant gaps):** US-7, US-28, and US-41 closed. US-40 owns
 the bulk of the remaining P1 scope (per-pilot mix, shared-queue

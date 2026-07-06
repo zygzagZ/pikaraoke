@@ -981,3 +981,112 @@ MusicBrainz / manual signal still wins.
   NOT fire; the manual edit is sticky across iTunes-miss runs.
 - Row whose filename would re-write the same artist/title that's
   already there → no-op (no spurious row updates).
+
+## Phone UX during search, download, and playback control
+
+Stories US-53..US-56 come from the 2026-07-06 UX audit
+(`docs/UX_AUDIT_2026-07-06.md`). They cover the guest-facing phone flows:
+picking a YouTube result, understanding what happens after "Pobierz", and
+adjusting subtitles during playback.
+
+### US-53 YouTube result interaction: preview is a step toward queueing, never a trap
+
+As a guest on my phone, tapping a YouTube search result never hijacks my
+phone into playing a video I didn't ask for, and previewing a result flows
+naturally into queueing it.
+
+- The primary action of a result card ("get this song") is visually
+  dominant and labelled; secondary actions (preview, open on YouTube) are
+  clearly subordinate.
+- Opening the preview shows an immediate loading indicator while the
+  stream URL is resolved; the sheet never sits on a black frame with no
+  feedback.
+- The preview sheet contains a prominent "Dodaj do kolejki" action so
+  "preview → like it → queue it" is one continuous flow, without closing
+  the sheet and re-locating the card.
+- If the preview stream cannot be resolved, the sheet says so ("Podgląd
+  niedostępny") instead of silently closing.
+
+**Acceptance:**
+
+- Preview open → spinner visible within 100 ms, replaced by video or an
+  error message; no silent close path.
+- Queueing from the preview sheet triggers the same download/queue flow as
+  the card button, with the same progress feedback (US-54).
+
+### US-54 Download and processing progress is visible from the phone, wherever I am
+
+As a guest, after I tap "Pobierz" I can always tell what state my song is
+in — downloading (with %), queued for download, processing, in the queue —
+without knowing which page to visit.
+
+- The result card I tapped reflects the download lifecycle persistently:
+  requested → downloading (live % from the `download_progress` socket
+  event) → done ("w kolejce" / "w bibliotece") or failed (error state,
+  tappable for details). The state does not reset to a neutral button
+  while work is still in flight.
+- Progress is not exclusive to the queue page: the existing socket events
+  (`download_started`, `download_progress`, `download_stopped`) drive
+  whatever surface the user is currently on.
+- A queued song that is still being prepared (download or post-processing
+  not finished) is visibly marked in the queue rather than looking
+  identical to a ready song.
+
+**Acceptance:**
+
+- `download_progress` events have at least one frontend consumer; the
+  search page shows live percent on the active card.
+- Simulated slow download: at no point between "Pobierz" tap and queue
+  appearance is there a surface with zero indication of the pending song.
+- Download error: the card and the queue-page error row both surface it.
+
+### US-55 Auto subtitle source prefers real lyrics over AI transcript
+
+As a singer, the default "Auto" subtitle source gives me the best available
+lyrics: a synced human-sourced lyric (LRCLib et al.) when one exists, and an
+AI transcript only as a last resort — never an AI transcript when a good
+synced source is already on disk.
+
+- Auto's precedence honors US-14: user > synced lyrics sources > YouTube
+  CC > AI transcript.
+- A source that was successfully written for the song (e.g. the lrclib
+  `.ass` variant) is always visible to Auto's resolution — "consensus: no
+  sources" while a variant exists on disk is a defect.
+- Quality heuristics gate the AI transcript before Auto will serve it
+  (e.g. repetition/garble detection, coverage vs. song duration), so a
+  degenerate transcript loses to any other available source.
+- The source picker is guest-readable: only usable sources are offered as
+  choices; failed pipeline sources are not listed as selectable rows with
+  raw error labels. Technical detail (per-source errors, counts) lives
+  behind an explicit "szczegóły" affordance, not in the primary list.
+
+**Acceptance:**
+
+- Song with an lrclib variant `.ass` on disk + Auto selected → served
+  lyrics are the lrclib ones (verifiable via the active-source indicator).
+- Song where only the AI transcript exists and it fails the garble
+  heuristic → Auto shows no word-synced lyrics rather than garbage
+  (falls back to the next tier or off).
+- Picker default state lists at most: wyłącz, Auto, plus sources that can
+  actually render for this song.
+
+### US-56 Subtitle offset is adjustable on a phone in seconds, not in 40 taps
+
+As a singer using an iPhone, I can set the subtitle offset to any value in
+its range within a couple of seconds, one-handed.
+
+- The − / + steppers respond to rapid tapping without triggering
+  double-tap zoom or text selection (`touch-action: manipulation`,
+  `user-select: none`, ≥44 px touch targets).
+- Press-and-hold auto-repeats with acceleration, so traversing the full
+  ±2 s range takes a single press of ~1-2 s.
+- Negative values are enterable on iOS despite the decimal keyboard having
+  no minus key (sign toggle, or equivalent affordance) — the stepper is
+  not the only path to a negative offset.
+
+**Acceptance:**
+
+- 10 taps in \<3 s on "+" → offset advances exactly 10 steps, page zoom
+  and selection unchanged.
+- Hold "−" from 0.00 → reaches −2.00 s in ≤2 s and stops at the clamp.
+- A negative offset (e.g. −1.35) can be set without using the steppers.
