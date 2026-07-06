@@ -31,6 +31,7 @@
 
   <script src="{{ url_for('static', filename='js/dialog.js') }}"></script>
   <script type="module" src="{{ url_for('static', filename='js/lyrics-parse.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='js/offset-stepper.js') }}"></script>
   <script type="module" src="{{ url_for('static', filename='js/subtitle-source-picker.js') }}"></script>
   <script src="{{ url_for('static', filename='js/now-playing-bar.js') }}"></script>
 
@@ -532,8 +533,11 @@
         <div class="pk-tool pk-tool-offset" data-pk-subtitle-offset-tool hidden>
           <span class="pk-tool-label">napisy</span>
           <div class="pk-offset-control">
+            {# Sign toggle: the iOS decimal keyboard has no minus key, so
+               manual entry alone can't produce negative offsets (US-56). #}
+            <button type="button" class="pk-tool-step" data-pk-subtitle-offset-sign aria-label="Flip offset sign">&plusmn;</button>
             <button type="button" class="pk-tool-step" data-pk-subtitle-offset-dec aria-label="Subtitles earlier">&minus;</button>
-            <input type="text" inputmode="decimal" data-pk-subtitle-offset class="pk-offset-input" value="0.00" aria-label="Subtitle offset (seconds)">
+            <input type="text" inputmode="decimal" enterkeyhint="done" data-pk-subtitle-offset class="pk-offset-input" value="0.00" aria-label="Subtitle offset (seconds)">
             <span class="pk-offset-suffix">s</span>
             <button type="button" class="pk-tool-step" data-pk-subtitle-offset-inc aria-label="Subtitles later">+</button>
           </div>

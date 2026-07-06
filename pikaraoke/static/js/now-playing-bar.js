@@ -69,6 +69,7 @@
     el.subOffsetInput = el.full.querySelector('[data-pk-subtitle-offset]');
     el.subOffsetDec = el.full.querySelector('[data-pk-subtitle-offset-dec]');
     el.subOffsetInc = el.full.querySelector('[data-pk-subtitle-offset-inc]');
+    el.subOffsetSign = el.full.querySelector('[data-pk-subtitle-offset-sign]');
     el.subSrcTool = el.full.querySelector('[data-pk-subtitle-src-tool]');
     el.subSrcSelect = el.full.querySelector('[data-pk-subtitle-src]');
     el.subSrcMount = el.full.querySelector('[data-pk-subtitle-src-mount]');
@@ -585,10 +586,18 @@
       // same grid; otherwise 0.05 + 0.05 + 0.05 drifts to 0.150000001s.
       const round2 = (v) => Math.round(v * 100) / 100;
 
+      const stepper = window.PK.OffsetStepper || null;
+
       const currentOffset = () => {
-        const v = parseFloat(el.subOffsetInput.value);
+        const v = stepper
+          ? stepper.parseOffsetInput(el.subOffsetInput.value)
+          : parseFloat(el.subOffsetInput.value);
         return Number.isFinite(v) ? v : 0;
       };
+
+      // Trailing debounce so hold-to-repeat doesn't flood /subtitle_offset
+      // with one POST per step; only the final value is committed.
+      let offsetPostTimer = null;
 
       const commitOffset = (rawValue) => {
         const next = round2(clampOffset(rawValue));
@@ -602,11 +611,15 @@
         anchorWordFillClock();
         tickLyrics(state.lyricsPosition);
         if (songId == null || !source) return;
-        fetch('/subtitle_offset', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ song_id: songId, source, offset: next }),
-        }).catch(() => { /* network errors surface on the next now_playing tick */ });
+        if (offsetPostTimer) clearTimeout(offsetPostTimer);
+        offsetPostTimer = setTimeout(() => {
+          offsetPostTimer = null;
+          fetch('/subtitle_offset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ song_id: songId, source, offset: next }),
+          }).catch(() => { /* network errors surface on the next now_playing tick */ });
+        }, 200);
       };
 
       el.subOffsetInput.addEventListener('keydown', (e) => {
@@ -627,14 +640,50 @@
       el.subOffsetInput.addEventListener('focus', () => {
         el.subOffsetInput.select();
       });
-      if (el.subOffsetDec) {
-        el.subOffsetDec.addEventListener('click', () => {
-          commitOffset(currentOffset() - STEP);
+      // Steppers: single tap = one step; press-and-hold auto-repeats with
+      // acceleration (US-56 — reaching the ±2s clamp used to take 40 taps).
+      const bindOffsetStep = (btn, dir) => {
+        if (!btn) return;
+        const delayFor = stepper ? stepper.stepRepeatDelay : null;
+        let repeatTimer = null;
+        let held = false;
+        const stepOnce = () => commitOffset(currentOffset() + dir * STEP);
+        const stopRepeat = () => {
+          if (repeatTimer) clearTimeout(repeatTimer);
+          repeatTimer = null;
+        };
+        if (delayFor) {
+          btn.addEventListener('pointerdown', () => {
+            held = false;
+            stopRepeat();
+            let repeats = 0;
+            const tick = () => {
+              held = true;
+              repeats += 1;
+              stepOnce();
+              repeatTimer = setTimeout(tick, delayFor(repeats));
+            };
+            repeatTimer = setTimeout(tick, delayFor(0));
+          });
+          ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => {
+            btn.addEventListener(ev, stopRepeat);
+          });
+          btn.addEventListener('contextmenu', (e) => e.preventDefault());
+        }
+        btn.addEventListener('click', () => {
+          if (held) {
+            // The click that ends a hold already stepped via the repeat loop.
+            held = false;
+            return;
+          }
+          stepOnce();
         });
-      }
-      if (el.subOffsetInc) {
-        el.subOffsetInc.addEventListener('click', () => {
-          commitOffset(currentOffset() + STEP);
+      };
+      bindOffsetStep(el.subOffsetDec, -1);
+      bindOffsetStep(el.subOffsetInc, +1);
+      if (el.subOffsetSign) {
+        el.subOffsetSign.addEventListener('click', () => {
+          commitOffset(-currentOffset());
         });
       }
     }
