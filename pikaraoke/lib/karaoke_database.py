@@ -436,9 +436,7 @@ class KaraokeDatabase:
         # Karaoke wires it to lyrics_service.invalidate_for_metadata_change
         # so every metadata writer (manual edit, enricher, scanner backfill,
         # consensus rerun) drops cached subtitles automatically.
-        self._track_metadata_change_listener: (
-            Callable[[int, frozenset[str]], None] | None
-        ) = None
+        self._track_metadata_change_listener: (Callable[[int, frozenset[str]], None] | None) = None
 
     def set_track_metadata_change_listener(
         self, callback: Callable[[int, frozenset[str]], None] | None

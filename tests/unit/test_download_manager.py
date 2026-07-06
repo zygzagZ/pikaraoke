@@ -31,9 +31,7 @@ def _stub_orig_autosubs():
     sequences. Tests that specifically exercise the second pass can
     re-patch this method on their case.
     """
-    with patch.object(
-        DownloadManager, "_fetch_orig_auto_captions", return_value=None
-    ) as stub:
+    with patch.object(DownloadManager, "_fetch_orig_auto_captions", return_value=None) as stub:
         yield stub
 
 
@@ -369,9 +367,7 @@ class TestDownloadManagerExecuteDownload:
             "https://youtube.com/watch?v=abc", False, "User", "Title"
         )
 
-        _stub_orig_autosubs.assert_called_once_with(
-            "https://youtube.com/watch?v=abc"
-        )
+        _stub_orig_autosubs.assert_called_once_with("https://youtube.com/watch?v=abc")
 
     @patch("flask_babel._", side_effect=lambda x: x)
     @patch("subprocess.Popen")
