@@ -67,10 +67,12 @@ After installation, you can launch pikaraoke from the command line with `pikarao
 We recommend installing pikaraoke via [uv](https://github.com/astral-sh/uv).
 
 ```sh
-uv tool install pikaraoke
+uv tool install "pikaraoke[align]"
 ```
 
-You may alternately use the standard python `pip install pikaraoke` installer if you are familiar with virtual environments or you are not concerned with global package isolation.
+The `[align]` extra carries the stems and lyric-alignment pipeline (demucs, torch, whisperx) that every played song goes through. Install without it only if you want the search, metadata and lyrics-fetch modules as a library.
+
+You may alternately use the standard python `pip install "pikaraoke[align]"` installer if you are familiar with virtual environments or you are not concerned with global package isolation.
 
 ## Usage
 

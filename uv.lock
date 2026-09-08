@@ -3213,7 +3213,6 @@ version = "1.19.0"
 source = { editable = "." }
 dependencies = [
     { name = "babel" },
-    { name = "demucs" },
     { name = "ffmpeg-python" },
     { name = "flask" },
     { name = "flask-babel" },
@@ -3221,24 +3220,25 @@ dependencies = [
     { name = "flask-smorest" },
     { name = "flask-socketio" },
     { name = "langdetect" },
-    { name = "librosa" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "psutil" },
     { name = "pyphen" },
     { name = "qrcode", extra = ["png"] },
     { name = "requests" },
     { name = "simple-websocket" },
-    { name = "soundfile" },
     { name = "syncedlyrics" },
-    { name = "torch" },
-    { name = "whisperx" },
     { name = "yt-dlp", extra = ["default"] },
 ]
 
 [package.optional-dependencies]
 align = [
+    { name = "demucs" },
+    { name = "librosa" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "silero-vad" },
+    { name = "soundfile" },
+    { name = "torch" },
+    { name = "whisperx" },
 ]
 dev = [
     { name = "pre-commit" },
@@ -3261,7 +3261,7 @@ translations = [
 [package.metadata]
 requires-dist = [
     { name = "babel", specifier = "==2.17.0" },
-    { name = "demucs", specifier = ">=4.0.1" },
+    { name = "demucs", marker = "extra == 'align'", specifier = ">=4.0.1" },
     { name = "ffmpeg-python", specifier = "==0.2.0" },
     { name = "flask", specifier = ">=3.1.0,<3.1.3" },
     { name = "flask-babel", specifier = "==4.0.0" },
@@ -3269,8 +3269,8 @@ requires-dist = [
     { name = "flask-smorest", specifier = ">=0.46.0" },
     { name = "flask-socketio", specifier = ">=5.5.0" },
     { name = "langdetect", specifier = ">=1.0.9" },
-    { name = "librosa", specifier = ">=0.10" },
-    { name = "numpy", specifier = ">=1.24" },
+    { name = "librosa", marker = "extra == 'align'", specifier = ">=0.10" },
+    { name = "numpy", marker = "extra == 'align'", specifier = ">=1.24" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.1" },
     { name = "psutil", specifier = "==7.2.1" },
     { name = "pyphen", specifier = ">=0.15" },
@@ -3280,10 +3280,10 @@ requires-dist = [
     { name = "requests", specifier = "==2.32.5" },
     { name = "silero-vad", marker = "extra == 'align'", specifier = ">=5.0" },
     { name = "simple-websocket", specifier = ">=1.0.0" },
-    { name = "soundfile", specifier = ">=0.12" },
+    { name = "soundfile", marker = "extra == 'align'", specifier = ">=0.12" },
     { name = "syncedlyrics", specifier = ">=0.5,<1.0" },
-    { name = "torch", specifier = ">=2.0" },
-    { name = "whisperx", specifier = ">=3.1.1" },
+    { name = "torch", marker = "extra == 'align'", specifier = ">=2.0" },
+    { name = "whisperx", marker = "extra == 'align'", specifier = ">=3.1.1" },
     { name = "yt-dlp", extras = ["default"], specifier = ">=2026.3.3" },
 ]
 provides-extras = ["dev", "align"]

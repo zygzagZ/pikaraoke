@@ -24,13 +24,7 @@ dependencies = [
   "yt-dlp[default]>=2026.03.03",
   "flask-socketio>=5.5.0",
   "simple-websocket>=1.0.0",
-  # Stems + alignment pipeline (required: every song hits this)
-  "demucs>=4.0.1",
-  "torch>=2.0",
-  "numpy>=1.24",
-  "soundfile>=0.12",
-  "librosa>=0.10",
-  "whisperx>=3.1.1",
+  # Lyrics language detection and hyphenation. Pure Python, no ML stack.
   "langdetect>=1.0.9",
   "pyphen>=0.15",
   # Multi-source lyrics consensus: optional curated-LRC providers
@@ -47,10 +41,21 @@ dev = [
   "pytest-cov>=7.0.0",
 
 ]
-# Optional VAD upstream for per-line LRC->audio anchoring. When silero-vad
-# is missing we fall back to ffmpeg silencedetect on the demucs vocals stem
+# Stems + alignment pipeline. Every song pikaraoke plays hits this, so a
+# pikaraoke install wants `pikaraoke[align]` — it is an extra only so that
+# downstream consumers can reuse the search, metadata and lyrics-fetch modules
+# without pulling several GB of torch. Confined to demucs_processor.py,
+# lyrics_align.py and vad_probe.py, each imported lazily from its callers.
+# silero-vad is the optional VAD upstream for per-line LRC->audio anchoring;
+# without it we fall back to ffmpeg silencedetect on the demucs vocals stem
 # (lower anchor density, but the DP solver still runs).
 align = [
+  "demucs>=4.0.1",
+  "torch>=2.0",
+  "numpy>=1.24",
+  "soundfile>=0.12",
+  "librosa>=0.10",
+  "whisperx>=3.1.1",
   "silero-vad>=5.0",
 ]
 

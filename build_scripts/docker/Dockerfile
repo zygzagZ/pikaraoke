@@ -17,9 +17,12 @@ RUN --mount=type=cache,target=/var/cache/apk \
 COPY pyproject.toml uv.lock ./
 
 # Install dependencies using uv (this layer is cached)
+# --extra align pulls the stems + alignment pipeline (demucs, torch, whisperx).
+# Every song played goes through it, so the image needs it; it sits in an extra
+# so downstream consumers can reuse the lighter modules without it.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /app/.venv && \
-    uv pip install --no-cache-dir -r pyproject.toml
+    uv pip install --no-cache-dir -r pyproject.toml --extra align
 
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
