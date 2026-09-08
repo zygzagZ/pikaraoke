@@ -1,5 +1,6 @@
 """Unit tests for pikaraoke.lib.lyrics."""
 
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -3808,6 +3809,11 @@ class TestAnimParamsForBpm:
 
 
 class TestEstimateBpm:
+    """``_estimate_bpm`` imports librosa inside the function, because librosa
+    ships in the ``align`` extra and ``lyrics`` must import without it. So the
+    fake goes into ``sys.modules``, not onto a module attribute.
+    """
+
     @pytest.fixture(autouse=True)
     def _clear_bpm_cache(self):
         """Reset the process-lifetime BPM cache between tests so prior
@@ -3823,7 +3829,7 @@ class TestEstimateBpm:
 
         fake_librosa = MagicMock()
         fake_librosa.load.side_effect = RuntimeError("cannot decode")
-        with patch("pikaraoke.lib.lyrics.librosa", fake_librosa):
+        with patch.dict(sys.modules, {"librosa": fake_librosa}):
             with caplog.at_level("WARNING"):
                 assert _estimate_bpm("/tmp/x.mp3") is None
         assert any("BPM estimation failed" in r.message for r in caplog.records)
@@ -3835,7 +3841,7 @@ class TestEstimateBpm:
         fake_librosa.load.return_value = ("signal", 22050)
         # librosa's newer API returns tempo as a 1-element ndarray-like.
         fake_librosa.beat.beat_track.return_value = ([128.5], "beats")
-        with patch("pikaraoke.lib.lyrics.librosa", fake_librosa):
+        with patch.dict(sys.modules, {"librosa": fake_librosa}):
             assert _estimate_bpm("/tmp/x.mp3") == 128.5
 
     def test_returns_tempo_when_scalar(self):
@@ -3844,7 +3850,7 @@ class TestEstimateBpm:
         fake_librosa = MagicMock()
         fake_librosa.load.return_value = ("signal", 22050)
         fake_librosa.beat.beat_track.return_value = (90.0, "beats")
-        with patch("pikaraoke.lib.lyrics.librosa", fake_librosa):
+        with patch.dict(sys.modules, {"librosa": fake_librosa}):
             assert _estimate_bpm("/tmp/x.mp3") == 90.0
 
     def test_caches_result_per_path(self):
@@ -3855,7 +3861,7 @@ class TestEstimateBpm:
         fake_librosa = MagicMock()
         fake_librosa.load.return_value = ("signal", 22050)
         fake_librosa.beat.beat_track.return_value = ([110.0], "beats")
-        with patch("pikaraoke.lib.lyrics.librosa", fake_librosa):
+        with patch.dict(sys.modules, {"librosa": fake_librosa}):
             assert _estimate_bpm("/tmp/cached.mp3") == 110.0
             assert _estimate_bpm("/tmp/cached.mp3") == 110.0
             assert _estimate_bpm("/tmp/cached.mp3") == 110.0
@@ -3871,7 +3877,7 @@ class TestEstimateBpm:
 
         fake_librosa = MagicMock()
         fake_librosa.load.side_effect = RuntimeError("cannot decode")
-        with patch("pikaraoke.lib.lyrics.librosa", fake_librosa):
+        with patch.dict(sys.modules, {"librosa": fake_librosa}):
             assert _estimate_bpm("/tmp/bad.mp3") is None
             assert _estimate_bpm("/tmp/bad.mp3") is None
             assert fake_librosa.load.call_count == 1

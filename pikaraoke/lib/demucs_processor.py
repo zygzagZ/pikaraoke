@@ -19,11 +19,22 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-import librosa
-import numpy as np
-import soundfile as sf
-import torch
-from tqdm import tqdm
+# The ML stack lives in the `align` extra (tqdm arrives with it, via demucs).
+# Every importer of this module does so from inside a function, so this raises
+# at the first vocal-separation call rather than at app startup — and says what
+# to install instead of surfacing a bare "No module named 'torch'" from a
+# worker thread.
+try:
+    import librosa
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from tqdm import tqdm
+except ImportError as exc:
+    raise ImportError(
+        f"Vocal separation needs the 'align' extra (missing: {exc.name or exc}). "
+        "Install with: pip install 'pikaraoke[align]'"
+    ) from exc
 
 CACHE_DIR = os.path.expanduser("~/.pikaraoke-cache")
 

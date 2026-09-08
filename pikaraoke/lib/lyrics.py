@@ -32,7 +32,6 @@ from threading import Thread
 from typing import Protocol
 from urllib.parse import quote_plus
 
-import librosa
 import requests
 
 # Stage msgids for _emit_stage_notification. Call sites pass the plain
@@ -5141,6 +5140,12 @@ def _estimate_bpm(audio_path: str) -> float | None:
         if audio_path in _bpm_cache:
             return _bpm_cache[audio_path]
     try:
+        # librosa ships in the `align` extra; importing it here keeps this
+        # module importable without the ML stack. A missing package lands in
+        # the same except as any other tempo-detection failure, so the render
+        # falls through un-pulsed.
+        import librosa
+
         y, sr = librosa.load(audio_path, sr=None, mono=True, duration=_BPM_ANALYSIS_DURATION_S)
         tempo, _beats = librosa.beat.beat_track(y=y, sr=sr)
         bpm = float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)

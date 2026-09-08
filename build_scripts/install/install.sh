@@ -153,20 +153,24 @@ else
 fi
 
 # Install pikaraoke
+# The [align] extra carries the stems + alignment pipeline (demucs, torch,
+# whisperx). Every song pikaraoke plays goes through it, so a playable install
+# always asks for it; the extra exists so downstream consumers can reuse the
+# search/metadata/lyrics modules without several GB of torch.
 echo "Installing pikaraoke via uv..."
 
 if uv tool list | grep -q "pikaraoke"; then
     echo "PiKaraoke is already installed. Upgrading..."
     if [ "$LOCAL" == "y" ]; then
-        uv tool install --force .
+        uv tool install --force ".[align]"
     else
         uv tool upgrade pikaraoke
     fi
 else
     if [ "$LOCAL" == "y" ]; then
-        uv tool install .
+        uv tool install ".[align]"
     else
-        uv tool install pikaraoke
+        uv tool install "pikaraoke[align]"
     fi
 fi
 

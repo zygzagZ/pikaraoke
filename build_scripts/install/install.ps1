@@ -82,19 +82,22 @@ $uvPackages = ""
 $uvPackages = uv tool list | Out-String
 
 # 6. install pikaraoke with uv
+# The [align] extra carries the stems + alignment pipeline (demucs, torch,
+# whisperx) that every played song goes through. It is an extra so downstream
+# consumers can reuse the lighter modules without several GB of torch.
 if ($uvPackages -match "pikaraoke") {
     Write-Host "Upgrading pikaraoke via uv..." -ForegroundColor Yellow
     if ($Local) {
-        uv tool install --force .
+        uv tool install --force ".[align]"
     } else {
         uv tool upgrade pikaraoke
     }
 } else {
     Write-Host "Installing pikaraoke via uv..." -ForegroundColor Yellow
     if ($Local) {
-        uv tool install .
+        uv tool install ".[align]"
     } else {
-        uv tool install pikaraoke
+        uv tool install "pikaraoke[align]"
     }
 }
 if ($LASTEXITCODE -ne 0) { throw "Failed to install/upgrade pikaraoke via uv tool" }
